@@ -10,7 +10,7 @@ set(UNITREE_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../unitree_sdk2")
 
 add_subdirectory("${UNITREE_SDK_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/unitree_sdk2_build" EXCLUDE_FROM_ALL)
 
-add_executable(go2_collector go2_collector.cpp)
+add_executable(go2_collector go2_collector.cpp web_ui_server.cpp)
 target_link_libraries(go2_collector PRIVATE unitree_sdk2)
 
 add_executable(go2_mode_probe go2_mode_probe.cpp)

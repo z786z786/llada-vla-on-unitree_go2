@@ -30,6 +30,7 @@
 #include <unitree/robot/channel/channel_subscriber.hpp>
 #include <unitree/robot/go2/sport/sport_client.hpp>
 #include <unitree/robot/go2/video/video_client.hpp>
+#include "web_ui_server.h"
 
 namespace
 {
@@ -83,6 +84,7 @@ struct Config
     };
 
     std::string networkInterface;
+    fs::path collectorRoot;
     fs::path outputDir;
     double loopHz = 50.0;
     double videoPollHz = 10.0;
@@ -101,7 +103,28 @@ struct Config
     double cmdVxMax = kDefaultCmdVxMax;
     double cmdVyMax = kDefaultCmdVyMax;
     double cmdWzMax = kDefaultCmdWzMax;
+    bool webUiEnabled = false;
+    int webPort = 8080;
 };
+
+struct EditableCollectorConfig
+{
+    Config::CaptureMode captureMode = Config::CaptureMode::SingleAction;
+    std::string sceneId;
+    std::string operatorId;
+    std::string instruction;
+    std::string taskFamily;
+    std::string targetType;
+    std::string targetDescription;
+    std::string targetInstanceId;
+    std::string collectorNotes;
+    std::vector<std::string> taskTags;
+    double cmdVxMax = kDefaultCmdVxMax;
+    double cmdVyMax = kDefaultCmdVyMax;
+    double cmdWzMax = kDefaultCmdWzMax;
+};
+
+std::optional<Config::CaptureMode> ParseCaptureMode(const std::string& value);
 
 struct TaskMetadata
 {
@@ -114,6 +137,9 @@ struct TaskMetadata
     std::vector<std::string> taskTags;
     std::string collectorNotes;
     std::string instructionSource;
+    std::string segmentStatus;
+    std::string success;
+    std::string terminationReason;
 };
 
 struct LatestState
@@ -189,11 +215,40 @@ struct EpisodeSummary
     std::vector<std::string> taskTags;
     std::string collectorNotes;
     std::string instructionSource;
+    std::string segmentStatus;
+    std::string success;
+    std::string terminationReason;
     std::string sceneId;
     std::string operatorId;
     size_t numFrames = 0;
     double startTimestamp = 0.0;
     double endTimestamp = 0.0;
+};
+
+enum class SegmentStatus
+{
+    Clean,
+    Usable,
+    Discard,
+};
+
+enum class SuccessLabel
+{
+    Success,
+    Partial,
+    Fail,
+};
+
+enum class TerminationReason
+{
+    GoalReached,
+    NearGoalStop,
+    Occluded,
+    TargetLost,
+    OperatorStop,
+    BadDemo,
+    Unsafe,
+    Timeout,
 };
 
 enum class SafetyState
@@ -314,6 +369,20 @@ std::vector<std::string> SplitCsvList(const std::string& input)
     return values;
 }
 
+std::string JoinCsvList(const std::vector<std::string>& values)
+{
+    std::ostringstream oss;
+    for (size_t index = 0; index < values.size(); ++index)
+    {
+        if (index > 0)
+        {
+            oss << ",";
+        }
+        oss << values[index];
+    }
+    return oss.str();
+}
+
 std::string InferTaskFamily(const std::string& instruction)
 {
     const std::string trimmed = Trim(instruction);
@@ -390,7 +459,7 @@ std::string FormatTimestampForPath(double timestampSeconds, const char* format)
     char buffer[64];
     if (std::strftime(buffer, sizeof(buffer), format, &localTime) == 0)
     {
-        throw std::runtime_error("failed to format timestamp");
+        throw std::runtime_error("格式化时间戳失败");
     }
     return buffer;
 }
@@ -399,6 +468,11 @@ fs::path CollectorRootFromArgv0(const char* argv0)
 {
     const fs::path executablePath = fs::absolute(argv0);
     return executablePath.parent_path().parent_path().parent_path();
+}
+
+fs::path CollectorDefaultsPath(const fs::path& collectorRoot)
+{
+    return collectorRoot / "collector_webui_defaults.json";
 }
 
 std::string SafetyStateName(SafetyState state)
@@ -479,6 +553,275 @@ std::string CaptureModeName(Config::CaptureMode mode)
         return "trajectory";
     }
     return "unknown";
+}
+
+std::string SegmentStatusName(SegmentStatus status)
+{
+    switch (status)
+    {
+    case SegmentStatus::Clean:
+        return "clean";
+    case SegmentStatus::Usable:
+        return "usable";
+    case SegmentStatus::Discard:
+        return "discard";
+    }
+    return "discard";
+}
+
+std::string SuccessLabelName(SuccessLabel label)
+{
+    switch (label)
+    {
+    case SuccessLabel::Success:
+        return "success";
+    case SuccessLabel::Partial:
+        return "partial";
+    case SuccessLabel::Fail:
+        return "fail";
+    }
+    return "fail";
+}
+
+std::string TerminationReasonName(TerminationReason reason)
+{
+    switch (reason)
+    {
+    case TerminationReason::GoalReached:
+        return "goal_reached";
+    case TerminationReason::NearGoalStop:
+        return "near_goal_stop";
+    case TerminationReason::Occluded:
+        return "occluded";
+    case TerminationReason::TargetLost:
+        return "target_lost";
+    case TerminationReason::OperatorStop:
+        return "operator_stop";
+    case TerminationReason::BadDemo:
+        return "bad_demo";
+    case TerminationReason::Unsafe:
+        return "unsafe";
+    case TerminationReason::Timeout:
+        return "timeout";
+    }
+    return "operator_stop";
+}
+
+bool IsValidSegmentStatusValue(const std::string& value)
+{
+    return value == SegmentStatusName(SegmentStatus::Clean) ||
+           value == SegmentStatusName(SegmentStatus::Usable) ||
+           value == SegmentStatusName(SegmentStatus::Discard);
+}
+
+bool IsValidSuccessValue(const std::string& value)
+{
+    return value == SuccessLabelName(SuccessLabel::Success) ||
+           value == SuccessLabelName(SuccessLabel::Partial) ||
+           value == SuccessLabelName(SuccessLabel::Fail);
+}
+
+bool IsValidTerminationReasonValue(const std::string& value)
+{
+    return value == TerminationReasonName(TerminationReason::GoalReached) ||
+           value == TerminationReasonName(TerminationReason::NearGoalStop) ||
+           value == TerminationReasonName(TerminationReason::Occluded) ||
+           value == TerminationReasonName(TerminationReason::TargetLost) ||
+           value == TerminationReasonName(TerminationReason::OperatorStop) ||
+           value == TerminationReasonName(TerminationReason::BadDemo) ||
+           value == TerminationReasonName(TerminationReason::Unsafe) ||
+           value == TerminationReasonName(TerminationReason::Timeout);
+}
+
+UiActionResult ActionOk(const std::string& message, const std::string& episodeId = "")
+{
+    UiActionResult result;
+    result.ok = true;
+    result.code = "ok";
+    result.message = message;
+    result.episodeId = episodeId;
+    return result;
+}
+
+UiActionResult ActionError(const std::string& code, const std::string& message)
+{
+    UiActionResult result;
+    result.ok = false;
+    result.code = code;
+    result.message = message;
+    return result;
+}
+
+std::optional<std::string> ExtractJsonStringFieldLocal(const std::string& body, const std::string& key)
+{
+    const std::string marker = "\"" + key + "\"";
+    const size_t keyPos = body.find(marker);
+    if (keyPos == std::string::npos)
+    {
+        return std::nullopt;
+    }
+    const size_t colonPos = body.find(':', keyPos + marker.size());
+    if (colonPos == std::string::npos)
+    {
+        return std::nullopt;
+    }
+    const size_t quotePos = body.find('"', colonPos + 1);
+    if (quotePos == std::string::npos)
+    {
+        return std::nullopt;
+    }
+    std::string value;
+    bool escaping = false;
+    for (size_t index = quotePos + 1; index < body.size(); ++index)
+    {
+        const char ch = body[index];
+        if (escaping)
+        {
+            value.push_back(ch);
+            escaping = false;
+            continue;
+        }
+        if (ch == '\\')
+        {
+            escaping = true;
+            continue;
+        }
+        if (ch == '"')
+        {
+            return value;
+        }
+        value.push_back(ch);
+    }
+    return std::nullopt;
+}
+
+std::optional<double> ExtractJsonNumberFieldLocal(const std::string& body, const std::string& key)
+{
+    const std::string marker = "\"" + key + "\"";
+    const size_t keyPos = body.find(marker);
+    if (keyPos == std::string::npos)
+    {
+        return std::nullopt;
+    }
+    const size_t colonPos = body.find(':', keyPos + marker.size());
+    if (colonPos == std::string::npos)
+    {
+        return std::nullopt;
+    }
+    size_t begin = body.find_first_of("-0123456789", colonPos + 1);
+    if (begin == std::string::npos)
+    {
+        return std::nullopt;
+    }
+    size_t end = begin;
+    while (end < body.size() &&
+           (std::isdigit(static_cast<unsigned char>(body[end])) || body[end] == '.' || body[end] == '-'))
+    {
+        ++end;
+    }
+    try
+    {
+        return std::stod(body.substr(begin, end - begin));
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
+
+void ApplyDefaultsFile(const fs::path& defaultsPath, Config& config)
+{
+    std::ifstream input(defaultsPath);
+    if (!input.is_open())
+    {
+        return;
+    }
+
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    const std::string body = buffer.str();
+
+    if (const auto value = ExtractJsonStringFieldLocal(body, "scene_id"); value.has_value())
+    {
+        config.sceneId = value.value();
+    }
+    if (const auto value = ExtractJsonStringFieldLocal(body, "operator_id"); value.has_value())
+    {
+        config.operatorId = value.value();
+    }
+    if (const auto value = ExtractJsonStringFieldLocal(body, "instruction"); value.has_value())
+    {
+        config.instruction = value.value();
+    }
+    if (const auto value = ExtractJsonStringFieldLocal(body, "capture_mode"); value.has_value())
+    {
+        const auto captureMode = ParseCaptureMode(value.value());
+        if (captureMode.has_value())
+        {
+            config.captureMode = captureMode.value();
+        }
+    }
+    if (const auto value = ExtractJsonStringFieldLocal(body, "task_family"); value.has_value())
+    {
+        config.taskFamily = value.value();
+    }
+    if (const auto value = ExtractJsonStringFieldLocal(body, "target_type"); value.has_value())
+    {
+        config.targetType = value.value();
+    }
+    if (const auto value = ExtractJsonStringFieldLocal(body, "target_description"); value.has_value())
+    {
+        config.targetDescription = value.value();
+    }
+    if (const auto value = ExtractJsonStringFieldLocal(body, "target_instance_id"); value.has_value())
+    {
+        config.targetInstanceId = value.value();
+    }
+    if (const auto value = ExtractJsonStringFieldLocal(body, "task_tags_csv"); value.has_value())
+    {
+        config.taskTags = SplitCsvList(value.value());
+    }
+    if (const auto value = ExtractJsonStringFieldLocal(body, "collector_notes"); value.has_value())
+    {
+        config.collectorNotes = value.value();
+    }
+    if (const auto value = ExtractJsonNumberFieldLocal(body, "cmd_vx_max"); value.has_value())
+    {
+        config.cmdVxMax = value.value();
+    }
+    if (const auto value = ExtractJsonNumberFieldLocal(body, "cmd_vy_max"); value.has_value())
+    {
+        config.cmdVyMax = value.value();
+    }
+    if (const auto value = ExtractJsonNumberFieldLocal(body, "cmd_wz_max"); value.has_value())
+    {
+        config.cmdWzMax = value.value();
+    }
+}
+
+void SaveDefaultsFile(const fs::path& defaultsPath, const EditableCollectorConfig& config)
+{
+    std::ofstream output(defaultsPath, std::ios::out | std::ios::trunc);
+    if (!output.is_open())
+    {
+        throw std::runtime_error("写入 collector 默认配置失败");
+    }
+
+    output << "{\n"
+           << "  \"scene_id\": " << JsonString(config.sceneId) << ",\n"
+           << "  \"operator_id\": " << JsonString(config.operatorId) << ",\n"
+           << "  \"instruction\": " << JsonString(config.instruction) << ",\n"
+           << "  \"capture_mode\": " << JsonString(CaptureModeName(config.captureMode)) << ",\n"
+           << "  \"task_family\": " << JsonString(config.taskFamily) << ",\n"
+           << "  \"target_type\": " << JsonString(config.targetType) << ",\n"
+           << "  \"target_description\": " << JsonString(config.targetDescription) << ",\n"
+           << "  \"target_instance_id\": " << JsonString(config.targetInstanceId) << ",\n"
+           << "  \"task_tags_csv\": " << JsonString(JoinCsvList(config.taskTags)) << ",\n"
+           << "  \"collector_notes\": " << JsonString(config.collectorNotes) << ",\n"
+           << "  \"cmd_vx_max\": " << config.cmdVxMax << ",\n"
+           << "  \"cmd_vy_max\": " << config.cmdVyMax << ",\n"
+           << "  \"cmd_wz_max\": " << config.cmdWzMax << "\n"
+           << "}\n";
 }
 
 std::optional<Config::InputBackend> ParseInputBackend(const std::string& value)
@@ -600,10 +943,10 @@ EffectiveControlAction ResolveControlAction(const VelocityCommand& rawAction, do
 void PrintUsage(const char* program)
 {
     std::cout
-        << "Usage: " << program << " --network-interface IFACE --scene-id SCENE --operator-id OPERATOR [options]\n\n"
+        << "用法: " << program << " --network-interface IFACE --scene-id SCENE --operator-id OPERATOR [options]\n\n"
         << "Options:\n"
-        << "  --output-dir PATH        Dataset root directory (default: <collector>/" << kDefaultDataDirName << ")\n"
-        << "  --loop-hz FLOAT          Control and logging loop frequency (default: 50.0)\n"
+        << "  --output-dir PATH        数据集根目录（默认：<collector>/" << kDefaultDataDirName << ")\n"
+        << "  --loop-hz FLOAT          Control 和 logging loop frequency (default: 50.0)\n"
         << "  --video-poll-hz FLOAT    Camera polling frequency (default: 10.0)\n"
         << "  --input-backend MODE     Input backend: evdev or tty (default: evdev)\n"
         << "  --capture-mode MODE      Capture mode: single_action or trajectory (default: single_action)\n"
@@ -620,32 +963,36 @@ void PrintUsage(const char* program)
         << "  --cmd-vx-max FLOAT       Max forward/backward speed in m/s\n"
         << "  --cmd-vy-max FLOAT       Max strafe speed in m/s\n"
         << "  --cmd-wz-max FLOAT       Max yaw speed in rad/s\n"
+        << "  --web-ui                 Enable optional local Web UI\n"
+        << "  --web-port INT           Local Web UI port (default: 8080)\n"
         << "  --help                   Show this help\n\n"
         << "Keyboard:\n"
         << "  W/S  forward/backward\n"
         << "  A/D  strafe left/right\n"
         << "  Q/E  turn left/right\n"
         << "  R    start capture flow for the selected mode\n"
-        << "  T    manually end the current capture if already recording\n"
+        << "  T    manually end the current capture and start labeling if already recording\n"
         << "  ESC  cancel current armed/capture segment\n"
-        << "  Space emergency stop and latch safety fault\n"
+        << "  Space emergency stop 和 latch safety fault\n"
         << "  C    clear fault or toggle stand up/down\n"
         << "  P    print status\n"
         << "  H    print help\n"
         << "  X    quit\n"
         << "Input:\n"
-        << "  evdev supports true multi-key press/release and smoother diagonal motion\n"
-        << "  tty is a fallback mode and may feel less stable for combined keys\n"
+        << "  evdev supports true multi-key press/release 和 smoother diagonal motion\n"
+        << "  tty is a fallback mode 和 may feel less stable for combined keys\n"
         << "Capture modes:\n"
-        << "  single_action arms on R, locks one motion key, waits 0.5s, records until key release\n"
-        << "  trajectory starts recording immediately on R, allows turning/strafe changes, and ends on T\n";
+        << "  single_action arms on R, locks one motion key, waits 0.5s, records until key release, 然后进入标注\n"
+        << "  trajectory starts recording immediately on R, allows turning/strafe changes, 和 ends on T for labeling\n";
 }
 
 std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
 {
     Config config;
     const fs::path collectorRoot = CollectorRootFromArgv0(argv[0]);
+    config.collectorRoot = collectorRoot;
     config.outputDir = collectorRoot / kDefaultDataDirName;
+    ApplyDefaultsFile(CollectorDefaultsPath(collectorRoot), config);
 
     for (int index = 1; index < argc; ++index)
     {
@@ -654,7 +1001,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --network-interface";
+                error = "参数缺少取值：--network-interface";
                 return std::nullopt;
             }
             config.networkInterface = argv[++index];
@@ -663,7 +1010,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --output-dir";
+                error = "参数缺少取值：--output-dir";
                 return std::nullopt;
             }
             fs::path outputDir = argv[++index];
@@ -677,7 +1024,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --loop-hz";
+                error = "参数缺少取值：--loop-hz";
                 return std::nullopt;
             }
             config.loopHz = std::stod(argv[++index]);
@@ -686,7 +1033,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --video-poll-hz";
+                error = "参数缺少取值：--video-poll-hz";
                 return std::nullopt;
             }
             config.videoPollHz = std::stod(argv[++index]);
@@ -695,13 +1042,13 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --input-backend";
+                error = "参数缺少取值：--input-backend";
                 return std::nullopt;
             }
             const auto backend = ParseInputBackend(argv[++index]);
             if (!backend.has_value())
             {
-                error = "input backend must be one of: evdev, tty";
+                error = "输入后端必须是 evdev 或 tty";
                 return std::nullopt;
             }
             config.inputBackend = backend.value();
@@ -710,13 +1057,13 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --capture-mode";
+                error = "参数缺少取值：--capture-mode";
                 return std::nullopt;
             }
             const auto captureMode = ParseCaptureMode(argv[++index]);
             if (!captureMode.has_value())
             {
-                error = "capture mode must be one of: single_action, trajectory";
+                error = "采集模式必须是 single_action 或 trajectory";
                 return std::nullopt;
             }
             config.captureMode = captureMode.value();
@@ -725,7 +1072,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --input-device";
+                error = "参数缺少取值：--input-device";
                 return std::nullopt;
             }
             config.inputDevice = argv[++index];
@@ -734,7 +1081,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --scene-id";
+                error = "参数缺少取值：--scene-id";
                 return std::nullopt;
             }
             config.sceneId = argv[++index];
@@ -743,7 +1090,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --operator-id";
+                error = "参数缺少取值：--operator-id";
                 return std::nullopt;
             }
             config.operatorId = argv[++index];
@@ -752,7 +1099,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --instruction";
+                error = "参数缺少取值：--instruction";
                 return std::nullopt;
             }
             config.instruction = argv[++index];
@@ -761,7 +1108,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --task-family";
+                error = "参数缺少取值：--task-family";
                 return std::nullopt;
             }
             config.taskFamily = argv[++index];
@@ -770,7 +1117,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --target-type";
+                error = "参数缺少取值：--target-type";
                 return std::nullopt;
             }
             config.targetType = argv[++index];
@@ -779,7 +1126,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --target-description";
+                error = "参数缺少取值：--target-description";
                 return std::nullopt;
             }
             config.targetDescription = argv[++index];
@@ -788,7 +1135,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --target-instance-id";
+                error = "参数缺少取值：--target-instance-id";
                 return std::nullopt;
             }
             config.targetInstanceId = argv[++index];
@@ -797,7 +1144,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --task-tags";
+                error = "参数缺少取值：--task-tags";
                 return std::nullopt;
             }
             config.taskTags = SplitCsvList(argv[++index]);
@@ -806,7 +1153,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --collector-notes";
+                error = "参数缺少取值：--collector-notes";
                 return std::nullopt;
             }
             config.collectorNotes = argv[++index];
@@ -815,7 +1162,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --cmd-vx-max";
+                error = "参数缺少取值：--cmd-vx-max";
                 return std::nullopt;
             }
             config.cmdVxMax = std::stod(argv[++index]);
@@ -824,7 +1171,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --cmd-vy-max";
+                error = "参数缺少取值：--cmd-vy-max";
                 return std::nullopt;
             }
             config.cmdVyMax = std::stod(argv[++index]);
@@ -833,10 +1180,23 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --cmd-wz-max";
+                error = "参数缺少取值：--cmd-wz-max";
                 return std::nullopt;
             }
             config.cmdWzMax = std::stod(argv[++index]);
+        }
+        else if (arg == "--web-ui")
+        {
+            config.webUiEnabled = true;
+        }
+        else if (arg == "--web-port")
+        {
+            if (index + 1 >= argc)
+            {
+                error = "参数缺少取值：--web-port";
+                return std::nullopt;
+            }
+            config.webPort = std::stoi(argv[++index]);
         }
         else if (arg == "--help")
         {
@@ -845,7 +1205,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         }
         else
         {
-            error = "unknown argument: " + arg;
+            error = "未知参数：" + arg;
             return std::nullopt;
         }
     }
@@ -861,32 +1221,37 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
 
     if (config.networkInterface.empty())
     {
-        error = "--network-interface is required";
+        error = "--network-interface 为必填参数";
         return std::nullopt;
     }
     if (config.sceneId.empty())
     {
-        error = "--scene-id is required";
+        error = "--scene-id 为必填参数";
         return std::nullopt;
     }
     if (config.operatorId.empty())
     {
-        error = "--operator-id is required";
+        error = "--operator-id 为必填参数";
         return std::nullopt;
     }
     if (config.captureMode == Config::CaptureMode::Trajectory && config.instruction.empty())
     {
-        error = "--instruction is required when --capture-mode trajectory is used";
+        error = "使用 --capture-mode trajectory 时必须提供 --instruction";
         return std::nullopt;
     }
     if (config.loopHz <= 0.0 || config.videoPollHz <= 0.0)
     {
-        error = "frequencies must be positive";
+        error = "频率参数必须为正数";
         return std::nullopt;
     }
     if (config.cmdVxMax <= 0.0 || config.cmdVyMax <= 0.0 || config.cmdWzMax <= 0.0)
     {
-        error = "command limits must be positive";
+        error = "速度上限参数必须为正数";
+        return std::nullopt;
+    }
+    if (config.webPort <= 0 || config.webPort > 65535)
+    {
+        error = "--web-port 必须在 1 到 65535 之间";
         return std::nullopt;
     }
     if (config.inputBackend == Config::InputBackend::Evdev && config.inputDevice.empty())
@@ -894,7 +1259,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         const auto detected = FindDefaultKeyboardDevice();
         if (!detected.has_value())
         {
-            error = "failed to auto-detect keyboard input device under /dev/input";
+            error = "无法在 /dev/input 下自动检测键盘输入设备";
             return std::nullopt;
         }
         config.inputDevice = detected.value();
@@ -922,7 +1287,7 @@ public:
     {
         if (!isatty(STDIN_FILENO))
         {
-            throw std::runtime_error("stdin must be a tty for keyboard teleop");
+            throw std::runtime_error("键盘遥操作模式下，stdin 必须是 tty");
         }
         if (enabled_)
         {
@@ -930,7 +1295,7 @@ public:
         }
         if (tcgetattr(STDIN_FILENO, &original_) != 0)
         {
-            throw std::runtime_error("failed to get terminal attributes");
+            throw std::runtime_error("获取终端属性失败");
         }
         termios raw = original_;
         raw.c_lflag &= static_cast<unsigned int>(~(ICANON | ECHO));
@@ -939,7 +1304,7 @@ public:
         raw.c_cc[VTIME] = 1;
         if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0)
         {
-            throw std::runtime_error("failed to set raw terminal mode");
+            throw std::runtime_error("设置终端 raw 模式失败");
         }
         enabled_ = true;
     }
@@ -1009,6 +1374,8 @@ public:
         size_t bufferedFrames = 0;
         std::string pendingEpisodeId;
         std::string lastEpisodeId;
+        double startTimestamp = 0.0;
+        double endTimestamp = 0.0;
     };
 
     Status GetStatus() const
@@ -1020,6 +1387,11 @@ public:
         status.bufferedFrames = pendingFrames_.size();
         status.pendingEpisodeId = pendingEpisodeId_;
         status.lastEpisodeId = lastRecordedEpisodeId_;
+        if (!pendingFrames_.empty())
+        {
+            status.startTimestamp = pendingFrames_.front().timestamp;
+            status.endTimestamp = pendingFrames_.back().timestamp;
+        }
         return status;
     }
 
@@ -1029,11 +1401,11 @@ public:
         const std::string trimmedOperatorId = Trim(operatorId);
         if (trimmedSceneId.empty())
         {
-            throw std::runtime_error("scene_id must not be empty");
+            throw std::runtime_error("scene_id 不能为空");
         }
         if (trimmedOperatorId.empty())
         {
-            throw std::runtime_error("operator_id must not be empty");
+            throw std::runtime_error("operator_id 不能为空");
         }
 
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1111,7 +1483,7 @@ public:
         pendingTaskMetadata_ = TaskMetadata{};
     }
 
-    std::optional<std::string> FinalizePendingSegment(const std::string& fallbackInstruction)
+    std::optional<std::string> FinalizePendingSegment(const std::string& fallbackInstruction, const TaskMetadata& labelMetadata)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!pendingLabel_ || pendingFrames_.empty())
@@ -1119,10 +1491,13 @@ public:
             return std::nullopt;
         }
         const TaskMetadata resolvedTaskMetadata = ResolveTaskMetadata(pendingTaskMetadata_, fallbackInstruction);
+        const std::string segmentStatus = Trim(labelMetadata.segmentStatus);
+        const std::string success = Trim(labelMetadata.success);
+        const std::string terminationReason = Trim(labelMetadata.terminationReason);
         const std::string trimmedInstruction = Trim(resolvedTaskMetadata.instruction);
         if (trimmedInstruction.empty())
         {
-            throw std::runtime_error("instruction must not be empty");
+            throw std::runtime_error("instruction 不能为空");
         }
 
         std::ostringstream episodeId;
@@ -1146,6 +1521,9 @@ public:
                     << "  \"task_tags\": " << JsonStringArray(resolvedTaskMetadata.taskTags) << ",\n"
                     << "  \"collector_notes\": " << JsonString(resolvedTaskMetadata.collectorNotes) << ",\n"
                     << "  \"instruction_source\": " << JsonString(resolvedTaskMetadata.instructionSource) << ",\n"
+                    << "  \"segment_status\": " << JsonString(segmentStatus) << ",\n"
+                    << "  \"success\": " << JsonString(success) << ",\n"
+                    << "  \"termination_reason\": " << JsonString(terminationReason) << ",\n"
                     << "  \"scene_id\": " << JsonString(pendingSceneId_) << ",\n"
                     << "  \"operator_id\": " << JsonString(pendingOperatorId_) << ",\n"
                     << "  \"frames\": [\n";
@@ -1160,7 +1538,7 @@ public:
             std::ofstream imageFile(imagePath, std::ios::binary);
             if (!imageFile.is_open())
             {
-                throw std::runtime_error("failed to write image file");
+                throw std::runtime_error("写入图像文件失败");
             }
             imageFile.write(reinterpret_cast<const char*>(frame.jpegBytes.data()), static_cast<std::streamsize>(frame.jpegBytes.size()));
             const std::string imageRelPath = fs::relative(imagePath, outputDir_).string();
@@ -1196,6 +1574,9 @@ public:
                         << "        \"target_description\": " << JsonString(resolvedTaskMetadata.targetDescription) << ",\n"
                         << "        \"target_instance_id\": " << JsonString(resolvedTaskMetadata.targetInstanceId) << ",\n"
                         << "        \"instruction_source\": " << JsonString(resolvedTaskMetadata.instructionSource) << ",\n"
+                        << "        \"segment_status\": " << JsonString(segmentStatus) << ",\n"
+                        << "        \"success\": " << JsonString(success) << ",\n"
+                        << "        \"termination_reason\": " << JsonString(terminationReason) << ",\n"
                         << "        \"scene_id\": " << JsonString(pendingSceneId_) << ",\n"
                         << "        \"operator_id\": " << JsonString(pendingOperatorId_) << ",\n"
                         << "        \"state_timestamp\": " << frame.stateTimestamp << ",\n"
@@ -1217,7 +1598,7 @@ public:
         std::ofstream episodeFile(episodesDir_ / (pendingEpisodeId_ + ".json"), std::ios::out | std::ios::trunc);
         if (!episodeFile.is_open())
         {
-            throw std::runtime_error("failed to write episode file");
+            throw std::runtime_error("写入 episode 文件失败");
         }
         episodeFile << episodeJson.str();
         episodeFile.flush();
@@ -1233,6 +1614,9 @@ public:
         summary.taskTags = resolvedTaskMetadata.taskTags;
         summary.collectorNotes = resolvedTaskMetadata.collectorNotes;
         summary.instructionSource = resolvedTaskMetadata.instructionSource;
+        summary.segmentStatus = segmentStatus;
+        summary.success = success;
+        summary.terminationReason = terminationReason;
         summary.sceneId = pendingSceneId_;
         summary.operatorId = pendingOperatorId_;
         summary.numFrames = pendingFrames_.size();
@@ -1271,7 +1655,7 @@ private:
         std::ofstream indexFile(indexPath_, std::ios::out | std::ios::trunc);
         if (!indexFile.is_open())
         {
-            throw std::runtime_error("failed to rewrite index.json");
+            throw std::runtime_error("重写 index.json 失败");
         }
 
         indexFile << std::fixed << std::setprecision(6);
@@ -1293,6 +1677,9 @@ private:
                       << "      \"task_tags\": " << JsonStringArray(summary.taskTags) << ",\n"
                       << "      \"collector_notes\": " << JsonString(summary.collectorNotes) << ",\n"
                       << "      \"instruction_source\": " << JsonString(summary.instructionSource) << ",\n"
+                      << "      \"segment_status\": " << JsonString(summary.segmentStatus) << ",\n"
+                      << "      \"success\": " << JsonString(summary.success) << ",\n"
+                      << "      \"termination_reason\": " << JsonString(summary.terminationReason) << ",\n"
                       << "      \"scene_id\": " << JsonString(summary.sceneId) << ",\n"
                       << "      \"operator_id\": " << JsonString(summary.operatorId) << ",\n"
                       << "      \"num_frames\": " << summary.numFrames << ",\n"
@@ -1333,6 +1720,19 @@ public:
     explicit CollectorApp(const Config& config)
         : config_(config), logger_(config.outputDir)
     {
+        editableConfig_.captureMode = config.captureMode;
+        editableConfig_.sceneId = config.sceneId;
+        editableConfig_.operatorId = config.operatorId;
+        editableConfig_.instruction = config.instruction;
+        editableConfig_.taskFamily = config.taskFamily;
+        editableConfig_.targetType = config.targetType;
+        editableConfig_.targetDescription = config.targetDescription;
+        editableConfig_.targetInstanceId = config.targetInstanceId;
+        editableConfig_.collectorNotes = config.collectorNotes;
+        editableConfig_.taskTags = config.taskTags;
+        editableConfig_.cmdVxMax = config.cmdVxMax;
+        editableConfig_.cmdVyMax = config.cmdVyMax;
+        editableConfig_.cmdWzMax = config.cmdWzMax;
     }
 
     ~CollectorApp()
@@ -1348,6 +1748,86 @@ public:
     void RequestQuit()
     {
         quitRequested_.store(true);
+    }
+
+    EditableCollectorConfig GetEditableConfigSnapshot() const
+    {
+        std::lock_guard<std::mutex> lock(editableConfigMutex_);
+        return editableConfig_;
+    }
+
+    UiActionResult UpdateEditableConfig(const UiConfigUpdateInput& input)
+    {
+        EditableCollectorConfig updated = GetEditableConfigSnapshot();
+        const auto loggerStatus = logger_.GetStatus();
+        CaptureState captureState;
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            captureState = captureState_;
+        }
+        updated.sceneId = Trim(input.sceneId);
+        updated.operatorId = Trim(input.operatorId);
+        updated.instruction = Trim(input.instruction);
+        updated.taskFamily = Trim(input.taskFamily);
+        updated.targetType = Trim(input.targetType);
+        updated.targetDescription = Trim(input.targetDescription);
+        updated.targetInstanceId = Trim(input.targetInstanceId);
+        updated.collectorNotes = Trim(input.collectorNotes);
+        updated.taskTags = SplitCsvList(input.taskTagsCsv);
+        updated.cmdVxMax = input.cmdVxMax;
+        updated.cmdVyMax = input.cmdVyMax;
+        updated.cmdWzMax = input.cmdWzMax;
+
+        const auto captureMode = ParseCaptureMode(Trim(input.captureMode));
+        if (!captureMode.has_value())
+        {
+            return ActionError("validation_error", "capture_mode 非法");
+        }
+        updated.captureMode = captureMode.value();
+        if (updated.captureMode != GetEditableConfigSnapshot().captureMode &&
+            (captureState == CaptureState::Capturing ||
+             captureState == CaptureState::Armed ||
+             captureState == CaptureState::DelayBeforeLog ||
+             loggerStatus.pendingLabel))
+        {
+            return ActionError("invalid_state", "当前有活动区间时不能切换 capture_mode");
+        }
+
+        if (updated.sceneId.empty())
+        {
+            return ActionError("validation_error", "scene_id 不能为空");
+        }
+        if (updated.operatorId.empty())
+        {
+            return ActionError("validation_error", "operator_id 不能为空");
+        }
+        if (updated.captureMode == Config::CaptureMode::Trajectory && updated.instruction.empty())
+        {
+            return ActionError("validation_error", "trajectory 模式下 instruction 不能为空");
+        }
+        if (updated.cmdVxMax <= 0.0 || updated.cmdVyMax <= 0.0 || updated.cmdWzMax <= 0.0)
+        {
+            return ActionError("validation_error", "速度上限必须为正数");
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(editableConfigMutex_);
+            editableConfig_ = updated;
+        }
+        return ActionOk("collector 参数已更新，将用于后续采集段");
+    }
+
+    UiActionResult SaveEditableConfigAsDefaults()
+    {
+        try
+        {
+            SaveDefaultsFile(CollectorDefaultsPath(config_.collectorRoot), GetEditableConfigSnapshot());
+            return ActionOk("已保存为下次启动默认值");
+        }
+        catch (const std::exception& ex)
+        {
+            return ActionError("save_defaults_failed", ex.what());
+        }
     }
 
     void Start()
@@ -1386,16 +1866,47 @@ public:
         keyboardThread_ = std::thread(&CollectorApp::KeyboardLoop, this);
         videoThread_ = std::thread(&CollectorApp::VideoLoop, this);
 
+        if (config_.webUiEnabled)
+        {
+            WebUiServerConfig webConfig;
+            webConfig.port = config_.webPort;
+            webConfig.assetDir = (config_.collectorRoot / "native" / "web_ui_assets").string();
+            webConfig.statusProvider = [this]() { return GetUiStatusSnapshot(); };
+            webConfig.startHandler = [this]() { return RequestBeginSegment(); };
+            webConfig.stopHandler = [this]() { return RequestStopSegmentForLabel(); };
+            webConfig.discardHandler = [this]() { return RequestDiscardSegment("discarded by web ui"); };
+            webConfig.estopHandler = [this]() { return RequestEmergencyStopFromUi(); };
+            webConfig.clearFaultHandler = [this]() { return RequestClearFaultFromUi(); };
+            webConfig.submitLabelHandler = [this](const SegmentLabelInput& input)
+            {
+                return SubmitPendingLabel(input);
+            };
+            webConfig.updateConfigHandler = [this](const UiConfigUpdateInput& input)
+            {
+                return UpdateEditableConfig(input);
+            };
+            webConfig.saveDefaultsHandler = [this]()
+            {
+                return SaveEditableConfigAsDefaults();
+            };
+            webUiServer_ = std::make_unique<WebUiServer>(webConfig);
+            webUiServer_->Start();
+        }
+
         {
             std::lock_guard<std::mutex> lock(commandMutex_);
             latestCommand_.valid = true;
             latestCommand_.timestamp = NowSeconds();
         }
 
-        PrintLine("session directory: " + logger_.OutputDir().string());
-        PrintLine("input backend: " + InputBackendName(config_.inputBackend) +
+        PrintLine("session 目录：" + logger_.OutputDir().string());
+        PrintLine("输入后端：" + InputBackendName(config_.inputBackend) +
                   (config_.inputDevice.empty() ? "" : " device=" + config_.inputDevice.string()));
-        PrintLine("collector ready; press H for help");
+        if (config_.webUiEnabled)
+        {
+            PrintLine("Web UI：http://127.0.0.1:" + std::to_string(config_.webPort));
+        }
+        PrintLine("collector 已就绪；按 H 查看帮助");
         PrintHelp();
     }
 
@@ -1407,6 +1918,10 @@ public:
         }
 
         imageUpdatedCv_.notify_all();
+        if (webUiServer_)
+        {
+            webUiServer_->Stop();
+        }
 
         if (sportStateSubscriber_)
         {
@@ -1436,6 +1951,186 @@ public:
         CloseEvdevInput();
         terminalGuard_.Disable();
         logger_.CleanupIfEmpty();
+        webUiServer_.reset();
+    }
+
+    UiStatusSnapshot GetUiStatusSnapshot() const
+    {
+        LatestState state;
+        LatestImage image;
+        VelocityCommand command;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            state = latestState_;
+        }
+        {
+            std::lock_guard<std::mutex> lock(imageMutex_);
+            image = latestImage_;
+        }
+        {
+            std::lock_guard<std::mutex> lock(commandMutex_);
+            command = latestCommand_;
+        }
+
+        UiStatusSnapshot snapshot;
+        CaptureState captureState;
+        SafetyState safetyState;
+        std::string faultReason;
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            captureState = captureState_;
+            safetyState = safetyState_;
+            faultReason = latchedFaultReason_;
+        }
+        const auto loggerStatus = logger_.GetStatus();
+        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
+        const double nowSeconds = NowSeconds();
+        snapshot.running = running_.load();
+        snapshot.webUiEnabled = config_.webUiEnabled;
+        snapshot.webPort = config_.webPort;
+        snapshot.sessionDir = logger_.OutputDir().string();
+        snapshot.captureMode = CaptureModeName(editable.captureMode);
+        snapshot.bufferedFrames = loggerStatus.bufferedFrames;
+        snapshot.segmentDurationSeconds = loggerStatus.bufferedFrames >= 2
+                                              ? std::max(0.0, loggerStatus.endTimestamp - loggerStatus.startTimestamp)
+                                              : 0.0;
+        snapshot.stateValid = state.valid;
+        snapshot.imageValid = image.valid;
+        snapshot.stateAgeSeconds = AgeSeconds(state.timestamp, nowSeconds);
+        snapshot.imageAgeSeconds = AgeSeconds(image.timestamp, nowSeconds);
+        snapshot.robotConnected = snapshot.stateValid && snapshot.stateAgeSeconds >= 0.0 && snapshot.stateAgeSeconds <= kStateTimeoutSeconds;
+        snapshot.bodyHeight = state.bodyHeight;
+        snapshot.roll = state.roll;
+        snapshot.pitch = state.pitch;
+        snapshot.yaw = state.yaw;
+        snapshot.commandVx = command.vx;
+        snapshot.commandVy = command.vy;
+        snapshot.commandWz = command.wz;
+        snapshot.sceneId = editable.sceneId;
+        snapshot.operatorId = editable.operatorId;
+        snapshot.instruction = editable.instruction;
+        snapshot.taskFamily = editable.taskFamily;
+        snapshot.targetType = editable.targetType;
+        snapshot.targetDescription = editable.targetDescription;
+        snapshot.targetInstanceId = editable.targetInstanceId;
+        snapshot.taskTagsCsv = JoinCsvList(editable.taskTags);
+        snapshot.collectorNotes = editable.collectorNotes;
+        snapshot.cmdVxMax = editable.cmdVxMax;
+        snapshot.cmdVyMax = editable.cmdVyMax;
+        snapshot.cmdWzMax = editable.cmdWzMax;
+        snapshot.networkInterface = config_.networkInterface;
+        snapshot.outputDir = config_.outputDir.string();
+        snapshot.loopHz = config_.loopHz;
+        snapshot.videoPollHz = config_.videoPollHz;
+        snapshot.inputBackend = InputBackendName(config_.inputBackend);
+        snapshot.inputDevice = config_.inputDevice.string();
+        snapshot.defaultsPath = CollectorDefaultsPath(config_.collectorRoot).string();
+        snapshot.pendingLabelActive = loggerStatus.pendingLabel;
+        snapshot.pendingEpisodeId = loggerStatus.pendingEpisodeId;
+        snapshot.pendingLabelBufferedFrames = loggerStatus.bufferedFrames;
+        snapshot.captureState = CaptureStateName(captureState);
+        snapshot.safetyState = SafetyStateName(safetyState);
+        snapshot.faultReason = faultReason;
+        snapshot.recording = captureState == CaptureState::Capturing;
+        snapshot.actions.canStartRecording = safetyState == SafetyState::SafeReady &&
+                                             captureState == CaptureState::Idle &&
+                                             !loggerStatus.pendingLabel;
+        snapshot.actions.canStopRecording = captureState == CaptureState::Capturing;
+        snapshot.actions.canDiscardSegment = captureState == CaptureState::Armed ||
+                                             captureState == CaptureState::DelayBeforeLog ||
+                                             captureState == CaptureState::Capturing ||
+                                             loggerStatus.pendingLabel;
+        snapshot.actions.canSubmitLabel = loggerStatus.pendingLabel;
+        snapshot.actions.canEstop = safetyState != SafetyState::EstopLatched;
+        snapshot.actions.canClearFault = safetyState != SafetyState::SafeReady;
+        return snapshot;
+    }
+
+    UiActionResult RequestBeginSegment()
+    {
+        return BeginSegmentInternal(true);
+    }
+
+    UiActionResult RequestStopSegmentForLabel()
+    {
+        return StopSegmentForLabelInternal(true);
+    }
+
+    UiActionResult RequestDiscardSegment(const std::string& reason)
+    {
+        return DiscardSegmentInternal(reason, true);
+    }
+
+    UiActionResult RequestEmergencyStopFromUi()
+    {
+        SafetyState safetyState;
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            safetyState = safetyState_;
+        }
+        if (safetyState == SafetyState::EstopLatched)
+        {
+            return ActionError("already_estop", "急停已锁定");
+        }
+        RequestEmergencyStop("web_ui_estop");
+        return ActionOk("急停已锁定");
+    }
+
+    UiActionResult RequestClearFaultFromUi()
+    {
+        bool hasFault = false;
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            hasFault = safetyState_ != SafetyState::SafeReady;
+        }
+        if (!hasFault)
+        {
+            return ActionError("no_fault", "当前没有 safety fault");
+        }
+        std::string reason;
+        if (!CanClearFault(reason))
+        {
+            return ActionError("cannot_clear_fault", "无法清除 safety fault：" + reason);
+        }
+        ClearLatchedFault();
+        PrintLine("safety fault 已清除");
+        return ActionOk("safety fault 已清除");
+    }
+
+    UiActionResult SubmitPendingLabel(const SegmentLabelInput& input)
+    {
+        const auto loggerStatus = logger_.GetStatus();
+        if (!loggerStatus.pendingLabel)
+        {
+            return ActionError("no_pending_label", "当前没有待标注区间");
+        }
+
+        const std::string segmentStatus = Trim(input.segmentStatus);
+        if (!IsValidSegmentStatusValue(segmentStatus))
+        {
+            return ActionError("validation_error", "segment_status 非法");
+        }
+        if (segmentStatus == SegmentStatusName(SegmentStatus::Discard))
+        {
+            return DiscardSegmentInternal("discarded by web label", true);
+        }
+
+        const std::string success = Trim(input.success);
+        const std::string terminationReason = Trim(input.terminationReason);
+        if (!IsValidSuccessValue(success))
+        {
+            return ActionError("validation_error", "success 非法");
+        }
+        if (!IsValidTerminationReasonValue(terminationReason))
+        {
+            return ActionError("validation_error", "termination_reason 非法");
+        }
+
+        TaskMetadata labelMetadata;
+        labelMetadata.segmentStatus = segmentStatus;
+        labelMetadata.success = success;
+        labelMetadata.terminationReason = terminationReason;
+        return FinalizePendingLabelInternal(labelMetadata, true);
     }
 
 private:
@@ -1525,29 +2220,153 @@ private:
         std::cout << "\r\33[2K" << line << std::endl;
     }
 
+    std::optional<std::string> PromptForSelection(
+        const std::string& title,
+        const std::vector<std::pair<std::string, std::string>>& options)
+    {
+        if (!isatty(STDIN_FILENO))
+        {
+            PrintLine("stdin 不是 tty，无法进行区间标注");
+            return std::nullopt;
+        }
+
+        promptCancelRequested_.store(false);
+        promptActive_.store(true);
+        struct PromptRestore
+        {
+            std::atomic<bool>& promptActive;
+
+            ~PromptRestore()
+            {
+                promptActive.store(false);
+            }
+        } restore{promptActive_};
+
+        while (running_.load())
+        {
+            {
+                std::lock_guard<std::mutex> lock(outputMutex_);
+                std::cout << "\r\33[2K" << title << std::endl;
+                for (const auto& option : options)
+                {
+                    std::cout << "  " << option.first << " = " << option.second << std::endl;
+                }
+                std::cout << "  ESC = discard" << std::endl;
+                std::cout << "> " << std::flush;
+            }
+
+            while (running_.load())
+            {
+                if (promptCancelRequested_.exchange(false))
+                {
+                    return std::nullopt;
+                }
+
+                pollfd pfd{STDIN_FILENO, POLLIN, 0};
+                const int pollResult = ::poll(&pfd, 1, 100);
+                if (pollResult < 0)
+                {
+                    PrintLine("等待标注输入失败");
+                    return std::nullopt;
+                }
+                if (pollResult == 0 || (pfd.revents & POLLIN) == 0)
+                {
+                    continue;
+                }
+
+                char ch = 0;
+                const ssize_t bytesRead = ::read(STDIN_FILENO, &ch, 1);
+                if (bytesRead <= 0)
+                {
+                    continue;
+                }
+                if (ch == kEscapeKey)
+                {
+                    return std::nullopt;
+                }
+                if (ch == '\r' || ch == '\n')
+                {
+                    continue;
+                }
+
+                const std::string input(1, ch);
+                for (const auto& option : options)
+                {
+                    if (input == option.first)
+                    {
+                        return option.second;
+                    }
+                }
+                PrintLine("输入无效，请按编号重新输入，或按 ESC 丢弃");
+                break;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<std::string> PromptSegmentStatus()
+    {
+        return PromptForSelection(
+            "请选择 segment_status",
+            {
+                {"1", SegmentStatusName(SegmentStatus::Clean)},
+                {"2", SegmentStatusName(SegmentStatus::Usable)},
+                {"3", SegmentStatusName(SegmentStatus::Discard)},
+            });
+    }
+
+    std::optional<std::string> PromptSuccessLabel()
+    {
+        return PromptForSelection(
+            "请选择 success",
+            {
+                {"1", SuccessLabelName(SuccessLabel::Success)},
+                {"2", SuccessLabelName(SuccessLabel::Partial)},
+                {"3", SuccessLabelName(SuccessLabel::Fail)},
+            });
+    }
+
+    std::optional<std::string> PromptTerminationReason()
+    {
+        return PromptForSelection(
+            "请选择 termination_reason",
+            {
+                {"1", TerminationReasonName(TerminationReason::GoalReached)},
+                {"2", TerminationReasonName(TerminationReason::NearGoalStop)},
+                {"3", TerminationReasonName(TerminationReason::Occluded)},
+                {"4", TerminationReasonName(TerminationReason::TargetLost)},
+                {"5", TerminationReasonName(TerminationReason::OperatorStop)},
+                {"6", TerminationReasonName(TerminationReason::BadDemo)},
+                {"7", TerminationReasonName(TerminationReason::Unsafe)},
+                {"8", TerminationReasonName(TerminationReason::Timeout)},
+            });
+    }
+
     void PrintHelp() const
     {
+        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
         std::lock_guard<std::mutex> lock(outputMutex_);
         std::cout << "\r\33[2KKeys:" << std::endl;
         std::cout << "  W/S forward/backward  A/D strafe  Q/E yaw" << std::endl;
         std::cout << "  R start capture flow  ESC cancel current armed/capture segment" << std::endl;
         std::cout << "  Space emergency stop  C clear fault or toggle stand up/down  P status  H help  X quit" << std::endl;
-        if (config_.captureMode == Config::CaptureMode::SingleAction)
+        if (editable.captureMode == Config::CaptureMode::SingleAction)
         {
-            std::cout << "  single_action mode: capture starts 0.5s after first valid motion input and auto-stops on key release" << std::endl;
-            std::cout << "  semantic instruction is taken from --instruction if set, otherwise falls back to the motion label" << std::endl;
+            std::cout << "  single_action 模式：检测到第一个有效单动作输入后，等待 0.5 秒开始录制，松键自动结束" << std::endl;
+            std::cout << "  若设置 --instruction，则使用该语义指令；否则回退为动作标签" << std::endl;
         }
         else
         {
-            std::cout << "  trajectory mode: capture starts immediately on R, allows multi-stage motion changes, and stops on T" << std::endl;
-            std::cout << "  --instruction is required and is stored as the trajectory-level semantic label" << std::endl;
+            std::cout << "  trajectory 模式：按 R 立即开始录制，允许多阶段动作变化，按 T 结束后进行标注" << std::endl;
+            std::cout << "  该模式下必须提供 --instruction，并作为轨迹级语义标签保存" << std::endl;
         }
         std::cout << "  input_backend=" << InputBackendName(config_.inputBackend)
-                  << " capture_mode=" << CaptureModeName(config_.captureMode) << std::endl;
+                  << " capture_mode=" << CaptureModeName(editable.captureMode) << std::endl;
     }
 
     void PrintStatus() const
     {
+        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
         LatestState state;
         LatestImage image;
         VelocityCommand command;
@@ -1601,13 +2420,13 @@ private:
             << "capture_state=" << CaptureStateName(captureState)
             << " safety_state=" << SafetyStateName(safetyState)
             << " fault_reason=" << (faultReason.empty() ? "-" : faultReason)
-            << " scene_id=" << config_.sceneId
-            << " operator_id=" << config_.operatorId
-            << " capture_mode=" << CaptureModeName(config_.captureMode)
-            << " configured_instruction=" << (config_.instruction.empty() ? "-" : config_.instruction)
-            << " task_family=" << (config_.taskFamily.empty() ? "-" : config_.taskFamily)
-            << " target_type=" << (config_.targetType.empty() ? "-" : config_.targetType)
-            << " target_description=" << (config_.targetDescription.empty() ? "-" : config_.targetDescription)
+            << " scene_id=" << editable.sceneId
+            << " operator_id=" << editable.operatorId
+            << " capture_mode=" << CaptureModeName(editable.captureMode)
+            << " configured_instruction=" << (editable.instruction.empty() ? "-" : editable.instruction)
+            << " task_family=" << (editable.taskFamily.empty() ? "-" : editable.taskFamily)
+            << " target_type=" << (editable.targetType.empty() ? "-" : editable.targetType)
+            << " target_description=" << (editable.targetDescription.empty() ? "-" : editable.targetDescription)
             << " buffered_frames=" << loggerStatus.bufferedFrames
             << " state=" << state.valid
             << " image=" << image.valid
@@ -1636,7 +2455,7 @@ private:
         evdevFd_ = ::open(config_.inputDevice.c_str(), O_RDONLY | O_NONBLOCK);
         if (evdevFd_ < 0)
         {
-            throw std::runtime_error("failed to open input device: " + config_.inputDevice.string());
+            throw std::runtime_error("打开输入设备失败：" + config_.inputDevice.string());
         }
     }
 
@@ -1719,7 +2538,7 @@ private:
     void RequestEmergencyStop(const std::string& reason)
     {
         LatchFault(SafetyState::EstopLatched, reason);
-        PrintLine("emergency stop latched: " + reason);
+        PrintLine("急停已锁定：" + reason);
     }
 
     void ClearFaultOrToggleStandState()
@@ -1740,18 +2559,18 @@ private:
             if (CanClearFault(reason))
             {
                 ClearLatchedFault();
-                PrintLine("safety fault cleared");
+                PrintLine("safety fault 已清除");
             }
             else
             {
-                PrintLine("cannot clear safety fault: " + reason);
+                PrintLine("无法清除 safety fault：" + reason);
             }
             return;
         }
 
         if (segmentActive)
         {
-            PrintLine("finish or discard the active segment first");
+            PrintLine("请先结束或丢弃当前采集段");
             return;
         }
 
@@ -1767,97 +2586,138 @@ private:
             std::lock_guard<std::mutex> sportLock(sportClientMutex_);
             if (!sportClient_)
             {
-                PrintLine("sport client is not ready");
+                PrintLine("sport client 尚未准备好");
                 return;
             }
             sportClient_->StopMove();
             if (shouldStandDown)
             {
                 sportClient_->StandDown();
-                PrintLine("requested stand down");
+                PrintLine("已请求趴下");
             }
             else
             {
                 sportClient_->StandUp();
-                PrintLine("requested stand up");
+                PrintLine("已请求站起");
             }
         }
         catch (...)
         {
-            PrintLine("failed to toggle stand state");
+            PrintLine("切换站立状态失败");
         }
     }
 
     TaskMetadata ConfiguredTaskMetadata() const
     {
+        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
         TaskMetadata metadata;
-        metadata.instruction = config_.instruction;
-        metadata.captureMode = CaptureModeName(config_.captureMode);
-        metadata.taskFamily = config_.taskFamily;
-        metadata.targetType = config_.targetType;
-        metadata.targetDescription = config_.targetDescription;
-        metadata.targetInstanceId = config_.targetInstanceId;
-        metadata.taskTags = config_.taskTags;
-        metadata.collectorNotes = config_.collectorNotes;
+        metadata.instruction = editable.instruction;
+        metadata.captureMode = CaptureModeName(editable.captureMode);
+        metadata.taskFamily = editable.taskFamily;
+        metadata.targetType = editable.targetType;
+        metadata.targetDescription = editable.targetDescription;
+        metadata.targetInstanceId = editable.targetInstanceId;
+        metadata.taskTags = editable.taskTags;
+        metadata.collectorNotes = editable.collectorNotes;
         metadata.instructionSource = metadata.instruction.empty() ? "motion_label" : "semantic_text";
         return metadata;
     }
 
-    void BeginSegment()
+    UiActionResult BeginSegmentInternal(bool emitLog)
     {
+        const bool hasPendingLabel = logger_.GetStatus().pendingLabel;
         std::lock_guard<std::mutex> lock(stateMachineMutex_);
         if (safetyState_ != SafetyState::SafeReady)
         {
-            PrintLine("cannot start segment while safety fault is latched");
-            return;
+            if (emitLog)
+            {
+                PrintLine("当前 safety fault 已锁定，无法启动采集段");
+            }
+            return ActionError("fault_latched", "当前 safety fault 已锁定");
         }
         if (captureState_ == CaptureState::Capturing)
         {
-            PrintLine("segment already active");
-            return;
+            if (emitLog)
+            {
+                PrintLine("当前已有采集段正在进行");
+            }
+            return ActionError("already_capturing", "当前已有采集段正在进行");
         }
         if (captureState_ == CaptureState::Armed || captureState_ == CaptureState::DelayBeforeLog)
         {
-            PrintLine("segment already armed");
-            return;
+            if (emitLog)
+            {
+                PrintLine("当前已有采集段处于 armed 状态");
+            }
+            return ActionError("already_armed", "当前已有采集段处于 armed 状态");
         }
+        if (hasPendingLabel)
+        {
+            if (emitLog)
+            {
+                PrintLine("当前有待标注区间，请先提交或丢弃");
+            }
+            return ActionError("pending_label", "当前有待标注区间");
+        }
+
         try
         {
-            if (config_.captureMode == Config::CaptureMode::Trajectory)
+            const EditableCollectorConfig editable = GetEditableConfigSnapshot();
+            if (editable.captureMode == Config::CaptureMode::Trajectory)
             {
-                logger_.BeginSegment(config_.sceneId, config_.operatorId, ConfiguredTaskMetadata());
+                logger_.BeginSegment(editable.sceneId, editable.operatorId, ConfiguredTaskMetadata());
                 captureState_ = CaptureState::Capturing;
                 activeMotionInstruction_ = MotionInstruction::None;
                 captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-                PrintLine("trajectory capture started; press T to save or ESC to discard");
+                pendingLabelFallbackInstruction_.clear();
+                if (emitLog)
+                {
+                    PrintLine("trajectory 采集已开始；按 T 结束并标注，按 ESC 丢弃");
+                }
             }
             else
             {
                 captureState_ = CaptureState::Armed;
                 activeMotionInstruction_ = MotionInstruction::None;
                 captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-                PrintLine("segment armed; waiting for a single valid motion input");
+                pendingLabelFallbackInstruction_.clear();
+                if (emitLog)
+                {
+                    PrintLine("采集段已 armed，等待单一有效动作输入");
+                }
             }
         }
         catch (const std::exception& ex)
         {
-            PrintLine(std::string("failed to start segment: ") + ex.what());
+            if (emitLog)
+            {
+                PrintLine(std::string("启动采集段失败：") + ex.what());
+            }
+            return ActionError("start_failed", ex.what());
         }
+
+        return ActionOk("segment started");
     }
 
-    void EndSegment()
+    UiActionResult StopSegmentForLabelInternal(bool emitLog)
     {
+        const bool hasPendingLabel = logger_.GetStatus().pendingLabel;
         MotionInstruction instruction = MotionInstruction::None;
-        std::string savedInstruction;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
             if (captureState_ != CaptureState::Capturing)
             {
-                PrintLine("no active segment to end");
-                return;
+                if (hasPendingLabel)
+                {
+                    return ActionError("already_waiting_label", "当前区间正在等待标注");
+                }
+                if (emitLog)
+                {
+                    PrintLine("当前没有可结束的采集段");
+                }
+                return ActionError("not_capturing", "当前没有可结束的采集段");
             }
             instruction = activeMotionInstruction_;
-            savedInstruction = config_.instruction.empty() ? MotionInstructionName(instruction) : config_.instruction;
         }
 
         const size_t frameCount = logger_.EndSegmentForLabel();
@@ -1868,51 +2728,163 @@ private:
             captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
             activeMotionInstruction_ = MotionInstruction::None;
             captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-            PrintLine("segment discarded because it contains no frames");
-            return;
+            pendingLabelFallbackInstruction_.clear();
+            if (emitLog)
+            {
+                PrintLine("该段未记录到有效帧，已丢弃");
+            }
+            return ActionError("empty_segment", "该段未记录到有效帧");
         }
 
-        try
         {
-            const auto episodeId = logger_.FinalizePendingSegment(MotionInstructionName(instruction));
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
             captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
             activeMotionInstruction_ = MotionInstruction::None;
             captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-            if (episodeId.has_value())
+            pendingLabelFallbackInstruction_ = MotionInstructionName(instruction);
+        }
+        if (emitLog)
+        {
+            PrintLine("采集段已结束，等待标注或丢弃");
+        }
+        return ActionOk("segment stopped for labeling");
+    }
+
+    UiActionResult DiscardSegmentInternal(const std::string& reason, bool emitLog)
+    {
+        const bool hasPendingLabel = logger_.GetStatus().pendingLabel;
+        bool hasActiveOrPending = false;
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            hasActiveOrPending = captureState_ == CaptureState::Capturing ||
+                                 captureState_ == CaptureState::Armed ||
+                                 captureState_ == CaptureState::DelayBeforeLog;
+            if (!hasActiveOrPending)
             {
-                PrintLine("saved episode " + episodeId.value() + " instruction=" + savedInstruction);
+                hasActiveOrPending = hasPendingLabel;
             }
-            else
+            if (!hasActiveOrPending)
             {
-                PrintLine("no pending segment to save");
+                return ActionError("nothing_to_discard", "当前没有可丢弃区间");
             }
+            captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
+            activeMotionInstruction_ = MotionInstruction::None;
+            captureStartDeadline_ = std::chrono::steady_clock::time_point{};
+            pendingLabelFallbackInstruction_.clear();
+        }
+        logger_.DiscardPendingSegment();
+        if (emitLog)
+        {
+            PrintLine("采集段已丢弃：" + reason);
+        }
+        return ActionOk("segment discarded");
+    }
+
+    UiActionResult FinalizePendingLabelInternal(const TaskMetadata& labelMetadata, bool emitLog)
+    {
+        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
+        const std::string savedInstruction = editable.instruction.empty()
+                                                 ? pendingLabelFallbackInstruction_
+                                                 : editable.instruction;
+        try
+        {
+            const auto episodeId = logger_.FinalizePendingSegment(pendingLabelFallbackInstruction_, labelMetadata);
+            if (!episodeId.has_value())
+            {
+                return ActionError("no_pending_label", "当前没有待保存的采集段");
+            }
+            {
+                std::lock_guard<std::mutex> lock(stateMachineMutex_);
+                pendingLabelFallbackInstruction_.clear();
+            }
+            if (emitLog)
+            {
+                PrintLine(
+                    "已保存 episode " + episodeId.value() +
+                    " 指令=" + savedInstruction +
+                    " segment_status=" + labelMetadata.segmentStatus +
+                    " success=" + labelMetadata.success +
+                    " termination_reason=" + labelMetadata.terminationReason);
+            }
+            return ActionOk("episode saved", episodeId.value());
         }
         catch (const std::exception& ex)
         {
             logger_.DiscardPendingSegment();
-            std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
-            activeMotionInstruction_ = MotionInstruction::None;
-            captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-            PrintLine(std::string("failed to finalize segment: ") + ex.what());
+            {
+                std::lock_guard<std::mutex> lock(stateMachineMutex_);
+                captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
+                activeMotionInstruction_ = MotionInstruction::None;
+                captureStartDeadline_ = std::chrono::steady_clock::time_point{};
+                pendingLabelFallbackInstruction_.clear();
+            }
+            if (emitLog)
+            {
+                PrintLine(std::string("结束采集段失败：") + ex.what());
+            }
+            return ActionError("finalize_failed", ex.what());
         }
+    }
+
+    void PromptAndFinalizePendingSegment()
+    {
+        const auto segmentStatus = PromptSegmentStatus();
+        if (!segmentStatus.has_value())
+        {
+            DiscardSegmentInternal("cancelled during labeling", true);
+            return;
+        }
+
+        SegmentLabelInput input;
+        input.segmentStatus = segmentStatus.value();
+        if (input.segmentStatus != SegmentStatusName(SegmentStatus::Discard))
+        {
+            const auto success = PromptSuccessLabel();
+            if (!success.has_value())
+            {
+                DiscardSegmentInternal("cancelled during labeling", true);
+                return;
+            }
+            input.success = success.value();
+
+            const auto terminationReason = PromptTerminationReason();
+            if (!terminationReason.has_value())
+            {
+                DiscardSegmentInternal("cancelled during labeling", true);
+                return;
+            }
+            input.terminationReason = terminationReason.value();
+        }
+
+        const UiActionResult result = SubmitPendingLabel(input);
+        if (!result.ok)
+        {
+            PrintLine("标注提交失败：" + result.message);
+        }
+    }
+
+    void BeginSegment()
+    {
+        BeginSegmentInternal(true);
+    }
+
+    void EndSegment()
+    {
+        const UiActionResult result = StopSegmentForLabelInternal(true);
+        if (!result.ok)
+        {
+            return;
+        }
+        if (config_.webUiEnabled)
+        {
+            return;
+        }
+        PromptAndFinalizePendingSegment();
     }
 
     void CancelCurrentSegment(const std::string& reason)
     {
-        std::lock_guard<std::mutex> lock(stateMachineMutex_);
-        if (captureState_ != CaptureState::Capturing &&
-            captureState_ != CaptureState::Armed &&
-            captureState_ != CaptureState::DelayBeforeLog)
-        {
-            return;
-        }
-        logger_.DiscardPendingSegment();
-        captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
-        activeMotionInstruction_ = MotionInstruction::None;
-        captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-        PrintLine("segment discarded: " + reason);
+        DiscardSegmentInternal(reason, true);
     }
 
     void StopMotion()
@@ -1927,7 +2899,7 @@ private:
         }
         catch (...)
         {
-            PrintLine("StopMove failed");
+            PrintLine("StopMove 调用失败");
         }
     }
 
@@ -1939,19 +2911,20 @@ private:
         }
         try
         {
-            logger_.BeginSegment(config_.sceneId, config_.operatorId, ConfiguredTaskMetadata());
+            const EditableCollectorConfig editable = GetEditableConfigSnapshot();
+            logger_.BeginSegment(editable.sceneId, editable.operatorId, ConfiguredTaskMetadata());
             {
                 std::lock_guard<std::mutex> lock(stateMachineMutex_);
                 activeMotionInstruction_ = instruction;
                 captureStartDeadline_ = std::chrono::steady_clock::now() + kCaptureStartDelay;
                 captureState_ = CaptureState::DelayBeforeLog;
             }
-            const std::string label = config_.instruction.empty() ? MotionInstructionName(instruction) : config_.instruction;
-            PrintLine("locked segment label=" + label + ", logging starts in 0.5s");
+            const std::string label = editable.instruction.empty() ? MotionInstructionName(instruction) : editable.instruction;
+            PrintLine("已锁定采集段标签=" + label + "，将在 0.5 秒后开始记录");
         }
         catch (const std::exception& ex)
         {
-            PrintLine(std::string("failed to arm segment logging: ") + ex.what());
+            PrintLine(std::string("准备采集段记录失败：") + ex.what());
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
             captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
             activeMotionInstruction_ = MotionInstruction::None;
@@ -1961,7 +2934,7 @@ private:
 
     void UpdateCaptureStateFromMotion(const MotionStateSnapshot& motionState)
     {
-        if (config_.captureMode == Config::CaptureMode::Trajectory)
+        if (GetEditableConfigSnapshot().captureMode == Config::CaptureMode::Trajectory)
         {
             return;
         }
@@ -1997,12 +2970,12 @@ private:
         {
             if (motionInstruction == MotionInstruction::None)
             {
-                CancelCurrentSegment("first motion ended before logging delay elapsed");
+                CancelCurrentSegment("首次动作在录制延迟结束前就已结束");
                 return;
             }
             if (motionInstruction == MotionInstruction::Mixed || motionInstruction != activeInstruction)
             {
-                CancelCurrentSegment("discarded due to mixed input before logging started");
+                CancelCurrentSegment("录制开始前检测到混合输入，已丢弃");
                 return;
             }
             if (std::chrono::steady_clock::now() >= captureStartDeadline)
@@ -2011,7 +2984,7 @@ private:
                 if (captureState_ == CaptureState::DelayBeforeLog)
                 {
                     captureState_ = CaptureState::Capturing;
-                    PrintLine("segment capture started instruction=" + MotionInstructionName(activeMotionInstruction_));
+                    PrintLine("segment capture started 指令=" + MotionInstructionName(activeMotionInstruction_));
                 }
             }
             return;
@@ -2021,7 +2994,7 @@ private:
         {
             if (motionInstruction == MotionInstruction::Mixed || (motionInstruction != MotionInstruction::None && motionInstruction != activeInstruction))
             {
-                CancelCurrentSegment("discarded due to mixed input");
+                CancelCurrentSegment("检测到混合输入，已丢弃");
                 return;
             }
             if (motionInstruction == MotionInstruction::None)
@@ -2148,9 +3121,10 @@ private:
 
         VelocityCommand command;
         command.timestamp = NowSeconds();
-        command.vx = smoothedVx_ * static_cast<float>(config_.cmdVxMax);
-        command.vy = smoothedVy_ * static_cast<float>(config_.cmdVyMax);
-        command.wz = smoothedWz_ * static_cast<float>(config_.cmdWzMax);
+        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
+        command.vx = smoothedVx_ * static_cast<float>(editable.cmdVxMax);
+        command.vy = smoothedVy_ * static_cast<float>(editable.cmdVyMax);
+        command.wz = smoothedWz_ * static_cast<float>(editable.cmdWzMax);
         command.valid = true;
         return command;
     }
@@ -2197,7 +3171,7 @@ private:
         default:
             if (ch == ' ')
             {
-                RequestEmergencyStop("keyboard emergency stop");
+                RequestEmergencyStop("键盘急停");
             }
             break;
         }
@@ -2213,6 +3187,11 @@ private:
 
         while (running_.load())
         {
+            if (promptActive_.load())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
             char ch = 0;
             const ssize_t bytesRead = ::read(STDIN_FILENO, &ch, 1);
             if (bytesRead <= 0)
@@ -2252,6 +3231,10 @@ private:
 
             if (terminalRawEnabled_ && pfds.size() > 1 && (pfds[1].revents & POLLIN) != 0)
             {
+                if (promptActive_.load())
+                {
+                    continue;
+                }
                 char ch = 0;
                 const ssize_t bytesRead = ::read(STDIN_FILENO, &ch, 1);
                 if (bytesRead > 0)
@@ -2287,6 +3270,11 @@ private:
         case KEY_ESC:
             if (pressed)
             {
+                if (promptActive_.load())
+                {
+                    promptCancelRequested_.store(true);
+                    return true;
+                }
                 ProcessTeleopChar(kEscapeKey);
             }
             return true;
@@ -2413,7 +3401,7 @@ private:
             }
             catch (...)
             {
-                PrintLine("failed to send motion command");
+                PrintLine("发送运动指令失败");
             }
             lastMoveActive = moveActive;
 
@@ -2519,7 +3507,7 @@ private:
                 if (!reason.empty())
                 {
                     LatchFault(SafetyState::FaultLatched, reason);
-                    PrintLine("safety fault latched: " + reason);
+                    PrintLine("safety fault 已锁定：" + reason);
                     std::this_thread::sleep_until(wakeDeadline);
                     continue;
                 }
@@ -2546,7 +3534,7 @@ private:
                 }
                 catch (const std::exception& ex)
                 {
-                    PrintLine(std::string("failed to log sample: ") + ex.what());
+                    PrintLine(std::string("记录样本失败：") + ex.what());
                 }
             }
             else if (captureState == CaptureState::Capturing && std::chrono::steady_clock::now() >= nextWaitLog)
@@ -2560,19 +3548,15 @@ private:
                 {
                     missing.emplace_back("image");
                 }
-                else if (!hasFreshImage)
-                {
-                    missing.emplace_back("new_image");
-                }
                 if (!missing.empty())
                 {
                     std::ostringstream oss;
-                    oss << "waiting for ";
+                    oss << "等待 ";
                     for (size_t index = 0; index < missing.size(); ++index)
                     {
                         if (index > 0)
                         {
-                            oss << " and ";
+                            oss << " 和 ";
                         }
                         oss << missing[index];
                     }
@@ -2599,6 +3583,7 @@ private:
     mutable std::mutex sportClientMutex_;
     mutable std::mutex stateMachineMutex_;
     mutable std::mutex keyMutex_;
+    mutable std::mutex editableConfigMutex_;
     std::condition_variable imageUpdatedCv_;
 
     LatestState latestState_;
@@ -2611,6 +3596,8 @@ private:
     CaptureState captureState_ = CaptureState::Idle;
     MotionInstruction activeMotionInstruction_ = MotionInstruction::None;
     std::chrono::steady_clock::time_point captureStartDeadline_{};
+    std::string pendingLabelFallbackInstruction_;
+    EditableCollectorConfig editableConfig_;
 
     KeyActivity keyW_;
     KeyActivity keyS_;
@@ -2633,6 +3620,9 @@ private:
     std::thread controlThread_;
     std::thread videoThread_;
     std::thread loggingThread_;
+    std::atomic<bool> promptActive_{false};
+    std::atomic<bool> promptCancelRequested_{false};
+    std::unique_ptr<WebUiServer> webUiServer_;
 };
 
 } // namespace
@@ -2645,7 +3635,7 @@ int main(int argc, char** argv)
         const auto config = ParseArgs(argc, argv, error);
         if (!config.has_value())
         {
-            std::cerr << "collector argument error: " << error << std::endl;
+            std::cerr << "collector 参数错误：" << error << std::endl;
             return 2;
         }
 
@@ -2662,11 +3652,11 @@ int main(int argc, char** argv)
     }
     catch (const std::exception& ex)
     {
-        std::cerr << "collector fatal error: " << ex.what() << std::endl;
+        std::cerr << "collector 致命错误：" << ex.what() << std::endl;
     }
     catch (...)
     {
-        std::cerr << "collector fatal error: unknown exception" << std::endl;
+        std::cerr << "collector 致命错误：未知异常" << std::endl;
     }
 
     return 1;

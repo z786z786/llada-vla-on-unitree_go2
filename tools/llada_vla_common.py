@@ -55,6 +55,9 @@ TASK_METADATA_FIELDS = [
     "task_tags",
     "collector_notes",
     "instruction_source",
+    "segment_status",
+    "success",
+    "termination_reason",
 ]
 ACTION_ACTIVITY_EPS = 0.05
 TEXT_TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -301,6 +304,21 @@ def episode_task_metadata(payload: Dict[str, Any], episode_meta: Dict[str, Any])
             _safe_str(payload.get("instruction_source")) or
             _safe_str(task_block.get("instruction_source")) or
             ("semantic_text" if task_family and task_family != "legacy_motion" else "motion_label")
+        ),
+        "segment_status": (
+            _safe_str(payload.get("segment_status")) or
+            _safe_str(episode_meta.get("segment_status")) or
+            _safe_str(task_block.get("segment_status"))
+        ),
+        "success": (
+            _safe_str(payload.get("success")) or
+            _safe_str(episode_meta.get("success")) or
+            _safe_str(task_block.get("success"))
+        ),
+        "termination_reason": (
+            _safe_str(payload.get("termination_reason")) or
+            _safe_str(episode_meta.get("termination_reason")) or
+            _safe_str(task_block.get("termination_reason"))
         ),
     }
 

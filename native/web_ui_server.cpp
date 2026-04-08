@@ -1,0 +1,614 @@
+#include "web_ui_server.h"
+
+#include <arpa/inet.h>
+#include <atomic>
+#include <cctype>
+#include <cerrno>
+#include <csignal>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <optional>
+#include <poll.h>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+namespace
+{
+
+namespace fs = std::filesystem;
+
+std::string JsonEscape(const std::string& input)
+{
+    std::ostringstream oss;
+    for (const char ch : input)
+    {
+        switch (ch)
+        {
+        case '\\':
+            oss << "\\\\";
+            break;
+        case '"':
+            oss << "\\\"";
+            break;
+        case '\n':
+            oss << "\\n";
+            break;
+        case '\r':
+            oss << "\\r";
+            break;
+        case '\t':
+            oss << "\\t";
+            break;
+        default:
+            oss << ch;
+            break;
+        }
+    }
+    return oss.str();
+}
+
+std::string JsonString(const std::string& input)
+{
+    return "\"" + JsonEscape(input) + "\"";
+}
+
+std::string BoolJson(bool value)
+{
+    return value ? "true" : "false";
+}
+
+std::string ReadFileToString(const fs::path& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open())
+    {
+        return {};
+    }
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    return buffer.str();
+}
+
+bool SendAll(int fd, const std::string& data)
+{
+    size_t sent = 0;
+    while (sent < data.size())
+    {
+        const ssize_t result = ::send(fd, data.data() + sent, data.size() - sent, 0);
+        if (result <= 0)
+        {
+            return false;
+        }
+        sent += static_cast<size_t>(result);
+    }
+    return true;
+}
+
+std::string MakeJsonActionResult(const UiActionResult& result)
+{
+    std::ostringstream oss;
+    oss << "{"
+        << "\"ok\":" << BoolJson(result.ok) << ","
+        << "\"code\":" << JsonString(result.code) << ","
+        << "\"message\":" << JsonString(result.message);
+    if (!result.episodeId.empty())
+    {
+        oss << ",\"episode_id\":" << JsonString(result.episodeId);
+    }
+    oss << "}";
+    return oss.str();
+}
+
+std::string MakeJsonStatus(const UiStatusSnapshot& status)
+{
+    std::ostringstream oss;
+    oss << "{"
+        << "\"collector\":{"
+        << "\"running\":" << BoolJson(status.running) << ","
+        << "\"session_dir\":" << JsonString(status.sessionDir) << ","
+        << "\"capture_mode\":" << JsonString(status.captureMode) << ","
+        << "\"capture_state\":" << JsonString(status.captureState) << ","
+        << "\"safety_state\":" << JsonString(status.safetyState) << ","
+        << "\"fault_reason\":" << JsonString(status.faultReason) << ","
+        << "\"recording\":" << BoolJson(status.recording) << ","
+        << "\"segment_duration_s\":" << status.segmentDurationSeconds << ","
+        << "\"buffered_frames\":" << status.bufferedFrames
+        << "},"
+        << "\"robot\":{"
+        << "\"connected\":" << BoolJson(status.robotConnected) << ","
+        << "\"state_valid\":" << BoolJson(status.stateValid) << ","
+        << "\"image_valid\":" << BoolJson(status.imageValid) << ","
+        << "\"state_age_s\":" << status.stateAgeSeconds << ","
+        << "\"image_age_s\":" << status.imageAgeSeconds << ","
+        << "\"body_height\":" << status.bodyHeight << ","
+        << "\"roll\":" << status.roll << ","
+        << "\"pitch\":" << status.pitch << ","
+        << "\"yaw\":" << status.yaw
+        << "},"
+        << "\"command\":{"
+        << "\"vx\":" << status.commandVx << ","
+        << "\"vy\":" << status.commandVy << ","
+        << "\"wz\":" << status.commandWz
+        << "},"
+        << "\"run_context\":{"
+        << "\"scene_id\":" << JsonString(status.sceneId) << ","
+        << "\"operator_id\":" << JsonString(status.operatorId) << ","
+        << "\"instruction\":" << JsonString(status.instruction) << ","
+        << "\"capture_mode\":" << JsonString(status.captureMode) << ","
+        << "\"task_family\":" << JsonString(status.taskFamily) << ","
+        << "\"target_type\":" << JsonString(status.targetType) << ","
+        << "\"target_description\":" << JsonString(status.targetDescription) << ","
+        << "\"target_instance_id\":" << JsonString(status.targetInstanceId) << ","
+        << "\"task_tags_csv\":" << JsonString(status.taskTagsCsv) << ","
+        << "\"collector_notes\":" << JsonString(status.collectorNotes) << ","
+        << "\"cmd_vx_max\":" << status.cmdVxMax << ","
+        << "\"cmd_vy_max\":" << status.cmdVyMax << ","
+        << "\"cmd_wz_max\":" << status.cmdWzMax
+        << "},"
+        << "\"process_config\":{"
+        << "\"network_interface\":" << JsonString(status.networkInterface) << ","
+        << "\"output_dir\":" << JsonString(status.outputDir) << ","
+        << "\"loop_hz\":" << status.loopHz << ","
+        << "\"video_poll_hz\":" << status.videoPollHz << ","
+        << "\"input_backend\":" << JsonString(status.inputBackend) << ","
+        << "\"input_device\":" << JsonString(status.inputDevice) << ","
+        << "\"defaults_path\":" << JsonString(status.defaultsPath)
+        << "},"
+        << "\"pending_label\":{"
+        << "\"active\":" << BoolJson(status.pendingLabelActive) << ","
+        << "\"episode_id\":" << JsonString(status.pendingEpisodeId) << ","
+        << "\"buffered_frames\":" << status.pendingLabelBufferedFrames
+        << "},"
+        << "\"actions\":{"
+        << "\"can_start_recording\":" << BoolJson(status.actions.canStartRecording) << ","
+        << "\"can_stop_recording\":" << BoolJson(status.actions.canStopRecording) << ","
+        << "\"can_discard_segment\":" << BoolJson(status.actions.canDiscardSegment) << ","
+        << "\"can_submit_label\":" << BoolJson(status.actions.canSubmitLabel) << ","
+        << "\"can_estop\":" << BoolJson(status.actions.canEstop) << ","
+        << "\"can_clear_fault\":" << BoolJson(status.actions.canClearFault)
+        << "},"
+        << "\"web_ui\":{"
+        << "\"enabled\":" << BoolJson(status.webUiEnabled) << ","
+        << "\"port\":" << status.webPort
+        << "}"
+        << "}";
+    return oss.str();
+}
+
+std::optional<std::string> ExtractJsonStringField(const std::string& body, const std::string& key)
+{
+    const std::string marker = "\"" + key + "\"";
+    const size_t keyPos = body.find(marker);
+    if (keyPos == std::string::npos)
+    {
+        return std::nullopt;
+    }
+    const size_t colonPos = body.find(':', keyPos + marker.size());
+    if (colonPos == std::string::npos)
+    {
+        return std::nullopt;
+    }
+    size_t valueBegin = body.find('"', colonPos + 1);
+    if (valueBegin == std::string::npos)
+    {
+        return std::nullopt;
+    }
+    ++valueBegin;
+    std::string value;
+    bool escaping = false;
+    for (size_t index = valueBegin; index < body.size(); ++index)
+    {
+        const char ch = body[index];
+        if (escaping)
+        {
+            value.push_back(ch);
+            escaping = false;
+            continue;
+        }
+        if (ch == '\\')
+        {
+            escaping = true;
+            continue;
+        }
+        if (ch == '"')
+        {
+            return value;
+        }
+        value.push_back(ch);
+    }
+    return std::nullopt;
+}
+
+std::optional<double> ExtractJsonNumberField(const std::string& body, const std::string& key)
+{
+    const std::string marker = "\"" + key + "\"";
+    const size_t keyPos = body.find(marker);
+    if (keyPos == std::string::npos)
+    {
+        return std::nullopt;
+    }
+    const size_t colonPos = body.find(':', keyPos + marker.size());
+    if (colonPos == std::string::npos)
+    {
+        return std::nullopt;
+    }
+    size_t begin = body.find_first_of("-0123456789", colonPos + 1);
+    if (begin == std::string::npos)
+    {
+        return std::nullopt;
+    }
+    size_t end = begin;
+    while (end < body.size() &&
+           (std::isdigit(static_cast<unsigned char>(body[end])) || body[end] == '.' || body[end] == '-'))
+    {
+        ++end;
+    }
+    try
+    {
+        return std::stod(body.substr(begin, end - begin));
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
+
+struct HttpRequest
+{
+    std::string method;
+    std::string path;
+    std::map<std::string, std::string> headers;
+    std::string body;
+};
+
+std::optional<HttpRequest> ReadHttpRequest(int fd)
+{
+    std::string data;
+    char buffer[4096];
+    size_t headerEnd = std::string::npos;
+    size_t contentLength = 0;
+
+    while (true)
+    {
+        const ssize_t bytesRead = ::recv(fd, buffer, sizeof(buffer), 0);
+        if (bytesRead <= 0)
+        {
+            return std::nullopt;
+        }
+        data.append(buffer, buffer + bytesRead);
+        headerEnd = data.find("\r\n\r\n");
+        if (headerEnd != std::string::npos)
+        {
+            break;
+        }
+        if (data.size() > 64 * 1024)
+        {
+            return std::nullopt;
+        }
+    }
+
+    HttpRequest request;
+    {
+        std::istringstream head(data.substr(0, headerEnd));
+        std::string requestLine;
+        if (!std::getline(head, requestLine))
+        {
+            return std::nullopt;
+        }
+        if (!requestLine.empty() && requestLine.back() == '\r')
+        {
+            requestLine.pop_back();
+        }
+        std::istringstream requestLineStream(requestLine);
+        requestLineStream >> request.method >> request.path;
+        std::string headerLine;
+        while (std::getline(head, headerLine))
+        {
+            if (!headerLine.empty() && headerLine.back() == '\r')
+            {
+                headerLine.pop_back();
+            }
+            const size_t colonPos = headerLine.find(':');
+            if (colonPos == std::string::npos)
+            {
+                continue;
+            }
+            std::string key = headerLine.substr(0, colonPos);
+            std::string value = headerLine.substr(colonPos + 1);
+            while (!value.empty() && value.front() == ' ')
+            {
+                value.erase(value.begin());
+            }
+            request.headers[key] = value;
+            if (key == "Content-Length")
+            {
+                contentLength = static_cast<size_t>(std::stoul(value));
+            }
+        }
+    }
+
+    request.body = data.substr(headerEnd + 4);
+    while (request.body.size() < contentLength)
+    {
+        const ssize_t bytesRead = ::recv(fd, buffer, sizeof(buffer), 0);
+        if (bytesRead <= 0)
+        {
+            return std::nullopt;
+        }
+        request.body.append(buffer, buffer + bytesRead);
+    }
+    if (request.body.size() > contentLength)
+    {
+        request.body.resize(contentLength);
+    }
+    return request;
+}
+
+std::string BuildHttpResponse(
+    int statusCode,
+    const std::string& statusText,
+    const std::string& contentType,
+    const std::string& body)
+{
+    std::ostringstream oss;
+    oss << "HTTP/1.1 " << statusCode << " " << statusText << "\r\n"
+        << "Content-Type: " << contentType << "\r\n"
+        << "Content-Length: " << body.size() << "\r\n"
+        << "Cache-Control: no-store\r\n"
+        << "Connection: close\r\n"
+        << "Access-Control-Allow-Origin: *\r\n\r\n"
+        << body;
+    return oss.str();
+}
+
+} // namespace
+
+struct WebUiServer::Impl
+{
+    explicit Impl(const WebUiServerConfig& cfg)
+        : config(cfg)
+    {
+    }
+
+    ~Impl()
+    {
+        Stop();
+    }
+
+    void Start()
+    {
+        if (running)
+        {
+            return;
+        }
+
+        serverFd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (serverFd < 0)
+        {
+            throw std::runtime_error("创建 Web UI socket 失败");
+        }
+
+        int reuse = 1;
+        ::setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<uint16_t>(config.port));
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::bind(serverFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+        {
+            const std::string reason = std::strerror(errno);
+            ::close(serverFd);
+            serverFd = -1;
+            throw std::runtime_error("绑定 Web UI 端口失败：" + reason);
+        }
+        if (::listen(serverFd, 16) != 0)
+        {
+            const std::string reason = std::strerror(errno);
+            ::close(serverFd);
+            serverFd = -1;
+            throw std::runtime_error("启动 Web UI 监听失败：" + reason);
+        }
+
+        running = true;
+        thread = std::thread([this]() { ServeLoop(); });
+    }
+
+    void Stop()
+    {
+        if (!running.exchange(false))
+        {
+            return;
+        }
+        if (serverFd >= 0)
+        {
+            ::shutdown(serverFd, SHUT_RDWR);
+            ::close(serverFd);
+            serverFd = -1;
+        }
+        if (thread.joinable())
+        {
+            thread.join();
+        }
+    }
+
+    void ServeLoop()
+    {
+        while (running)
+        {
+            pollfd pfd{serverFd, POLLIN, 0};
+            const int pollResult = ::poll(&pfd, 1, 100);
+            if (pollResult <= 0)
+            {
+                continue;
+            }
+
+            sockaddr_in clientAddr{};
+            socklen_t clientLen = sizeof(clientAddr);
+            const int clientFd = ::accept(serverFd, reinterpret_cast<sockaddr*>(&clientAddr), &clientLen);
+            if (clientFd < 0)
+            {
+                continue;
+            }
+            HandleConnection(clientFd);
+            ::close(clientFd);
+        }
+    }
+
+    void HandleConnection(int clientFd)
+    {
+        const auto request = ReadHttpRequest(clientFd);
+        if (!request.has_value())
+        {
+            SendAll(clientFd, BuildHttpResponse(400, "Bad Request", "text/plain; charset=utf-8", "bad request"));
+            return;
+        }
+
+        if (request->method == "GET")
+        {
+            HandleGet(clientFd, request.value());
+            return;
+        }
+        if (request->method == "POST")
+        {
+            HandlePost(clientFd, request.value());
+            return;
+        }
+        SendAll(clientFd, BuildHttpResponse(405, "Method Not Allowed", "text/plain; charset=utf-8", "method not allowed"));
+    }
+
+    void HandleGet(int clientFd, const HttpRequest& request)
+    {
+        if (request.path == "/api/status")
+        {
+            const std::string body = MakeJsonStatus(config.statusProvider());
+            SendAll(clientFd, BuildHttpResponse(200, "OK", "application/json; charset=utf-8", body));
+            return;
+        }
+
+        std::string assetName;
+        std::string contentType;
+        if (request.path == "/" || request.path == "/index.html")
+        {
+            assetName = "index.html";
+            contentType = "text/html; charset=utf-8";
+        }
+        else if (request.path == "/app.js")
+        {
+            assetName = "app.js";
+            contentType = "application/javascript; charset=utf-8";
+        }
+        else if (request.path == "/style.css")
+        {
+            assetName = "style.css";
+            contentType = "text/css; charset=utf-8";
+        }
+        else
+        {
+            SendAll(clientFd, BuildHttpResponse(404, "Not Found", "text/plain; charset=utf-8", "not found"));
+            return;
+        }
+
+        const std::string body = ReadFileToString(fs::path(config.assetDir) / assetName);
+        if (body.empty())
+        {
+            SendAll(clientFd, BuildHttpResponse(500, "Internal Server Error", "text/plain; charset=utf-8", "asset missing"));
+            return;
+        }
+        SendAll(clientFd, BuildHttpResponse(200, "OK", contentType, body));
+    }
+
+    void HandlePost(int clientFd, const HttpRequest& request)
+    {
+        UiActionResult result;
+        if (request.path == "/api/control/start")
+        {
+            result = config.startHandler();
+        }
+        else if (request.path == "/api/control/stop")
+        {
+            result = config.stopHandler();
+        }
+        else if (request.path == "/api/control/discard")
+        {
+            result = config.discardHandler();
+        }
+        else if (request.path == "/api/control/estop")
+        {
+            result = config.estopHandler();
+        }
+        else if (request.path == "/api/control/clear-fault")
+        {
+            result = config.clearFaultHandler();
+        }
+        else if (request.path == "/api/label/submit")
+        {
+            SegmentLabelInput input;
+            input.segmentStatus = ExtractJsonStringField(request.body, "segment_status").value_or("");
+            input.success = ExtractJsonStringField(request.body, "success").value_or("");
+            input.terminationReason = ExtractJsonStringField(request.body, "termination_reason").value_or("");
+            result = config.submitLabelHandler(input);
+        }
+        else if (request.path == "/api/config/update")
+        {
+            UiConfigUpdateInput input;
+            input.sceneId = ExtractJsonStringField(request.body, "scene_id").value_or("");
+            input.operatorId = ExtractJsonStringField(request.body, "operator_id").value_or("");
+            input.instruction = ExtractJsonStringField(request.body, "instruction").value_or("");
+            input.captureMode = ExtractJsonStringField(request.body, "capture_mode").value_or("");
+            input.taskFamily = ExtractJsonStringField(request.body, "task_family").value_or("");
+            input.targetType = ExtractJsonStringField(request.body, "target_type").value_or("");
+            input.targetDescription = ExtractJsonStringField(request.body, "target_description").value_or("");
+            input.targetInstanceId = ExtractJsonStringField(request.body, "target_instance_id").value_or("");
+            input.taskTagsCsv = ExtractJsonStringField(request.body, "task_tags_csv").value_or("");
+            input.collectorNotes = ExtractJsonStringField(request.body, "collector_notes").value_or("");
+            input.cmdVxMax = ExtractJsonNumberField(request.body, "cmd_vx_max").value_or(0.0);
+            input.cmdVyMax = ExtractJsonNumberField(request.body, "cmd_vy_max").value_or(0.0);
+            input.cmdWzMax = ExtractJsonNumberField(request.body, "cmd_wz_max").value_or(0.0);
+            result = config.updateConfigHandler(input);
+        }
+        else if (request.path == "/api/config/save-defaults")
+        {
+            result = config.saveDefaultsHandler();
+        }
+        else
+        {
+            SendAll(clientFd, BuildHttpResponse(404, "Not Found", "text/plain; charset=utf-8", "not found"));
+            return;
+        }
+
+        const int statusCode = result.ok ? 200 : 409;
+        SendAll(clientFd, BuildHttpResponse(statusCode, result.ok ? "OK" : "Conflict", "application/json; charset=utf-8", MakeJsonActionResult(result)));
+    }
+
+    WebUiServerConfig config;
+    std::atomic<bool> running{false};
+    int serverFd = -1;
+    std::thread thread;
+};
+
+WebUiServer::WebUiServer(const WebUiServerConfig& config)
+    : impl_(std::make_unique<Impl>(config))
+{
+}
+
+WebUiServer::~WebUiServer() = default;
+
+void WebUiServer::Start()
+{
+    impl_->Start();
+}
+
+void WebUiServer::Stop()
+{
+    impl_->Stop();
+}

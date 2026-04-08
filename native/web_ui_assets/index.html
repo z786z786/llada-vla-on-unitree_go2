@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Go2 Collector</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="panel summary-panel">
+      <div class="title-row">
+        <div>
+          <h1>Go2 Collector</h1>
+          <p class="subtle">single-screen local control panel</p>
+        </div>
+      </div>
+      <div id="summary-grid" class="summary-grid"></div>
+    </section>
+
+    <section class="columns">
+      <section class="panel">
+        <h2>Collector Config</h2>
+        <div class="actions actions-config">
+          <button id="apply-config-btn" class="accent" type="submit" form="config-form">Apply For Next Segment</button>
+          <button id="save-defaults-btn" class="accent-secondary" type="button">Save As Next Default</button>
+        </div>
+        <form id="config-form" class="compact-form">
+          <div class="form-grid">
+            <label><span>Scene</span><input id="cfg-scene-id" type="text" placeholder="ex: corridor_a"></label>
+            <label><span>Operator</span><input id="cfg-operator-id" type="text" placeholder="ex: op_01"></label>
+            <label class="wide"><span>Instruction</span><input id="cfg-instruction" type="text" placeholder="ex: go to the red door"></label>
+            <label><span>Capture Mode</span>
+              <select id="cfg-capture-mode">
+                <option value="single_action">single_action</option>
+                <option value="trajectory">trajectory</option>
+              </select>
+            </label>
+            <label><span>Task Family</span><input id="cfg-task-family" type="text" placeholder="ex: goal_navigation"></label>
+            <label><span>Target Type</span><input id="cfg-target-type" type="text" placeholder="ex: door"></label>
+            <label class="wide"><span>Target Description</span><input id="cfg-target-description" type="text" placeholder="ex: red door on the left"></label>
+            <label><span>Target Instance</span><input id="cfg-target-instance-id" type="text" placeholder="ex: door_left_01"></label>
+            <label><span>Task Tags CSV</span><input id="cfg-task-tags-csv" type="text" placeholder="ex: clean,left_turn,indoor"></label>
+            <label class="wide"><span>Collector Notes</span><input id="cfg-collector-notes" type="text" placeholder="ex: start from hallway corner"></label>
+            <label><span>cmd_vx_max</span><input id="cfg-cmd-vx-max" type="number" step="0.01" placeholder="ex: 0.20"></label>
+            <label><span>cmd_vy_max</span><input id="cfg-cmd-vy-max" type="number" step="0.01" placeholder="ex: 0.20"></label>
+            <label><span>cmd_wz_max</span><input id="cfg-cmd-wz-max" type="number" step="0.01" placeholder="ex: 0.80"></label>
+          </div>
+        </form>
+        <div id="process-grid" class="mini-grid"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Robot State</h2>
+        <div id="robot-grid" class="mini-grid"></div>
+        <pre id="action-result" class="log log-mid"></pre>
+        <h2>Controls</h2>
+        <div class="actions actions-keys">
+          <button id="start-btn">Start <span class="kbd">R</span></button>
+          <button id="stop-btn">Stop <span class="kbd">T</span></button>
+          <button id="discard-btn">Discard <span class="kbd">ESC</span></button>
+          <button id="estop-btn" class="danger">E-Stop <span class="kbd">Space</span></button>
+          <button id="clear-fault-btn">Clear Fault <span class="kbd">C</span></button>
+        </div>
+        <h2>Pending Label</h2>
+        <div id="pending-meta" class="pending-meta"></div>
+        <form id="label-form" class="compact-form">
+          <div class="radio-block">
+            <span class="block-title">Segment Status</span>
+            <label class="radio-chip"><input id="segment-status-clean" type="radio" name="segment-status" value="clean" checked><span>clean</span></label>
+            <label class="radio-chip"><input id="segment-status-usable" type="radio" name="segment-status" value="usable"><span>usable</span></label>
+            <label class="radio-chip"><input id="segment-status-discard" type="radio" name="segment-status" value="discard"><span>discard</span></label>
+          </div>
+          <div class="radio-block">
+            <span class="block-title">Success</span>
+            <label class="radio-chip"><input id="success-success" type="radio" name="success" value="success" checked><span>success</span></label>
+            <label class="radio-chip"><input id="success-partial" type="radio" name="success" value="partial"><span>partial</span></label>
+            <label class="radio-chip"><input id="success-fail" type="radio" name="success" value="fail"><span>fail</span></label>
+          </div>
+          <div class="radio-block">
+            <span class="block-title">Termination Reason</span>
+            <label class="radio-chip"><input id="termination-goal" type="radio" name="termination-reason" value="goal_reached" checked><span>goal_reached</span></label>
+            <label class="radio-chip"><input type="radio" name="termination-reason" value="near_goal_stop"><span>near_goal_stop</span></label>
+            <label class="radio-chip"><input type="radio" name="termination-reason" value="occluded"><span>occluded</span></label>
+            <label class="radio-chip"><input type="radio" name="termination-reason" value="target_lost"><span>target_lost</span></label>
+            <label class="radio-chip"><input type="radio" name="termination-reason" value="operator_stop"><span>operator_stop</span></label>
+            <label class="radio-chip"><input type="radio" name="termination-reason" value="bad_demo"><span>bad_demo</span></label>
+            <label class="radio-chip"><input type="radio" name="termination-reason" value="unsafe"><span>unsafe</span></label>
+            <label class="radio-chip"><input type="radio" name="termination-reason" value="timeout"><span>timeout</span></label>
+          </div>
+          <div class="actions">
+            <button id="submit-label-btn" class="accent" type="submit">Submit Label <span class="kbd">F</span></button>
+          </div>
+        </form>
+      </section>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
