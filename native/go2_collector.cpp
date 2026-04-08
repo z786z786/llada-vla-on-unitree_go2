@@ -35,14 +35,7 @@ namespace
 {
 
 namespace fs = std::filesystem;
-
-#if defined(GO2_COLLECTOR_STAGE1_PROFILE) && GO2_COLLECTOR_STAGE1_PROFILE
-constexpr bool kStage1CollectorProfile = true;
-constexpr char kDefaultDataDirName[] = "data_stage1";
-#else
-constexpr bool kStage1CollectorProfile = false;
 constexpr char kDefaultDataDirName[] = "data";
-#endif
 
 constexpr char kSportStateTopic[] = "rt/sportmodestate";
 constexpr char kSchemaVersion[] = "go2_local_dataset_v1";
@@ -93,7 +86,6 @@ struct Config
     fs::path outputDir;
     double loopHz = 50.0;
     double videoPollHz = 10.0;
-    bool enableVideo = true;
     InputBackend inputBackend = InputBackend::Evdev;
     CaptureMode captureMode = CaptureMode::SingleAction;
     fs::path inputDevice;
@@ -607,54 +599,12 @@ EffectiveControlAction ResolveControlAction(const VelocityCommand& rawAction, do
 
 void PrintUsage(const char* program)
 {
-    if (kStage1CollectorProfile)
-    {
-        std::cout
-            << "Usage: " << program << " --network-interface IFACE --scene-id SCENE --operator-id OPERATOR [options]\n\n"
-            << "Stage 1 profile:\n"
-            << "  This executable is dedicated to the first collection phase.\n"
-            << "  It always runs in single_action mode and auto-labels episodes from the motion key.\n\n"
-            << "Options:\n"
-            << "  --output-dir PATH        Dataset root directory (default: <collector>/" << kDefaultDataDirName << ")\n"
-            << "  --loop-hz FLOAT          Control and logging loop frequency (default: 50.0)\n"
-            << "  --video-poll-hz FLOAT    Camera polling frequency (default: 10.0)\n"
-            << "  --disable-video          Disable front camera capture\n"
-            << "  --input-backend MODE     Input backend: evdev or tty (default: evdev)\n"
-            << "  --input-device PATH      evdev device path (default: auto-detect keyboard)\n"
-            << "  --scene-id TEXT          Required scene identifier\n"
-            << "  --operator-id TEXT       Required operator identifier\n"
-            << "  --collector-notes TEXT   Optional free-text notes stored with each episode\n"
-            << "  --cmd-vx-max FLOAT       Reserved legacy option\n"
-            << "  --cmd-vy-max FLOAT       Reserved legacy option\n"
-            << "  --cmd-wz-max FLOAT       Reserved legacy option\n"
-            << "  --help                   Show this help\n\n"
-            << "Keyboard:\n"
-            << "  W/S  forward/backward\n"
-            << "  A/D  strafe left/right\n"
-            << "  Q/E  turn left/right\n"
-            << "  R    arm single-action capture\n"
-            << "  T    manually end the current capture if already recording\n"
-            << "  ESC  cancel current armed/capture segment\n"
-            << "  Space emergency stop and latch safety fault\n"
-            << "  C    clear fault or toggle stand up/down\n"
-            << "  P    print status\n"
-            << "  H    print help\n"
-            << "  X    quit\n"
-            << "Input:\n"
-            << "  evdev supports true multi-key press/release and smoother diagonal motion\n"
-            << "  tty is a fallback mode and may feel less stable for combined keys\n"
-            << "Capture flow:\n"
-            << "  Press R, execute exactly one motion, and release the key to save the episode.\n";
-        return;
-    }
-
     std::cout
         << "Usage: " << program << " --network-interface IFACE --scene-id SCENE --operator-id OPERATOR [options]\n\n"
         << "Options:\n"
         << "  --output-dir PATH        Dataset root directory (default: <collector>/" << kDefaultDataDirName << ")\n"
         << "  --loop-hz FLOAT          Control and logging loop frequency (default: 50.0)\n"
         << "  --video-poll-hz FLOAT    Camera polling frequency (default: 10.0)\n"
-        << "  --disable-video          Disable front camera capture\n"
         << "  --input-backend MODE     Input backend: evdev or tty (default: evdev)\n"
         << "  --capture-mode MODE      Capture mode: single_action or trajectory (default: single_action)\n"
         << "  --input-device PATH      evdev device path (default: auto-detect keyboard)\n"
@@ -667,9 +617,9 @@ void PrintUsage(const char* program)
         << "  --target-instance-id TEXT  Optional target instance identifier used by the operator during collection\n"
         << "  --task-tags CSV          Optional comma-separated tags, e.g. occluded,left_turn,low_light\n"
         << "  --collector-notes TEXT   Optional free-text notes stored with each episode\n"
-        << "  --cmd-vx-max FLOAT       Reserved legacy option\n"
-        << "  --cmd-vy-max FLOAT       Reserved legacy option\n"
-        << "  --cmd-wz-max FLOAT       Reserved legacy option\n"
+        << "  --cmd-vx-max FLOAT       Max forward/backward speed in m/s\n"
+        << "  --cmd-vy-max FLOAT       Max strafe speed in m/s\n"
+        << "  --cmd-wz-max FLOAT       Max yaw speed in rad/s\n"
         << "  --help                   Show this help\n\n"
         << "Keyboard:\n"
         << "  W/S  forward/backward\n"
@@ -741,10 +691,6 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
             }
             config.videoPollHz = std::stod(argv[++index]);
         }
-        else if (arg == "--disable-video")
-        {
-            config.enableVideo = false;
-        }
         else if (arg == "--input-backend")
         {
             if (index + 1 >= argc)
@@ -762,11 +708,6 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         }
         else if (arg == "--capture-mode")
         {
-            if (kStage1CollectorProfile)
-            {
-                error = "--capture-mode is not supported by the stage1 collector; it always uses single_action";
-                return std::nullopt;
-            }
             if (index + 1 >= argc)
             {
                 error = "missing value for --capture-mode";
@@ -809,11 +750,6 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         }
         else if (arg == "--instruction")
         {
-            if (kStage1CollectorProfile)
-            {
-                error = "--instruction is disabled in the stage1 collector; episodes are labeled from the motion key";
-                return std::nullopt;
-            }
             if (index + 1 >= argc)
             {
                 error = "missing value for --instruction";
@@ -823,11 +759,6 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         }
         else if (arg == "--task-family")
         {
-            if (kStage1CollectorProfile)
-            {
-                error = "--task-family is disabled in the stage1 collector";
-                return std::nullopt;
-            }
             if (index + 1 >= argc)
             {
                 error = "missing value for --task-family";
@@ -837,11 +768,6 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         }
         else if (arg == "--target-type")
         {
-            if (kStage1CollectorProfile)
-            {
-                error = "--target-type is disabled in the stage1 collector";
-                return std::nullopt;
-            }
             if (index + 1 >= argc)
             {
                 error = "missing value for --target-type";
@@ -851,11 +777,6 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         }
         else if (arg == "--target-description")
         {
-            if (kStage1CollectorProfile)
-            {
-                error = "--target-description is disabled in the stage1 collector";
-                return std::nullopt;
-            }
             if (index + 1 >= argc)
             {
                 error = "missing value for --target-description";
@@ -865,11 +786,6 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         }
         else if (arg == "--target-instance-id")
         {
-            if (kStage1CollectorProfile)
-            {
-                error = "--target-instance-id is disabled in the stage1 collector";
-                return std::nullopt;
-            }
             if (index + 1 >= argc)
             {
                 error = "missing value for --target-instance-id";
@@ -879,11 +795,6 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         }
         else if (arg == "--task-tags")
         {
-            if (kStage1CollectorProfile)
-            {
-                error = "--task-tags is disabled in the stage1 collector";
-                return std::nullopt;
-            }
             if (index + 1 >= argc)
             {
                 error = "missing value for --task-tags";
@@ -1140,7 +1051,7 @@ public:
         const LatestState& state,
         const VelocityCommand& rawAction,
         const EffectiveControlAction& controlAction,
-        const std::optional<LatestImage>& image,
+        const LatestImage& image,
         double stateTimestamp,
         double rawActionTimestamp,
         double imageTimestamp)
@@ -1150,7 +1061,7 @@ public:
         {
             return false;
         }
-        if (!image.has_value() || !image->valid || image->jpegBytes.empty())
+        if (!image.valid || image.jpegBytes.empty())
         {
             return false;
         }
@@ -1171,7 +1082,7 @@ public:
             controlAction.command.vx,
             controlAction.command.vy,
             controlAction.command.wz,
-            image->jpegBytes,
+            image.jpegBytes,
         });
         return true;
     }
@@ -1202,17 +1113,16 @@ public:
 
     std::optional<std::string> FinalizePendingSegment(const std::string& fallbackInstruction)
     {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!pendingLabel_ || pendingFrames_.empty())
+        {
+            return std::nullopt;
+        }
         const TaskMetadata resolvedTaskMetadata = ResolveTaskMetadata(pendingTaskMetadata_, fallbackInstruction);
         const std::string trimmedInstruction = Trim(resolvedTaskMetadata.instruction);
         if (trimmedInstruction.empty())
         {
             throw std::runtime_error("instruction must not be empty");
-        }
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!pendingLabel_ || pendingFrames_.empty())
-        {
-            return std::nullopt;
         }
 
         std::ostringstream episodeId;
@@ -1466,21 +1376,15 @@ public:
         sportStateSubscriber_ = std::make_shared<unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::SportModeState_>>(kSportStateTopic);
         sportStateSubscriber_->InitChannel(std::bind(&CollectorApp::OnSportState, this, std::placeholders::_1), 1);
 
-        if (config_.enableVideo)
-        {
-            videoClient_ = std::make_unique<unitree::robot::go2::VideoClient>();
-            videoClient_->SetTimeout(1.0f);
-            videoClient_->Init();
-        }
+        videoClient_ = std::make_unique<unitree::robot::go2::VideoClient>();
+        videoClient_->SetTimeout(1.0f);
+        videoClient_->Init();
 
         running_.store(true);
         controlThread_ = std::thread(&CollectorApp::ControlLoop, this);
         loggingThread_ = std::thread(&CollectorApp::LoggingLoop, this);
         keyboardThread_ = std::thread(&CollectorApp::KeyboardLoop, this);
-        if (config_.enableVideo)
-        {
-            videoThread_ = std::thread(&CollectorApp::VideoLoop, this);
-        }
+        videoThread_ = std::thread(&CollectorApp::VideoLoop, this);
 
         {
             std::lock_guard<std::mutex> lock(commandMutex_);
@@ -1628,11 +1532,7 @@ private:
         std::cout << "  W/S forward/backward  A/D strafe  Q/E yaw" << std::endl;
         std::cout << "  R start capture flow  ESC cancel current armed/capture segment" << std::endl;
         std::cout << "  Space emergency stop  C clear fault or toggle stand up/down  P status  H help  X quit" << std::endl;
-        if (kStage1CollectorProfile)
-        {
-            std::cout << "  stage1 profile: single_action only, auto-labeled from the locked motion key" << std::endl;
-        }
-        else if (config_.captureMode == Config::CaptureMode::SingleAction)
+        if (config_.captureMode == Config::CaptureMode::SingleAction)
         {
             std::cout << "  single_action mode: capture starts 0.5s after first valid motion input and auto-stops on key release" << std::endl;
             std::cout << "  semantic instruction is taken from --instruction if set, otherwise falls back to the motion label" << std::endl;
@@ -1703,19 +1603,16 @@ private:
             << " fault_reason=" << (faultReason.empty() ? "-" : faultReason)
             << " scene_id=" << config_.sceneId
             << " operator_id=" << config_.operatorId
-            << " capture_mode=" << (kStage1CollectorProfile ? "single_action(stage1)" : CaptureModeName(config_.captureMode));
-        if (!kStage1CollectorProfile)
-        {
-            oss << " configured_instruction=" << (config_.instruction.empty() ? "-" : config_.instruction)
-                << " task_family=" << (config_.taskFamily.empty() ? "-" : config_.taskFamily)
-                << " target_type=" << (config_.targetType.empty() ? "-" : config_.targetType)
-                << " target_description=" << (config_.targetDescription.empty() ? "-" : config_.targetDescription);
-        }
-        oss << " buffered_frames=" << loggerStatus.bufferedFrames
+            << " capture_mode=" << CaptureModeName(config_.captureMode)
+            << " configured_instruction=" << (config_.instruction.empty() ? "-" : config_.instruction)
+            << " task_family=" << (config_.taskFamily.empty() ? "-" : config_.taskFamily)
+            << " target_type=" << (config_.targetType.empty() ? "-" : config_.targetType)
+            << " target_description=" << (config_.targetDescription.empty() ? "-" : config_.targetDescription)
+            << " buffered_frames=" << loggerStatus.bufferedFrames
             << " state=" << state.valid
-            << " image=" << (config_.enableVideo ? image.valid : true)
+            << " image=" << image.valid
             << " state_age_s=" << std::fixed << std::setprecision(3) << AgeSeconds(state.timestamp, nowSeconds)
-            << " image_age_s=" << (config_.enableVideo ? AgeSeconds(image.timestamp, nowSeconds) : 0.0)
+            << " image_age_s=" << AgeSeconds(image.timestamp, nowSeconds)
             << " command=(" << command.vx << "," << command.vy << "," << command.wz << ")"
             << " motion_keys=("
             << (motionState.forward ? "W" : "")
@@ -1894,14 +1791,6 @@ private:
     TaskMetadata ConfiguredTaskMetadata() const
     {
         TaskMetadata metadata;
-        if (kStage1CollectorProfile)
-        {
-            metadata.captureMode = "single_action";
-            metadata.taskFamily = "legacy_motion";
-            metadata.collectorNotes = config_.collectorNotes;
-            metadata.instructionSource = "motion_label";
-            return metadata;
-        }
         metadata.instruction = config_.instruction;
         metadata.captureMode = CaptureModeName(config_.captureMode);
         metadata.taskFamily = config_.taskFamily;
@@ -2259,9 +2148,9 @@ private:
 
         VelocityCommand command;
         command.timestamp = NowSeconds();
-        command.vx = smoothedVx_;
-        command.vy = smoothedVy_;
-        command.wz = smoothedWz_;
+        command.vx = smoothedVx_ * static_cast<float>(config_.cmdVxMax);
+        command.vy = smoothedVy_ * static_cast<float>(config_.cmdVyMax);
+        command.wz = smoothedWz_ * static_cast<float>(config_.cmdWzMax);
         command.valid = true;
         return command;
     }
@@ -2585,19 +2474,17 @@ private:
             const auto wakeDeadline = cycleStart + period;
 
             LatestImage image;
-            if (config_.enableVideo)
-            {
-                std::unique_lock<std::mutex> lock(imageMutex_);
-                imageUpdatedCv_.wait_until(
-                    lock,
-                    wakeDeadline,
-                    [&]()
-                    {
-                        return !running_.load() ||
-                               (latestImage_.valid && latestImage_.sequence > lastLoggedImageSequence);
-                    });
-                image = latestImage_;
-            }
+            std::unique_lock<std::mutex> lock(imageMutex_);
+            imageUpdatedCv_.wait_until(
+                lock,
+                wakeDeadline,
+                [&]()
+                {
+                    return !running_.load() ||
+                           (latestImage_.valid && latestImage_.sequence > lastLoggedImageSequence);
+                });
+            image = latestImage_;
+            lock.unlock();
 
             LatestState state;
             VelocityCommand action;
@@ -2620,7 +2507,6 @@ private:
 
             if (captureState == CaptureState::Capturing &&
                 previousCaptureState != CaptureState::Capturing &&
-                config_.enableVideo &&
                 image.valid)
             {
                 lastLoggedImageSequence = image.sequence;
@@ -2639,17 +2525,11 @@ private:
                 }
             }
 
-            const bool hasFreshImage = !config_.enableVideo || (image.valid && image.sequence > lastLoggedImageSequence);
+            const bool hasFreshImage = image.valid && image.sequence > lastLoggedImageSequence;
             const bool ready = captureState == CaptureState::Capturing && state.valid && hasFreshImage;
             if (ready)
             {
-                std::optional<LatestImage> maybeImage;
-                if (config_.enableVideo && image.valid)
-                {
-                    maybeImage = image;
-                }
-                const double sampleTimestamp =
-                    (config_.enableVideo && maybeImage.has_value()) ? maybeImage->timestamp : state.timestamp;
+                const double sampleTimestamp = image.timestamp;
                 const EffectiveControlAction controlAction = ResolveControlAction(action, sampleTimestamp);
                 try
                 {
@@ -2658,14 +2538,11 @@ private:
                         state,
                         action,
                         controlAction,
-                        maybeImage,
+                        image,
                         state.timestamp,
                         action.timestamp,
-                        maybeImage.has_value() ? maybeImage->timestamp : state.timestamp);
-                    if (config_.enableVideo && maybeImage.has_value())
-                    {
-                        lastLoggedImageSequence = maybeImage->sequence;
-                    }
+                        image.timestamp);
+                    lastLoggedImageSequence = image.sequence;
                 }
                 catch (const std::exception& ex)
                 {
@@ -2679,11 +2556,11 @@ private:
                 {
                     missing.emplace_back("state");
                 }
-                if (config_.enableVideo && !image.valid)
+                if (!image.valid)
                 {
                     missing.emplace_back("image");
                 }
-                else if (config_.enableVideo && !hasFreshImage)
+                else if (!hasFreshImage)
                 {
                     missing.emplace_back("new_image");
                 }

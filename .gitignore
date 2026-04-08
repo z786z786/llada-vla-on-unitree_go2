@@ -2,7 +2,6 @@ native/build/
 data/
 data_min10/
 data_min10_converted/
-data_stage1/
 outputs/
 __pycache__/
 scripts/__pycache__/

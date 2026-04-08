@@ -3,7 +3,6 @@
 当前只保留一条本地主路径：
 
 - `native/build/go2_collector` 采集
-- `native/build/go2_collector_stage1` 第一阶段简单指令采集
 - `scripts/sanity_check_dataset.py` 回放检查
 - `tools/validate_bc_dataset.py` 验证可训练性
 - `tools/convert_llada_vla_dataset.py` 转换训练清单
@@ -19,22 +18,6 @@ cmake --build native/build -j
 ```
 
 ## 2. 启动 collector
-
-第一阶段简单指令采集程序：
-
-```bash
-cd /home/xiaohui/unitree_go2/go2_vla_collector
-./native/build/go2_collector_stage1 --network-interface eno1 --scene-id lab_test --operator-id wxh
-```
-
-说明：
-
-- 这个程序固定为 `single_action`
-- 不接受 `--instruction` / `--task-family` / `--target-*` 这类第二阶段语义任务参数
-- episode 会自动按动作键标成 `go forward` / `turn left` 这类受控指令
-- 默认输出目录是 `data_stage1/`，避免和后续长轨迹数据混在一起
-
-通用 collector（保留第二阶段与视觉任务能力）：
 
 ```bash
 cd /home/xiaohui/unitree_go2/go2_vla_collector
