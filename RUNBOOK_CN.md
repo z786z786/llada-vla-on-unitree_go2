@@ -114,7 +114,23 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
   --target-description "corridor end glass door"
 ```
 
-## 3. 键盘操作
+## 3. 操作设备
+
+当前 collector 默认使用 `wireless_controller` 输入后端，直接读取 Go2 原生手柄 DDS 话题 `rt/wirelesscontroller`。
+
+手柄控制：
+
+- `Start`：应用当前配置并解锁
+- 左摇杆 `ly/lx`：前进 / 后退、左移 / 右移
+- 右摇杆 `rx`：左转 / 右转
+- `A`：按当前 `capture_mode` 启动采集
+- `B`：如果当前正在记录，则结束并保存当前区间
+- `X`：取消当前已 arm 或正在进行的区间
+- `R2`：急停，并 latch safety fault
+- `Y`：清除已恢复的 safety fault，或切换 stand up / down
+- 方向键 `上/右/下/左`：待标注时提交 `1/2/3/4`
+
+键盘回退控制：
 
 运动控制：
 

@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COLLECTOR_BIN="${PROJECT_ROOT}/native/build/go2_collector"
 
 NETWORK_INTERFACE="${NETWORK_INTERFACE:-}"
-INPUT_BACKEND="${INPUT_BACKEND:-evdev}"
+INPUT_BACKEND="${INPUT_BACKEND:-wireless_controller}"
 INPUT_DEVICE="${INPUT_DEVICE:-/dev/input/by-id/usb-Parallels_Virtual_Keyboard_KBD1.1-if01-event-kbd}"
 CAPTURE_MODE="${CAPTURE_MODE:-trajectory}"
 LOCAL_IPV4_CIDR="${LOCAL_IPV4_CIDR:-192.168.123.222/24}"
@@ -38,7 +38,7 @@ usage() {
 
 可选参数：
   --network-interface IFACE   默认：自动检测首选 Go2 有线网卡
-  --input-backend MODE        默认：evdev
+  --input-backend MODE        默认：wireless_controller
   --input-device PATH         默认：/dev/input/by-id/usb-Parallels_Virtual_Keyboard_KBD1.1-if01-event-kbd
   --capture-mode MODE         默认：trajectory
   --local-ipv4-cidr CIDR      默认：192.168.123.222/24

@@ -131,7 +131,23 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
   - 按 `ESC` 丢弃
   - 必须提供 `--instruction`
 
-## 键盘操作
+## 操作设备
+
+当前默认输入后端是 `wireless_controller`，直接读取 Go2 原生手柄 DDS 话题 `rt/wirelesscontroller`。
+
+手柄映射：
+
+- `Start`：应用当前配置并解锁
+- 左摇杆 `ly/lx`：前进后退 / 左右平移
+- 右摇杆 `rx`：左转 / 右转
+- `A`：按当前采集模式启动采集
+- `B`：结束当前采集段并保存
+- `X`：取消当前 armed 或 active 段
+- `R2`：急停
+- `Y`：清除故障或切换站立 / 趴下
+- 方向键 `上/右/下/左`：待标注时提交 `1/2/3/4`
+
+键盘仍可作为回退输入：
 
 - `W/S`：前进 / 后退
 - `A/D`：左移 / 右移

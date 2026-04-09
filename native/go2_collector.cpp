@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <unitree/idl/go2/SportModeState_.hpp>
+#include <unitree/idl/go2/WirelessController_.hpp>
 #include <unitree/robot/channel/channel_factory.hpp>
 #include <unitree/robot/channel/channel_subscriber.hpp>
 #include <unitree/robot/go2/sport/sport_client.hpp>
@@ -39,8 +40,10 @@ namespace fs = std::filesystem;
 constexpr char kDefaultDataDirName[] = "data";
 
 constexpr char kSportStateTopic[] = "rt/sportmodestate";
+constexpr char kWirelessControllerTopic[] = "rt/wirelesscontroller";
 constexpr char kSchemaVersion[] = "go2_local_dataset_v1";
 constexpr double kStateTimeoutSeconds = 1.0;
+constexpr double kWirelessControllerTimeoutSeconds = 1.0;
 constexpr double kMaxSafeAbsRollRad = 0.75;
 constexpr double kMaxSafeAbsPitchRad = 0.75;
 constexpr double kDefaultCmdVxMax = 0.5;
@@ -52,6 +55,9 @@ constexpr float kLinearAccelPerSecond = 3.0f;
 constexpr float kLinearDecelPerSecond = 4.5f;
 constexpr float kYawAccelPerSecond = 4.5f;
 constexpr float kYawDecelPerSecond = 6.0f;
+constexpr float kWirelessControllerDeadZone = 0.12f;
+constexpr float kWirelessControllerAxisSmoothing = 0.35f;
+constexpr float kWirelessControllerDiscreteThreshold = 0.35f;
 constexpr auto kCaptureStartDelay = std::chrono::milliseconds(500);
 constexpr auto kStartupGateReminderInterval = std::chrono::seconds(2);
 constexpr auto kTrajectoryFinalizeGracePeriod = std::chrono::milliseconds(400);
@@ -90,6 +96,7 @@ struct Config
 {
     enum class InputBackend
     {
+        WirelessController,
         Evdev,
         Tty,
     };
@@ -105,7 +112,7 @@ struct Config
     fs::path outputDir;
     double loopHz = 50.0;
     double videoPollHz = 10.0;
-    InputBackend inputBackend = InputBackend::Evdev;
+    InputBackend inputBackend = InputBackend::WirelessController;
     CaptureMode captureMode = CaptureMode::SingleAction;
     fs::path inputDevice;
     std::string sceneId;
@@ -186,6 +193,107 @@ struct VelocityCommand
     float vy = 0.0f;
     float wz = 0.0f;
     bool valid = false;
+};
+
+union WirelessControllerKeyBits
+{
+    struct
+    {
+        uint8_t R1 : 1;
+        uint8_t L1 : 1;
+        uint8_t start : 1;
+        uint8_t select : 1;
+        uint8_t R2 : 1;
+        uint8_t L2 : 1;
+        uint8_t F1 : 1;
+        uint8_t F2 : 1;
+        uint8_t A : 1;
+        uint8_t B : 1;
+        uint8_t X : 1;
+        uint8_t Y : 1;
+        uint8_t up : 1;
+        uint8_t right : 1;
+        uint8_t down : 1;
+        uint8_t left : 1;
+    } components;
+    uint16_t value = 0;
+};
+
+struct ControllerButtonState
+{
+    bool pressed = false;
+    bool onPress = false;
+    bool onRelease = false;
+
+    void Update(bool state)
+    {
+        onPress = state && !pressed;
+        onRelease = !state && pressed;
+        pressed = state;
+    }
+};
+
+struct WirelessControllerState
+{
+    double timestamp = 0.0;
+    bool valid = false;
+    float lx = 0.0f;
+    float ly = 0.0f;
+    float rx = 0.0f;
+    float ry = 0.0f;
+
+    ControllerButtonState R1;
+    ControllerButtonState L1;
+    ControllerButtonState start;
+    ControllerButtonState select;
+    ControllerButtonState R2;
+    ControllerButtonState L2;
+    ControllerButtonState F1;
+    ControllerButtonState F2;
+    ControllerButtonState A;
+    ControllerButtonState B;
+    ControllerButtonState X;
+    ControllerButtonState Y;
+    ControllerButtonState up;
+    ControllerButtonState right;
+    ControllerButtonState down;
+    ControllerButtonState left;
+
+    void Update(const unitree_go::msg::dds_::WirelessController_& message, double messageTimestamp)
+    {
+        const auto filterAxis = [](float current, float raw)
+        {
+            const float target = std::fabs(raw) < kWirelessControllerDeadZone ? 0.0f : raw;
+            return current * (1.0f - kWirelessControllerAxisSmoothing) + target * kWirelessControllerAxisSmoothing;
+        };
+
+        lx = filterAxis(lx, message.lx());
+        ly = filterAxis(ly, message.ly());
+        rx = filterAxis(rx, message.rx());
+        ry = filterAxis(ry, message.ry());
+
+        WirelessControllerKeyBits keyBits;
+        keyBits.value = message.keys();
+        R1.Update(keyBits.components.R1);
+        L1.Update(keyBits.components.L1);
+        start.Update(keyBits.components.start);
+        select.Update(keyBits.components.select);
+        R2.Update(keyBits.components.R2);
+        L2.Update(keyBits.components.L2);
+        F1.Update(keyBits.components.F1);
+        F2.Update(keyBits.components.F2);
+        A.Update(keyBits.components.A);
+        B.Update(keyBits.components.B);
+        X.Update(keyBits.components.X);
+        Y.Update(keyBits.components.Y);
+        up.Update(keyBits.components.up);
+        right.Update(keyBits.components.right);
+        down.Update(keyBits.components.down);
+        left.Update(keyBits.components.left);
+
+        timestamp = messageTimestamp;
+        valid = true;
+    }
 };
 
 struct EffectiveControlAction
@@ -500,9 +608,22 @@ fs::path LegacyCollectorDefaultsPath(const fs::path& collectorRoot)
     return collectorRoot / "collector_webui_defaults.json";
 }
 
-std::string StartupPromptText()
+std::string StartupUnlockHint(Config::InputBackend backend)
 {
-    return "collector 已完成初始化；请先在 WebUI 点击 Apply For Next Segment，或按 O 使用当前配置解锁移动与录制";
+    switch (backend)
+    {
+    case Config::InputBackend::WirelessController:
+        return "请先在 WebUI 点击 Apply For Next Segment，或按手柄 Start 使用当前配置解锁";
+    case Config::InputBackend::Evdev:
+    case Config::InputBackend::Tty:
+        return "请先在 WebUI 点击 Apply For Next Segment，或按 O 使用当前配置解锁";
+    }
+    return "请先在 WebUI 点击 Apply For Next Segment 完成解锁";
+}
+
+std::string StartupPromptText(Config::InputBackend backend)
+{
+    return "collector 已完成初始化；" + StartupUnlockHint(backend) + "移动与录制";
 }
 
 std::string SafetyStateName(SafetyState state)
@@ -582,6 +703,8 @@ std::string InputBackendName(Config::InputBackend backend)
 {
     switch (backend)
     {
+    case Config::InputBackend::WirelessController:
+        return "wireless_controller";
     case Config::InputBackend::Evdev:
         return "evdev";
     case Config::InputBackend::Tty:
@@ -915,6 +1038,10 @@ void SaveDefaultsFile(const fs::path& defaultsPath, const EditableCollectorConfi
 
 std::optional<Config::InputBackend> ParseInputBackend(const std::string& value)
 {
+    if (value == "wireless" || value == "wireless_controller" || value == "controller" || value == "gamepad")
+    {
+        return Config::InputBackend::WirelessController;
+    }
     if (value == "evdev")
     {
         return Config::InputBackend::Evdev;
@@ -1047,7 +1174,7 @@ void PrintUsage(const char* program)
         << "  --output-dir PATH        数据集根目录（默认：<collector>/" << kDefaultDataDirName << ")\n"
         << "  --loop-hz FLOAT          Control 和 logging loop frequency (default: 50.0)\n"
         << "  --video-poll-hz FLOAT    Camera polling frequency (default: 10.0)\n"
-        << "  --input-backend MODE     Input backend: evdev or tty (default: evdev)\n"
+        << "  --input-backend MODE     Input backend: wireless_controller, evdev, or tty (default: wireless_controller)\n"
         << "  --capture-mode MODE      Capture mode: single_action or trajectory (default: single_action)\n"
         << "  --input-device PATH      evdev device path (default: auto-detect keyboard)\n"
         << "  --scene-id TEXT          Required scene identifier\n"
@@ -1063,20 +1190,18 @@ void PrintUsage(const char* program)
         << "  --web-ui                 Enable optional local Web UI\n"
         << "  --web-port INT           Local Web UI port (default: 8080)\n"
         << "  --help                   Show this help\n\n"
-        << "Keyboard:\n"
-        << "  O    apply current config and unlock teleop/recording\n"
-        << "  W/S  forward/backward\n"
-        << "  A/D  strafe left/right\n"
-        << "  Q/E  turn left/right\n"
-        << "  R    start capture flow for the selected mode\n"
-        << "  T    manually end the current capture and start labeling if already recording\n"
-        << "  ESC  cancel current armed/capture segment\n"
-        << "  Space emergency stop 和 latch safety fault\n"
-        << "  C    clear fault or toggle stand up/down\n"
-        << "  P    print status\n"
-        << "  H    print help\n"
-        << "  X    quit\n"
+        << "Wireless controller:\n"
+        << "  Start apply current config and unlock teleop/recording\n"
+        << "  Left stick (ly/lx) forward-backward / strafe\n"
+        << "  Right stick X turn left-right\n"
+        << "  A start capture  B stop capture  X discard current segment\n"
+        << "  R2 emergency stop  Y clear fault or toggle stand up/down\n"
+        << "  D-pad Up/Right/Down/Left submit label 1/2/3/4 when label_ready\n"
+        << "Keyboard fallback:\n"
+        << "  O unlock  W/S forward-backward  A/D strafe  Q/E turn\n"
+        << "  R start  T stop  ESC discard  Space estop  C clear fault  P status  H help  X quit\n"
         << "Input:\n"
+        << "  wireless_controller subscribes Go2 native controller topic rt/wirelesscontroller\n"
         << "  evdev supports true multi-key press/release 和 smoother diagonal motion\n"
         << "  tty is a fallback mode 和 may feel less stable for combined keys\n"
         << "Capture modes:\n"
@@ -1146,7 +1271,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
             const auto backend = ParseInputBackend(argv[++index]);
             if (!backend.has_value())
             {
-                error = "输入后端必须是 evdev 或 tty";
+                error = "输入后端必须是 wireless_controller、evdev 或 tty";
                 return std::nullopt;
             }
             config.inputBackend = backend.value();
@@ -2086,7 +2211,7 @@ public:
             ResetActiveMotionKeys();
             if (emitUnlockLog)
             {
-                PrintLine("collector 参数已应用；已解锁移动与录制，按 R 开始采集");
+                PrintLine("collector 参数已应用；已解锁移动与录制，可立即开始采集");
             }
             return ActionOk("collector 参数已应用；已解锁移动与录制");
         }
@@ -2119,7 +2244,7 @@ public:
 
         if (wasLocked)
         {
-            PrintLine("collector 参数已应用并保存为默认值；已解锁移动与录制，按 R 开始采集");
+            PrintLine("collector 参数已应用并保存为默认值；已解锁移动与录制，可立即开始采集");
             return ActionOk("collector 参数已应用并保存为默认值；已解锁移动与录制");
         }
         PrintLine("collector 参数已更新并保存为默认值，将用于后续采集段");
@@ -2175,7 +2300,7 @@ public:
         }
         if (shouldPrint)
         {
-            PrintLine("当前尚未解锁移动；请先点击 Apply For Next Segment，或按 O 使用当前配置解锁");
+            PrintLine("当前尚未解锁移动；" + StartupUnlockHint(config_.inputBackend));
         }
     }
 
@@ -2185,14 +2310,22 @@ public:
         std::lock_guard<std::mutex> lock(outputMutex_);
         std::cout << "\r\33[2KCollector Startup" << std::endl;
         std::cout << "  采集前检查：确认周围安全、机器人姿态稳定、状态已正常更新" << std::endl;
-        std::cout << "  主控键位：W/S 前后  A/D 横移  Q/E 转向  R 开始录制  T 结束录制  ESC 丢弃当前段" << std::endl;
-        std::cout << "  其他键位：C 清 fault/切换站立  P 状态  H 帮助  X 退出" << std::endl;
-        std::cout << "  标注快捷键：待标注时按 1/2/3/4 直接完成评分" << std::endl;
-        std::cout << "  安全键位：Space 急停（始终有效）" << std::endl;
-        std::cout << "  解锁方式：先在 WebUI 填写并点击 Apply For Next Segment；终端可按 O 使用当前配置解锁" << std::endl;
+        if (config_.inputBackend == Config::InputBackend::WirelessController)
+        {
+            std::cout << "  主控手柄：左摇杆前后/横移，右摇杆 X 转向，A 开始录制，B 结束录制，X 丢弃当前段" << std::endl;
+            std::cout << "  其他按键：Start 解锁  R2 急停  Y 清 fault/切换站立  方向键上右下左 = 评分 1/2/3/4" << std::endl;
+        }
+        else
+        {
+            std::cout << "  主控键位：W/S 前后  A/D 横移  Q/E 转向  R 开始录制  T 结束录制  ESC 丢弃当前段" << std::endl;
+            std::cout << "  其他键位：C 清 fault/切换站立  P 状态  H 帮助  X 退出" << std::endl;
+            std::cout << "  标注快捷键：待标注时按 1/2/3/4 直接完成评分" << std::endl;
+            std::cout << "  安全键位：Space 急停（始终有效）" << std::endl;
+        }
+        std::cout << "  解锁方式：" << StartupUnlockHint(config_.inputBackend) << std::endl;
         std::cout << "  当前模式：capture_mode=" << CaptureModeName(editable.captureMode)
                   << " input_backend=" << InputBackendName(config_.inputBackend) << std::endl;
-        std::cout << "  " << StartupPromptText() << std::endl;
+        std::cout << "  " << StartupPromptText(config_.inputBackend) << std::endl;
     }
 
     UiActionResult ValidateEditableConfigForUse(
@@ -2279,7 +2412,7 @@ public:
         {
             if (unlocked)
             {
-                PrintLine("collector 参数已应用并保存为默认值；已解锁移动与录制，按 R 开始采集");
+                PrintLine("collector 参数已应用并保存为默认值；已解锁移动与录制，可立即开始采集");
             }
             else
             {
@@ -2328,10 +2461,14 @@ public:
         {
             terminalGuard_.Enable();
         }
-        else
+        else if (config_.inputBackend == Config::InputBackend::Evdev)
         {
             terminalRawEnabled_ = terminalGuard_.TryEnable();
             OpenEvdevInput();
+        }
+        else
+        {
+            terminalRawEnabled_ = terminalGuard_.TryEnable();
         }
 
         unitree::robot::ChannelFactory::Instance()->Init(0, config_.networkInterface);
@@ -2342,6 +2479,10 @@ public:
 
         sportStateSubscriber_ = std::make_shared<unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::SportModeState_>>(kSportStateTopic);
         sportStateSubscriber_->InitChannel(std::bind(&CollectorApp::OnSportState, this, std::placeholders::_1), 1);
+
+        wirelessControllerSubscriber_ =
+            std::make_shared<unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::WirelessController_>>(kWirelessControllerTopic);
+        wirelessControllerSubscriber_->InitChannel(std::bind(&CollectorApp::OnWirelessController, this, std::placeholders::_1), 1);
 
         videoClient_ = std::make_unique<unitree::robot::go2::VideoClient>();
         videoClient_->SetTimeout(1.0f);
@@ -2418,6 +2559,11 @@ public:
             sportStateSubscriber_->CloseChannel();
             sportStateSubscriber_.reset();
         }
+        if (wirelessControllerSubscriber_)
+        {
+            wirelessControllerSubscriber_->CloseChannel();
+            wirelessControllerSubscriber_.reset();
+        }
 
         if (keyboardThread_.joinable())
         {
@@ -2480,7 +2626,7 @@ public:
         snapshot.running = running_.load();
         snapshot.webUiEnabled = config_.webUiEnabled;
         snapshot.webPort = config_.webPort;
-        snapshot.startupPrompt = StartupPromptText();
+        snapshot.startupPrompt = StartupPromptText(config_.inputBackend);
         snapshot.sessionDir = logger_.OutputDir().string();
         snapshot.captureMode = CaptureModeName(editable.captureMode);
         snapshot.bufferedFrames = loggerStatus.bufferedFrames;
@@ -2675,9 +2821,35 @@ private:
         bool yawRight = false;
     };
 
-    MotionStateSnapshot GetMotionStateSnapshotLocked(std::chrono::steady_clock::time_point now) const
+    WirelessControllerState GetWirelessControllerStateSnapshot() const
+    {
+        std::lock_guard<std::mutex> lock(controllerMutex_);
+        return wirelessControllerState_;
+    }
+
+    MotionStateSnapshot GetMotionStateSnapshot() const
     {
         MotionStateSnapshot motionState;
+        if (config_.inputBackend == Config::InputBackend::WirelessController)
+        {
+            const WirelessControllerState controllerState = GetWirelessControllerStateSnapshot();
+            const double ageSeconds = AgeSeconds(controllerState.timestamp, NowSeconds());
+            if (!controllerState.valid || ageSeconds < 0.0 || ageSeconds > kWirelessControllerTimeoutSeconds)
+            {
+                return motionState;
+            }
+
+            motionState.forward = controllerState.ly > kWirelessControllerDiscreteThreshold;
+            motionState.backward = controllerState.ly < -kWirelessControllerDiscreteThreshold;
+            motionState.left = controllerState.lx < -kWirelessControllerDiscreteThreshold;
+            motionState.right = controllerState.lx > kWirelessControllerDiscreteThreshold;
+            motionState.yawLeft = controllerState.rx < -kWirelessControllerDiscreteThreshold;
+            motionState.yawRight = controllerState.rx > kWirelessControllerDiscreteThreshold;
+            return motionState;
+        }
+
+        std::lock_guard<std::mutex> lock(keyMutex_);
+        const auto now = std::chrono::steady_clock::now();
         motionState.forward = keyW_.pressed || keyW_.deadline > now;
         motionState.backward = keyS_.pressed || keyS_.deadline > now;
         motionState.left = keyA_.pressed || keyA_.deadline > now;
@@ -2685,12 +2857,6 @@ private:
         motionState.yawLeft = keyQ_.pressed || keyQ_.deadline > now;
         motionState.yawRight = keyE_.pressed || keyE_.deadline > now;
         return motionState;
-    }
-
-    MotionStateSnapshot GetMotionStateSnapshot() const
-    {
-        std::lock_guard<std::mutex> lock(keyMutex_);
-        return GetMotionStateSnapshotLocked(std::chrono::steady_clock::now());
     }
 
     static MotionInstruction MotionInstructionFromSnapshot(const MotionStateSnapshot& motionState)
@@ -2775,11 +2941,11 @@ private:
         {
             if (timedOut)
             {
-                StartTrajectoryFinalizeGracePeriod("Stopping segment timed out; finalizing segment... press score key", true);
+                StartTrajectoryFinalizeGracePeriod("Stopping segment timed out; finalizing segment... submit a score", true);
             }
             else
             {
-                StartTrajectoryFinalizeGracePeriod("Finalizing segment... press score key", true);
+                StartTrajectoryFinalizeGracePeriod("Finalizing segment... submit a score", true);
             }
             return;
         }
@@ -2894,46 +3060,73 @@ private:
             return std::nullopt;
         }
 
-        SegmentLabelInput input;
         if (selection.value() == "好的成功示范 (clean + success + goal_reached)")
         {
+            return BuildPresetLabelFromShortcut('1');
+        }
+        if (selection.value() == "可用但不完美 (usable + partial + near_goal_stop)")
+        {
+            return BuildPresetLabelFromShortcut('2');
+        }
+        if (selection.value() == "失败但有价值 (usable + fail + operator_stop)")
+        {
+            return BuildPresetLabelFromShortcut('3');
+        }
+        if (selection.value() == "丢弃 (discard)")
+        {
+            return BuildPresetLabelFromShortcut('4');
+        }
+        return std::nullopt;
+    }
+
+    static std::optional<SegmentLabelInput> BuildPresetLabelFromShortcut(char shortcut)
+    {
+        SegmentLabelInput input;
+        switch (shortcut)
+        {
+        case '1':
             input.segmentStatus = SegmentStatusName(SegmentStatus::Clean);
             input.success = SuccessLabelName(SuccessLabel::Success);
             input.terminationReason = TerminationReasonName(TerminationReason::GoalReached);
             return input;
-        }
-        if (selection.value() == "可用但不完美 (usable + partial + near_goal_stop)")
-        {
+        case '2':
             input.segmentStatus = SegmentStatusName(SegmentStatus::Usable);
             input.success = SuccessLabelName(SuccessLabel::Partial);
             input.terminationReason = TerminationReasonName(TerminationReason::NearGoalStop);
             return input;
-        }
-        if (selection.value() == "失败但有价值 (usable + fail + operator_stop)")
-        {
+        case '3':
             input.segmentStatus = SegmentStatusName(SegmentStatus::Usable);
             input.success = SuccessLabelName(SuccessLabel::Fail);
             input.terminationReason = TerminationReasonName(TerminationReason::OperatorStop);
             return input;
-        }
-        if (selection.value() == "丢弃 (discard)")
-        {
+        case '4':
             input.segmentStatus = SegmentStatusName(SegmentStatus::Discard);
             return input;
+        default:
+            return std::nullopt;
         }
-        return std::nullopt;
     }
 
     void PrintHelp() const
     {
         const EditableCollectorConfig editable = GetEditableConfigSnapshot();
         std::lock_guard<std::mutex> lock(outputMutex_);
-        std::cout << "\r\33[2KKeys:" << std::endl;
-        std::cout << "  O apply current config and unlock teleop/recording" << std::endl;
-        std::cout << "  W/S forward/backward  A/D strafe  Q/E yaw" << std::endl;
-        std::cout << "  R start capture flow  ESC cancel current armed/capture segment" << std::endl;
-        std::cout << "  Space emergency stop  C clear fault or toggle stand up/down  P status  H help  X quit" << std::endl;
-        std::cout << "  pending label: 1 good demo  2 usable imperfect  3 failed but valuable  4 discard" << std::endl;
+        std::cout << "\r\33[2KControls:" << std::endl;
+        if (config_.inputBackend == Config::InputBackend::WirelessController)
+        {
+            std::cout << "  Start unlock/apply config  A start capture  B stop capture  X discard current segment" << std::endl;
+            std::cout << "  left stick = forward/backward + strafe  right stick X = yaw" << std::endl;
+            std::cout << "  R2 emergency stop  Y clear fault or toggle stand up/down" << std::endl;
+            std::cout << "  pending label: D-pad up/right/down/left = 1/2/3/4" << std::endl;
+        }
+        else
+        {
+            std::cout << "  O apply current config and unlock teleop/recording" << std::endl;
+            std::cout << "  W/S forward/backward  A/D strafe  Q/E yaw" << std::endl;
+            std::cout << "  R start capture flow  ESC cancel current armed/capture segment" << std::endl;
+            std::cout << "  Space emergency stop  C clear fault or toggle stand up/down  P status  H help  X quit" << std::endl;
+            std::cout << "  pending label: 1 good demo  2 usable imperfect  3 failed but valuable  4 discard" << std::endl;
+        }
         if (editable.captureMode == Config::CaptureMode::SingleAction)
         {
             std::cout << "  single_action 模式：检测到第一个有效单动作输入后，等待 0.5 秒开始录制，松键自动结束" << std::endl;
@@ -2954,7 +3147,10 @@ private:
         LatestState state;
         LatestImage image;
         VelocityCommand command;
-        MotionStateSnapshot motionState;
+        const MotionStateSnapshot motionState = GetMotionStateSnapshot();
+        const WirelessControllerState controllerState =
+            config_.inputBackend == Config::InputBackend::WirelessController ? GetWirelessControllerStateSnapshot()
+                                                                             : WirelessControllerState{};
         {
             std::lock_guard<std::mutex> lock(stateMutex_);
             state = latestState_;
@@ -2966,16 +3162,6 @@ private:
         {
             std::lock_guard<std::mutex> lock(commandMutex_);
             command = latestCommand_;
-        }
-        {
-            std::lock_guard<std::mutex> lock(keyMutex_);
-            const auto now = std::chrono::steady_clock::now();
-            motionState.forward = keyW_.pressed || keyW_.deadline > now;
-            motionState.backward = keyS_.pressed || keyS_.deadline > now;
-            motionState.left = keyA_.pressed || keyA_.deadline > now;
-            motionState.right = keyD_.pressed || keyD_.deadline > now;
-            motionState.yawLeft = keyQ_.pressed || keyQ_.deadline > now;
-            motionState.yawRight = keyE_.pressed || keyE_.deadline > now;
         }
 
         const auto loggerStatus = logger_.GetStatus();
@@ -3019,15 +3205,27 @@ private:
             << " image=" << image.valid
             << " state_age_s=" << std::fixed << std::setprecision(3) << AgeSeconds(state.timestamp, nowSeconds)
             << " image_age_s=" << AgeSeconds(image.timestamp, nowSeconds)
-            << " command=(" << command.vx << "," << command.vy << "," << command.wz << ")"
-            << " motion_keys=("
-            << (motionState.forward ? "W" : "")
-            << (motionState.backward ? "S" : "")
-            << (motionState.left ? "A" : "")
-            << (motionState.right ? "D" : "")
-            << (motionState.yawLeft ? "Q" : "")
-            << (motionState.yawRight ? "E" : "")
-            << ")"
+            << " command=(" << command.vx << "," << command.vy << "," << command.wz << ")";
+        if (config_.inputBackend == Config::InputBackend::WirelessController)
+        {
+            oss << " controller_axes=("
+                << "ly=" << controllerState.ly
+                << ",lx=" << controllerState.lx
+                << ",rx=" << controllerState.rx
+                << ")";
+        }
+        else
+        {
+            oss << " motion_keys=("
+                << (motionState.forward ? "W" : "")
+                << (motionState.backward ? "S" : "")
+                << (motionState.left ? "A" : "")
+                << (motionState.right ? "D" : "")
+                << (motionState.yawLeft ? "Q" : "")
+                << (motionState.yawRight ? "E" : "")
+                << ")";
+        }
+        oss
             << " active_instruction=" << (activeInstruction.empty() ? "-" : activeInstruction)
             << " capture_delay_s=" << std::fixed << std::setprecision(3) << armDelayRemaining;
         PrintLine(oss.str());
@@ -3219,9 +3417,9 @@ private:
         {
             if (emitLog)
             {
-                PrintLine("当前尚未解锁移动；请先点击 Apply For Next Segment，或按 O 使用当前配置解锁");
+                PrintLine("当前尚未解锁移动；" + StartupUnlockHint(config_.inputBackend));
             }
-            return ActionError("startup_gate_active", "请先点击 Apply For Next Segment，或按 O 使用当前配置解锁");
+            return ActionError("startup_gate_active", StartupUnlockHint(config_.inputBackend));
         }
         if (safetyState_ != SafetyState::SafeReady)
         {
@@ -3268,7 +3466,7 @@ private:
                 ResetTrajectoryStopFlowLocked();
                 if (emitLog)
                 {
-                    PrintLine("trajectory 已 armed；检测到连续有效动作后开始写入，按 T 请求结束，按 ESC 丢弃");
+                    PrintLine("trajectory 已 armed；检测到连续有效动作后开始写入，使用停止键结束，使用丢弃键取消");
                 }
             }
             else
@@ -3325,7 +3523,7 @@ private:
         }
         if (emitLog)
         {
-            PrintLine("Entering labeling state... press 1/2/3/4");
+            PrintLine("Entering labeling state... submit 1/2/3/4 or D-pad score");
         }
         return ActionOk("segment stopped for labeling");
     }
@@ -3399,7 +3597,7 @@ private:
                 }
                 else
                 {
-                    PrintLine("Finalizing segment... press score key");
+                    PrintLine("Finalizing segment... submit a score");
                 }
             }
             return ActionOk("trajectory stop requested");
@@ -3753,7 +3951,7 @@ private:
         target->deadline = deadline;
     }
 
-    VelocityCommand ComputeKeyboardCommand()
+    VelocityCommand ComputeInputCommand()
     {
         if (IsStartupGateActive())
         {
@@ -3768,22 +3966,40 @@ private:
             stopRequested = trajectoryStopRequested_;
         }
         const auto now = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> lock(keyMutex_);
         const float deltaSeconds = lastCommandUpdate_.time_since_epoch().count() == 0
                                        ? 0.0f
                                        : std::chrono::duration<float>(now - lastCommandUpdate_).count();
         lastCommandUpdate_ = now;
 
-        const float forward = stopRequested ? 0.0f : ((keyW_.pressed || keyW_.deadline > now) ? 1.0f : 0.0f);
-        const float backward = stopRequested ? 0.0f : ((keyS_.pressed || keyS_.deadline > now) ? 1.0f : 0.0f);
-        const float left = stopRequested ? 0.0f : ((keyA_.pressed || keyA_.deadline > now) ? 1.0f : 0.0f);
-        const float right = stopRequested ? 0.0f : ((keyD_.pressed || keyD_.deadline > now) ? 1.0f : 0.0f);
-        const float yawLeft = stopRequested ? 0.0f : ((keyQ_.pressed || keyQ_.deadline > now) ? 1.0f : 0.0f);
-        const float yawRight = stopRequested ? 0.0f : ((keyE_.pressed || keyE_.deadline > now) ? 1.0f : 0.0f);
+        float targetVx = 0.0f;
+        float targetVy = 0.0f;
+        float targetWz = 0.0f;
+        if (config_.inputBackend == Config::InputBackend::WirelessController)
+        {
+            const WirelessControllerState controllerState = GetWirelessControllerStateSnapshot();
+            const double ageSeconds = AgeSeconds(controllerState.timestamp, NowSeconds());
+            if (!stopRequested && controllerState.valid && ageSeconds >= 0.0 && ageSeconds <= kWirelessControllerTimeoutSeconds)
+            {
+                // Unitree SDK examples use ly / -lx / -rx as the normalized locomotion axes.
+                targetVx = controllerState.ly;
+                targetVy = -controllerState.lx;
+                targetWz = -controllerState.rx;
+            }
+        }
+        else
+        {
+            std::lock_guard<std::mutex> lock(keyMutex_);
+            const float forward = stopRequested ? 0.0f : ((keyW_.pressed || keyW_.deadline > now) ? 1.0f : 0.0f);
+            const float backward = stopRequested ? 0.0f : ((keyS_.pressed || keyS_.deadline > now) ? 1.0f : 0.0f);
+            const float left = stopRequested ? 0.0f : ((keyA_.pressed || keyA_.deadline > now) ? 1.0f : 0.0f);
+            const float right = stopRequested ? 0.0f : ((keyD_.pressed || keyD_.deadline > now) ? 1.0f : 0.0f);
+            const float yawLeft = stopRequested ? 0.0f : ((keyQ_.pressed || keyQ_.deadline > now) ? 1.0f : 0.0f);
+            const float yawRight = stopRequested ? 0.0f : ((keyE_.pressed || keyE_.deadline > now) ? 1.0f : 0.0f);
+            targetVx = forward - backward;
+            targetVy = left - right;
+            targetWz = yawLeft - yawRight;
+        }
 
-        float targetVx = forward - backward;
-        float targetVy = left - right;
-        const float targetWz = yawLeft - yawRight;
         const float planarNorm = std::sqrt(targetVx * targetVx + targetVy * targetVy);
         if (planarNorm > 1.0f)
         {
@@ -3876,6 +4092,12 @@ private:
         case 'x':
             RequestQuit();
             break;
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+            SubmitPresetLabelShortcut(lowered);
+            break;
         default:
             if (ch == ' ')
             {
@@ -3885,8 +4107,76 @@ private:
         }
     }
 
+    void SubmitPresetLabelShortcut(char shortcut)
+    {
+        const auto preset = BuildPresetLabelFromShortcut(shortcut);
+        if (!preset.has_value())
+        {
+            return;
+        }
+        if (!logger_.GetStatus().pendingLabel)
+        {
+            return;
+        }
+        const UiActionResult result = SubmitPendingLabel(preset.value());
+        if (!result.ok)
+        {
+            PrintLine("标注提交失败：" + result.message);
+        }
+    }
+
+    void HandleWirelessControllerActions(const WirelessControllerState& controllerState)
+    {
+        if (controllerState.start.onPress)
+        {
+            ProcessTeleopChar(kStartupAcknowledgeKey, false);
+        }
+        if (controllerState.A.onPress)
+        {
+            ProcessTeleopChar('r', false);
+        }
+        if (controllerState.B.onPress)
+        {
+            ProcessTeleopChar('t', false);
+        }
+        if (controllerState.X.onPress)
+        {
+            ProcessTeleopChar(kEscapeKey, false);
+        }
+        if (controllerState.R2.onPress)
+        {
+            ProcessTeleopChar(' ', false);
+        }
+        if (controllerState.Y.onPress)
+        {
+            ProcessTeleopChar('c', false);
+        }
+        if (controllerState.up.onPress)
+        {
+            SubmitPresetLabelShortcut('1');
+        }
+        if (controllerState.right.onPress)
+        {
+            SubmitPresetLabelShortcut('2');
+        }
+        if (controllerState.down.onPress)
+        {
+            SubmitPresetLabelShortcut('3');
+        }
+        if (controllerState.left.onPress)
+        {
+            SubmitPresetLabelShortcut('4');
+        }
+    }
+
     void KeyboardLoop()
     {
+        if (config_.inputBackend == Config::InputBackend::WirelessController)
+        {
+            WirelessControllerLoop();
+            return;
+        }
+
         if (config_.inputBackend == Config::InputBackend::Evdev)
         {
             EvdevKeyboardLoop();
@@ -3907,6 +4197,43 @@ private:
                 continue;
             }
             ProcessTeleopChar(ch, true);
+        }
+    }
+
+    void WirelessControllerLoop()
+    {
+        while (running_.load())
+        {
+            WirelessControllerState controllerState;
+            {
+                std::lock_guard<std::mutex> lock(controllerMutex_);
+                if (wirelessControllerMessageReceived_)
+                {
+                    wirelessControllerState_.Update(wirelessControllerMessage_, wirelessControllerMessageTimestamp_);
+                }
+                controllerState = wirelessControllerState_;
+            }
+            if (controllerState.valid)
+            {
+                HandleWirelessControllerActions(controllerState);
+            }
+
+            if (terminalRawEnabled_ && !promptActive_.load())
+            {
+                pollfd pfd{STDIN_FILENO, POLLIN, 0};
+                const int pollResult = ::poll(&pfd, 1, 0);
+                if (pollResult > 0 && (pfd.revents & POLLIN) != 0)
+                {
+                    char ch = 0;
+                    const ssize_t bytesRead = ::read(STDIN_FILENO, &ch, 1);
+                    if (bytesRead > 0)
+                    {
+                        ProcessTeleopChar(ch, false);
+                    }
+                }
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
     }
 
@@ -4067,6 +4394,15 @@ private:
         latestState_ = latest;
     }
 
+    void OnWirelessController(const void* message)
+    {
+        const auto* controller = static_cast<const unitree_go::msg::dds_::WirelessController_*>(message);
+        std::lock_guard<std::mutex> lock(controllerMutex_);
+        wirelessControllerMessage_ = *controller;
+        wirelessControllerMessageTimestamp_ = NowSeconds();
+        wirelessControllerMessageReceived_ = true;
+    }
+
     void ControlLoop()
     {
         const auto period = std::chrono::duration<double>(1.0 / config_.loopHz);
@@ -4079,7 +4415,7 @@ private:
             const MotionStateSnapshot motionState = GetMotionStateSnapshot();
             UpdateCaptureStateFromMotion(motionState);
             UpdateTrajectoryStopFlow(motionState);
-            VelocityCommand command = ComputeKeyboardCommand();
+            VelocityCommand command = ComputeInputCommand();
             CaptureState captureState;
             SafetyState safetyState;
             {
@@ -4307,6 +4643,7 @@ private:
     mutable std::mutex sportClientMutex_;
     mutable std::mutex stateMachineMutex_;
     mutable std::mutex keyMutex_;
+    mutable std::mutex controllerMutex_;
     mutable std::mutex editableConfigMutex_;
     std::condition_variable imageUpdatedCv_;
 
@@ -4339,12 +4676,17 @@ private:
     float smoothedVx_ = 0.0f;
     float smoothedVy_ = 0.0f;
     float smoothedWz_ = 0.0f;
+    unitree_go::msg::dds_::WirelessController_ wirelessControllerMessage_{};
+    double wirelessControllerMessageTimestamp_ = 0.0;
+    bool wirelessControllerMessageReceived_ = false;
+    WirelessControllerState wirelessControllerState_{};
     int evdevFd_ = -1;
     bool terminalRawEnabled_ = false;
 
     std::unique_ptr<unitree::robot::go2::SportClient> sportClient_;
     std::unique_ptr<unitree::robot::go2::VideoClient> videoClient_;
     std::shared_ptr<unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::SportModeState_>> sportStateSubscriber_;
+    std::shared_ptr<unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::WirelessController_>> wirelessControllerSubscriber_;
 
     std::thread keyboardThread_;
     std::thread controlThread_;
