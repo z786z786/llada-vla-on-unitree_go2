@@ -28,16 +28,16 @@ TARGET_FIELDS = list(ACTION_FIELDS)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train and evaluate a simple Go2 behavior-cloning baseline")
-    parser.add_argument("--dataset-root", type=Path, required=True, help="Converted manifest root or raw session root")
-    parser.add_argument("--l2", type=float, default=1e-4, help="L2 regularization strength")
-    parser.add_argument("--text-dim", type=int, default=64, help="Hashed instruction feature dimension")
-    parser.add_argument("--train-ratio", type=float, default=0.8, help="Training split ratio for raw sessions")
-    parser.add_argument("--val-ratio", type=float, default=0.1, help="Validation split ratio for raw sessions")
-    parser.add_argument("--test-ratio", type=float, default=0.1, help="Test split ratio for raw sessions")
-    parser.add_argument("--min-episode-length", type=int, default=1, help="Drop raw episodes shorter than this many frames")
-    parser.add_argument("--split-mode", choices=["auto", "by_session", "by_trajectory"], default="auto", help="Split mode when reading raw sessions")
-    parser.add_argument("--save-model", type=Path, help="Optional path to save the fitted baseline weights as JSON")
+    parser = argparse.ArgumentParser(description="训练并评估一个简单的 Go2 行为克隆基线")
+    parser.add_argument("--dataset-root", type=Path, required=True, help="转换后清单根目录，或原始 session 根目录")
+    parser.add_argument("--l2", type=float, default=1e-4, help="L2 正则强度")
+    parser.add_argument("--text-dim", type=int, default=64, help="哈希指令特征维度")
+    parser.add_argument("--train-ratio", type=float, default=0.8, help="原始 session 划分时的训练集比例")
+    parser.add_argument("--val-ratio", type=float, default=0.1, help="原始 session 划分时的验证集比例")
+    parser.add_argument("--test-ratio", type=float, default=0.1, help="原始 session 划分时的测试集比例")
+    parser.add_argument("--min-episode-length", type=int, default=1, help="丢弃短于该长度的原始 episode")
+    parser.add_argument("--split-mode", choices=["auto", "by_session", "by_trajectory"], default="auto", help="读取原始 session 时的数据划分模式")
+    parser.add_argument("--save-model", type=Path, help="可选：将拟合后的基线权重保存为 JSON")
     return parser
 
 
@@ -199,7 +199,7 @@ def _load_split_records(dataset_root: Path, args: argparse.Namespace) -> Dict[st
 
     session_roots = discover_session_roots(dataset_root)
     if not session_roots:
-        raise FileNotFoundError(f"no converted manifests or raw session roots found under {dataset_root}")
+        raise FileNotFoundError(f"在以下路径下没有找到转换后清单或原始 session：{dataset_root}")
 
     samples: List[Sample] = []
     for session_root in session_roots:
@@ -230,8 +230,8 @@ def _predict_many(model: LinearBaseline, features: Sequence[Sequence[float]]) ->
 def _describe_split(name: str, records: Sequence[Dict[str, Any]]) -> str:
     sessions = len({str(record.get("session_id") or "") for record in records})
     episodes = len({(str(record.get("session_id") or ""), str(record.get("episode_id") or record.get("trajectory_id") or "")) for record in records})
-    instructions = len({str(record.get("instruction") or "") for record in records})
-    return f"{name}: {len(records)} samples, {sessions} sessions, {episodes} episodes, {instructions} instructions"
+    条指令 = len({str(record.get("instruction") or "") for record in records})
+    return f"{name}: {len(records)} 个样本，{sessions} 个 session，{episodes} 条 episode，{instructions} 条指令"
 
 
 def main() -> None:
@@ -243,7 +243,7 @@ def main() -> None:
     val_records = split_records["val"]
     test_records = split_records["test"]
     if not train_records:
-        raise RuntimeError("no training records available")
+        raise RuntimeError("没有可用的训练记录")
 
     print(_describe_split("train", train_records))
     print(_describe_split("val", val_records))
@@ -255,21 +255,21 @@ def main() -> None:
 
     mean_baseline = _mean_vector(train_targets)
     if val_targets:
-        print("mean-baseline val:", _mse_mae([mean_baseline for _ in val_targets], val_targets))
+        print("均值基线 val：", _mse_mae([mean_baseline for _ in val_targets], val_targets))
     if test_targets:
-        print("mean-baseline test:", _mse_mae([mean_baseline for _ in test_targets], test_targets))
+        print("均值基线 test：", _mse_mae([mean_baseline for _ in test_targets], test_targets))
 
     model = LinearBaseline.create(len(train_features[0]), len(train_targets[0]))
     model.fit(train_features, train_targets, l2=args.l2)
-    print("linear-baseline train:", _mse_mae(_predict_many(model, train_features), train_targets))
+    print("线性基线 train：", _mse_mae(_predict_many(model, train_features), train_targets))
     if val_targets:
-        print("linear-baseline val:", _mse_mae(_predict_many(model, val_features), val_targets))
+        print("线性基线 val：", _mse_mae(_predict_many(model, val_features), val_targets))
     if test_targets:
-        print("linear-baseline test:", _mse_mae(_predict_many(model, test_features), test_targets))
+        print("线性基线 test：", _mse_mae(_predict_many(model, test_features), test_targets))
 
     if args.save_model is not None:
         model.save(args.save_model.resolve())
-        print(f"saved model to {args.save_model.resolve()}")
+        print(f"模型已保存到 {args.save_model.resolve()}")
 
 
 if __name__ == "__main__":

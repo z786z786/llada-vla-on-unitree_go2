@@ -51,8 +51,6 @@ TASK_METADATA_FIELDS = [
     "task_family",
     "target_type",
     "target_description",
-    "target_instance_id",
-    "task_tags",
     "collector_notes",
     "instruction_source",
     "segment_status",
@@ -262,14 +260,6 @@ def episode_task_metadata(payload: Dict[str, Any], episode_meta: Dict[str, Any])
         _safe_str(task_block.get("task_family"))
     )
     task_family = infer_task_family(instruction, explicit_task_family)
-    task_tags = normalize_tags(
-        payload.get("task_tags")
-        or episode_meta.get("task_tags")
-        or task_block.get("task_tags")
-        or payload.get("tags")
-        or episode_meta.get("tags")
-    )
-
     return {
         "capture_mode": (
             _safe_str(payload.get("capture_mode")) or
@@ -287,12 +277,6 @@ def episode_task_metadata(payload: Dict[str, Any], episode_meta: Dict[str, Any])
             _safe_str(episode_meta.get("target_description")) or
             _safe_str(task_block.get("target_description"))
         ),
-        "target_instance_id": (
-            _safe_str(payload.get("target_instance_id")) or
-            _safe_str(episode_meta.get("target_instance_id")) or
-            _safe_str(task_block.get("target_instance_id"))
-        ),
-        "task_tags": task_tags,
         "collector_notes": (
             _safe_str(payload.get("collector_notes")) or
             _safe_str(episode_meta.get("collector_notes")) or

@@ -52,47 +52,47 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train and evaluate the Go2 multimodal VLA baseline v2")
-    parser.add_argument("--dataset-root", type=Path, required=True, help="Converted manifest root or raw session root")
-    parser.add_argument("--manifest-path", type=Path, help="Optional manifest file path inside a converted dataset root")
-    parser.add_argument("--output-dir", type=Path, required=True, help="Directory for checkpoints and metrics")
+    parser = argparse.ArgumentParser(description="训练并评估 Go2 多模态 VLA 基线 v2")
+    parser.add_argument("--dataset-root", type=Path, required=True, help="转换后清单根目录，或原始 session 根目录")
+    parser.add_argument("--manifest-path", type=Path, help="可选：转换后数据集内的 manifest 文件路径")
+    parser.add_argument("--output-dir", type=Path, required=True, help="checkpoint 与指标输出目录")
     parser.add_argument(
         "--ablation-mode",
         choices=["instruction_only", "image_plus_instruction", "image_plus_instruction_plus_state"],
         default="image_plus_instruction",
-        help="Which modalities to enable",
+        help="启用哪些模态",
     )
-    parser.add_argument("--image-size", type=int, default=224, help="Square image size for the vision encoder")
-    parser.add_argument("--image-error-mode", choices=["blank", "raise"], default="blank", help="How to handle unreadable image files")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
-    parser.add_argument("--learning-rate", type=float, default=1e-4, help="AdamW learning rate")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay")
-    parser.add_argument("--hidden-dim", type=int, default=256, help="Shared hidden dimension for modality projections")
-    parser.add_argument("--text-embed-dim", type=int, default=64, help="Embedding size for text tokens before projection")
-    parser.add_argument("--vision-learning-rate", type=float, help="Optional separate learning rate for the vision backbone")
-    parser.add_argument("--freeze-vision-backbone", action="store_true", help="Freeze ResNet18 backbone weights and train only projector/fusion/head")
-    parser.add_argument("--use-state", type=_parse_bool, default=False, help="Enable the state branch when ablation mode permits it")
-    parser.add_argument("--state-fields", type=str, help="Comma-separated state fields to use; defaults to yaw only")
-    parser.add_argument("--fusion-type", choices=["mlp", "tiny_transformer"], default="mlp", help="Multimodal fusion type")
+    parser.add_argument("--image-size", type=int, default=224, help="视觉编码器使用的方形图像尺寸")
+    parser.add_argument("--image-error-mode", choices=["blank", "raise"], default="blank", help="无法读取图像时的处理方式")
+    parser.add_argument("--batch-size", type=int, default=32, help="批大小")
+    parser.add_argument("--epochs", type=int, default=10, help="训练轮数")
+    parser.add_argument("--learning-rate", type=float, default=1e-4, help="AdamW 学习率")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW 权重衰减")
+    parser.add_argument("--hidden-dim", type=int, default=256, help="模态投影共享隐藏维度")
+    parser.add_argument("--text-embed-dim", type=int, default=64, help="文本 token 投影前的嵌入维度")
+    parser.add_argument("--vision-learning-rate", type=float, help="可选：视觉骨干网络单独学习率")
+    parser.add_argument("--freeze-vision-backbone", action="store_true", help="冻结 ResNet18 骨干，仅训练投影/融合/输出头")
+    parser.add_argument("--use-state", type=_parse_bool, default=False, help="在当前消融模式允许时启用状态分支")
+    parser.add_argument("--state-fields", type=str, help="要使用的状态字段，逗号分隔；默认只使用 yaw")
+    parser.add_argument("--fusion-type", choices=["mlp", "tiny_transformer"], default="mlp", help="多模态融合类型")
     parser.add_argument(
         "--split-strategy",
         choices=["use_manifest", "auto", "by_session", "by_episode"],
         default="use_manifest",
-        help="How to assign train/val/test splits when raw sessions are used",
+        help="使用原始 session 时如何划分 train/val/test",
     )
-    parser.add_argument("--train-ratio", type=float, default=0.8, help="Training ratio for raw-session splitting")
-    parser.add_argument("--val-ratio", type=float, default=0.1, help="Validation ratio for raw-session splitting")
-    parser.add_argument("--test-ratio", type=float, default=0.1, help="Test ratio for raw-session splitting")
-    parser.add_argument("--min-episode-length", type=int, default=1, help="Drop raw episodes shorter than this many frames")
-    parser.add_argument("--checkpoint-path", type=Path, help="Checkpoint to resume from or use for eval-only")
-    parser.add_argument("--eval-only", action="store_true", help="Skip training and evaluate a checkpoint")
-    parser.add_argument("--save-predictions", action="store_true", help="Save per-sample prediction dumps for val/test")
-    parser.add_argument("--compare-old-linear", action="store_true", help="Also report the existing handcrafted linear baseline")
-    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker count")
-    parser.add_argument("--device", type=str, help="Torch device to use, e.g. cuda, cuda:0, cpu")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--no-pretrained-vision", action="store_true", help="Disable pretrained ResNet18 weights")
+    parser.add_argument("--train-ratio", type=float, default=0.8, help="原始 session 划分训练集比例")
+    parser.add_argument("--val-ratio", type=float, default=0.1, help="原始 session 划分验证集比例")
+    parser.add_argument("--test-ratio", type=float, default=0.1, help="原始 session 划分测试集比例")
+    parser.add_argument("--min-episode-length", type=int, default=1, help="丢弃短于该长度的原始 episode")
+    parser.add_argument("--checkpoint-path", type=Path, help="用于恢复训练或仅评估的 checkpoint")
+    parser.add_argument("--eval-only", action="store_true", help="跳过训练，直接评估 checkpoint")
+    parser.add_argument("--save-predictions", action="store_true", help="保存 val/test 逐样本预测结果")
+    parser.add_argument("--compare-old-linear", action="store_true", help="同时报告当前手工线性基线结果")
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker 数量")
+    parser.add_argument("--device", type=str, help="Torch 设备，例如 cuda、cuda:0、cpu")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--no-pretrained-vision", action="store_true", help="禁用预训练 ResNet18 权重")
     return parser
 
 
@@ -104,13 +104,13 @@ def _parse_bool(value: Any) -> bool:
         return True
     if text in {"0", "false", "no", "n", "off"}:
         return False
-    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+    raise argparse.ArgumentTypeError(f"非法布尔值：{value}")
 
 
 def _require_torch() -> None:
     if torch is None or nn is None or DataLoader is None or models is None or transforms is None:
         raise ModuleNotFoundError(
-            "PyTorch baseline v2 requires torch and torchvision. Install them first, then rerun this script."
+            "PyTorch 基线 v2 依赖 torch 与 torchvision，请先安装后重试。"
         )
 
 
@@ -299,12 +299,12 @@ class Go2ManifestDataset(DatasetBase):
                 return source.convert("RGB")
         except (OSError, UnidentifiedImageError) as error:
             if self.image_error_mode == "raise":
-                raise RuntimeError(f"failed to load image for sample {sample_id}: {image_path}: {error}") from error
+                raise RuntimeError(f"加载样本图像失败：{sample_id}: {image_path}: {error}") from error
             self._image_error_count += 1
             if self._image_error_count <= 5:
                 print(
-                    f"warning: failed to load image for sample {sample_id}, "
-                    f"using blank fallback: {image_path} ({error})"
+                    f"warning: 加载样本图像失败：{sample_id}, "
+                    f"改用空白图像回退：{image_path} ({error})"
                 )
             return self._blank_image()
 
@@ -947,7 +947,7 @@ def main() -> None:
     _save_json(output_dir / "training_summary.json", training_summary)
 
     summary_lines = [
-        "Go2 VLA baseline v2 summary",
+        "Go2 VLA 基线 v2 汇总",
         f"ablation_mode={args.ablation_mode}",
         f"fusion_type={args.fusion_type}",
         f"modalities={modalities}",
@@ -955,7 +955,7 @@ def main() -> None:
         f"checkpoint_used={eval_checkpoint_path}",
         f"val_overall_rmse={val_metrics['overall_rmse']:.6f}",
         f"test_overall_rmse={test_metrics['overall_rmse']:.6f}",
-        f"mean_baseline_test_overall_rmse={mean_baseline['test']['overall_rmse']:.6f}",
+        f"均值基线 test 总体 RMSE={mean_baseline['test']['overall_rmse']:.6f}",
     ]
     (output_dir / "summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
@@ -963,9 +963,9 @@ def main() -> None:
         _save_jsonl(output_dir / "predictions_val.jsonl", val_dumps)
         _save_jsonl(output_dir / "predictions_test.jsonl", test_dumps)
 
-    print("val:", json.dumps(val_metrics, ensure_ascii=True, sort_keys=True))
-    print("test:", json.dumps(test_metrics, ensure_ascii=True, sort_keys=True))
-    print("mean-baseline test:", json.dumps(mean_baseline["test"], ensure_ascii=True, sort_keys=True))
+    print("验证集：", json.dumps(val_metrics, ensure_ascii=True, sort_keys=True))
+    print("测试集：", json.dumps(test_metrics, ensure_ascii=True, sort_keys=True))
+    print("mean-baseline 测试集：", json.dumps(mean_baseline["test"], ensure_ascii=True, sort_keys=True))
 
 
 if __name__ == "__main__":

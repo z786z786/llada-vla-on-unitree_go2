@@ -50,8 +50,6 @@ class EpisodeRecord:
     task_family: str
     target_type: str
     target_description: str
-    target_instance_id: str
-    task_tags: List[str]
     collector_notes: str
     scene_id: str
     operator_id: str
@@ -81,12 +79,12 @@ svg { width: 100%; height: auto; }
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Generate local HTML replay and sanity reports for Go2 sessions")
-    parser.add_argument("--data-root", type=Path, required=True, help="Dataset root or parent directory containing session roots")
-    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "sanity_check", help="Directory for HTML reports")
-    parser.add_argument("--num-samples", type=int, default=4, help="Number of random still frames to include per episode")
-    parser.add_argument("--max-episodes", type=int, help="Optional cap for smoke testing")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for preview sampling")
+    parser = argparse.ArgumentParser(description="为 Go2 采集 session 生成本地 HTML 回放与体检报告")
+    parser.add_argument("--data-root", type=Path, required=True, help="数据集根目录，或包含多个 session 根目录的父目录")
+    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "sanity_check", help="HTML 报告输出目录")
+    parser.add_argument("--num-samples", type=int, default=4, help="每条 episode 页面中展示的随机静态帧数量")
+    parser.add_argument("--max-episodes", type=int, help="可选的 episode 数量上限，用于冒烟测试")
+    parser.add_argument("--seed", type=int, default=0, help="预览采样随机种子")
     return parser
 
 
@@ -168,8 +166,6 @@ def load_episodes(data_root: Path, max_episodes: Optional[int]) -> List[EpisodeR
                 task_family=str(task_metadata.get("task_family") or ""),
                 target_type=str(task_metadata.get("target_type") or ""),
                 target_description=str(task_metadata.get("target_description") or ""),
-                target_instance_id=str(task_metadata.get("target_instance_id") or ""),
-                task_tags=list(task_metadata.get("task_tags") or []),
                 collector_notes=str(task_metadata.get("collector_notes") or ""),
                 scene_id=str(payload.get("scene_id") or episode_meta.get("scene_id") or ""),
                 operator_id=str(payload.get("operator_id") or episode_meta.get("operator_id") or ""),
@@ -226,7 +222,7 @@ def _plot_svg(episode: EpisodeRecord) -> str:
     lines = []
     for axis in ACTION_FIELDS:
         lines.append(
-            f'<polyline fill="none" stroke="{colors[axis]}" stroke-width="3" points="{_polyline(values[axis], width, height, -1.0, 1.0)}" />'
+            f'<polyline fill="无" stroke="{colors[axis]}" stroke-width="3" points="{_polyline(values[axis], width, height, -1.0, 1.0)}" />'
         )
     legend = " ".join(
         f'<text x="{20 + index * 140}" y="20" fill="{colors[axis]}" font-size="14">{axis}</text>'
@@ -286,8 +282,8 @@ def _episode_page(episode: EpisodeRecord, page_path: Path, index_path: Path, rng
         for frame in sample_frames
     )
     histogram_html = "".join(_histogram_svg([frame.control_action[axis] for frame in episode.frames], axis) for axis in ACTION_FIELDS)
-    warnings = "none" if not episode.warnings else ", ".join(episode.warnings)
-    info = "none" if not episode.info else ", ".join(episode.info)
+    warnings = "无" if not episode.warnings else ", ".join(episode.warnings)
+    info = "无" if not episode.info else ", ".join(episode.info)
     index_rel = os.path.relpath(index_path, page_path.parent)
 
     return f"""<!DOCTYPE html>
@@ -344,7 +340,7 @@ def _episode_page(episode: EpisodeRecord, page_path: Path, index_path: Path, rng
       }}
       const frame = frames[index];
       image.src = frame.image;
-      overlay.innerHTML = `Instruction: ${{frame.instruction}}<br />vx: ${{frame.vx.toFixed(3)}} vy: ${{frame.vy.toFixed(3)}} wz: ${{frame.wz.toFixed(3)}}<br />t: ${{frame.timestamp.toFixed(3)}}`;
+      overlay.innerHTML = `指令: ${{frame.instruction}}<br />vx: ${{frame.vx.toFixed(3)}} vy: ${{frame.vy.toFixed(3)}} wz: ${{frame.wz.toFixed(3)}}<br />t: ${{frame.timestamp.toFixed(3)}}`;
       slider.value = String(index);
     }}
 
@@ -396,8 +392,8 @@ def write_reports(episodes: Sequence[EpisodeRecord], output_dir: Path, data_root
             f"<td>{escape(episode.instruction)}</td><td>{escape(episode.capture_mode or '-')}</td><td>{escape(episode.task_family or '-')}</td><td>{escape(episode.target_description or episode.target_type or '-')}</td><td>{len(episode.frames)}</td>"
             f"<td>{episode.trajectory_metrics.get('duration_seconds', 0.0):.2f}</td><td>{int(episode.trajectory_metrics.get('action_change_count', 0))}</td><td>{episode.trajectory_metrics.get('stop_ratio', 0.0):.1%}</td><td>{episode.trajectory_metrics.get('turn_ratio', 0.0):.1%}</td>"
             f"<td>{escape(episode.scene_id or '-')}</td><td>{escape(episode.operator_id or '-')}</td>"
-            f"<td>{escape(', '.join(episode.warnings) or 'none')}</td>"
-            f"<td>{escape(', '.join(episode.info) or 'none')}</td></tr>"
+            f"<td>{escape(', '.join(episode.warnings) or '无')}</td>"
+            f"<td>{escape(', '.join(episode.info) or '无')}</td></tr>"
         )
 
     instruction_episode_counts: Dict[str, int] = {}
@@ -558,14 +554,14 @@ def write_reports(episodes: Sequence[EpisodeRecord], output_dir: Path, data_root
 <html lang=\"en\">
 <head>
   <meta charset=\"utf-8\" />
-  <title>Go2 dataset sanity report</title>
+  <title>Go2 数据集体检报告</title>
   <style>{CSS}</style>
 </head>
 <body>
   <div class=\"card\">
-    <h1>Go2 dataset sanity report</h1>
+    <h1>Go2 数据集体检报告</h1>
     <p class=\"meta\">episodes={summary['episode_count']} frames={summary['frame_count']} warning_episodes={summary['warning_episode_count']} info_episodes={summary['info_episode_count']}</p>
-    <p>Instructions: <code>{escape(', '.join(summary['instructions']) or 'none')}</code></p>
+    <p>指令s: <code>{escape(', '.join(summary['instructions']) or '无')}</code></p>
   </div>
   <div class=\"grid\">
     <div class=\"card\">
@@ -578,108 +574,108 @@ def write_reports(episodes: Sequence[EpisodeRecord], output_dir: Path, data_root
           <tr><th>Zero-action frames</th><td>{summary['zero_action_frame_count']}</td></tr>
           <tr><th>Zero-action ratio</th><td>{summary['zero_action_frame_ratio']:.1%}</td></tr>
           <tr><th>Episode length min / median / max</th><td>{summary['episode_length_min']} / {summary['episode_length_median']} / {summary['episode_length_max']}</td></tr>
-          <tr><th>Avg duration (s)</th><td>{summary['trajectory_metrics']['duration_seconds']['mean']:.2f}</td></tr>
-          <tr><th>Avg action changes</th><td>{summary['trajectory_metrics']['action_change_count']['mean']:.2f}</td></tr>
-          <tr><th>Avg stop ratio</th><td>{summary['trajectory_metrics']['stop_ratio']['mean']:.1%}</td></tr>
-          <tr><th>Avg turn ratio</th><td>{summary['trajectory_metrics']['turn_ratio']['mean']:.1%}</td></tr>
+          <tr><th>平均时长（秒）</th><td>{summary['trajectory_metrics']['duration_seconds']['mean']:.2f}</td></tr>
+          <tr><th>平均动作切换次数</th><td>{summary['trajectory_metrics']['action_change_count']['mean']:.2f}</td></tr>
+          <tr><th>平均停止占比</th><td>{summary['trajectory_metrics']['stop_ratio']['mean']:.1%}</td></tr>
+          <tr><th>平均转向占比</th><td>{summary['trajectory_metrics']['turn_ratio']['mean']:.1%}</td></tr>
         </tbody>
       </table>
     </div>
     <div class=\"card\">
-      <h2>Session Coverage</h2>
+      <h2>Session 覆盖情况</h2>
       <table>
-        <thead><tr><th>Session</th><th>Episodes</th></tr></thead>
-        <tbody>{session_rows or '<tr><td colspan="2">No session metadata available.</td></tr>'}</tbody>
+        <thead><tr><th>Session</th><th>Episode 数</th></tr></thead>
+        <tbody>{session_rows or '<tr><td colspan="2">没有可用的 session 元数据。</td></tr>'}</tbody>
       </table>
     </div>
   </div>
   <div class=\"card\">
-    <h2>Instruction Statistics</h2>
+    <h2>指令统计</h2>
     <table>
-      <thead><tr><th>Instruction</th><th>Episodes</th><th>Episode Share</th><th>Frames</th><th>Frame Share</th></tr></thead>
-      <tbody>{''.join(instruction_rows) or '<tr><td colspan="5">No instruction statistics available.</td></tr>'}</tbody>
+      <thead><tr><th>指令</th><th>Episode 数</th><th>Episode 占比</th><th>帧数</th><th>帧占比</th></tr></thead>
+      <tbody>{''.join(instruction_rows) or '<tr><td colspan="5">没有可用的指令统计。</td></tr>'}</tbody>
     </table>
   </div>
   <div class=\"grid\">
     <div class=\"card\">
-      <h2>Scene Coverage</h2>
+      <h2>场景覆盖情况</h2>
       <table>
-        <thead><tr><th>Scene</th><th>Episodes</th></tr></thead>
-        <tbody>{scene_rows or '<tr><td colspan="2">No scene metadata available.</td></tr>'}</tbody>
+        <thead><tr><th>场景</th><th>Episode 数</th></tr></thead>
+        <tbody>{scene_rows or '<tr><td colspan="2">没有可用的场景元数据。</td></tr>'}</tbody>
       </table>
     </div>
     <div class=\"card\">
-      <h2>Operator Coverage</h2>
+      <h2>操作员覆盖情况</h2>
       <table>
-        <thead><tr><th>Operator</th><th>Episodes</th></tr></thead>
-        <tbody>{operator_rows or '<tr><td colspan="2">No operator metadata available.</td></tr>'}</tbody>
+        <thead><tr><th>操作员</th><th>Episode 数</th></tr></thead>
+        <tbody>{operator_rows or '<tr><td colspan="2">没有可用的操作员元数据。</td></tr>'}</tbody>
       </table>
     </div>
     <div class=\"card\">
-      <h2>Capture Modes</h2>
+      <h2>采集模式统计</h2>
       <table>
-        <thead><tr><th>Capture Mode</th><th>Episodes</th></tr></thead>
-        <tbody>{capture_mode_rows or '<tr><td colspan="2">No capture mode metadata available.</td></tr>'}</tbody>
+        <thead><tr><th>采集模式</th><th>Episode 数</th></tr></thead>
+        <tbody>{capture_mode_rows or '<tr><td colspan="2">没有可用的采集模式元数据。</td></tr>'}</tbody>
       </table>
     </div>
     <div class=\"card\">
-      <h2>Task Families</h2>
+      <h2>任务族统计</h2>
       <table>
-        <thead><tr><th>Task Family</th><th>Episodes</th></tr></thead>
-        <tbody>{task_family_rows or '<tr><td colspan="2">No task family metadata available.</td></tr>'}</tbody>
+        <thead><tr><th>任务族</th><th>Episode 数</th></tr></thead>
+        <tbody>{task_family_rows or '<tr><td colspan="2">没有可用的任务族元数据。</td></tr>'}</tbody>
       </table>
     </div>
     <div class=\"card\">
-      <h2>Target Types</h2>
+      <h2>目标类型统计</h2>
       <table>
-        <thead><tr><th>Target Type</th><th>Episodes</th></tr></thead>
-        <tbody>{target_type_rows or '<tr><td colspan="2">No target metadata available.</td></tr>'}</tbody>
+        <thead><tr><th>目标类型</th><th>Episode 数</th></tr></thead>
+        <tbody>{target_type_rows or '<tr><td colspan="2">没有可用的目标元数据。</td></tr>'}</tbody>
       </table>
     </div>
   </div>
   <div class=\"grid\">
     <div class=\"card\">
-      <h2>Trajectory Metrics</h2>
+      <h2>轨迹统计指标</h2>
       <table>
-        <thead><tr><th>Metric</th><th>Mean</th><th>Median</th><th>Min</th><th>Max</th></tr></thead>
+        <thead><tr><th>指标</th><th>均值</th><th>中位数</th><th>最小值</th><th>最大值</th></tr></thead>
         <tbody>
-          <tr><td>Duration (s)</td><td>{summary['trajectory_metrics']['duration_seconds']['mean']:.2f}</td><td>{summary['trajectory_metrics']['duration_seconds']['median']:.2f}</td><td>{summary['trajectory_metrics']['duration_seconds']['min']:.2f}</td><td>{summary['trajectory_metrics']['duration_seconds']['max']:.2f}</td></tr>
-          <tr><td>Action changes</td><td>{summary['trajectory_metrics']['action_change_count']['mean']:.2f}</td><td>{summary['trajectory_metrics']['action_change_count']['median']:.2f}</td><td>{summary['trajectory_metrics']['action_change_count']['min']:.0f}</td><td>{summary['trajectory_metrics']['action_change_count']['max']:.0f}</td></tr>
-          <tr><td>Stop ratio</td><td>{summary['trajectory_metrics']['stop_ratio']['mean']:.1%}</td><td>{summary['trajectory_metrics']['stop_ratio']['median']:.1%}</td><td>{summary['trajectory_metrics']['stop_ratio']['min']:.1%}</td><td>{summary['trajectory_metrics']['stop_ratio']['max']:.1%}</td></tr>
-          <tr><td>Turn ratio</td><td>{summary['trajectory_metrics']['turn_ratio']['mean']:.1%}</td><td>{summary['trajectory_metrics']['turn_ratio']['median']:.1%}</td><td>{summary['trajectory_metrics']['turn_ratio']['min']:.1%}</td><td>{summary['trajectory_metrics']['turn_ratio']['max']:.1%}</td></tr>
+          <tr><td>时长（秒）</td><td>{summary['trajectory_metrics']['duration_seconds']['mean']:.2f}</td><td>{summary['trajectory_metrics']['duration_seconds']['median']:.2f}</td><td>{summary['trajectory_metrics']['duration_seconds']['min']:.2f}</td><td>{summary['trajectory_metrics']['duration_seconds']['max']:.2f}</td></tr>
+          <tr><td>动作切换次数</td><td>{summary['trajectory_metrics']['action_change_count']['mean']:.2f}</td><td>{summary['trajectory_metrics']['action_change_count']['median']:.2f}</td><td>{summary['trajectory_metrics']['action_change_count']['min']:.0f}</td><td>{summary['trajectory_metrics']['action_change_count']['max']:.0f}</td></tr>
+          <tr><td>停止占比</td><td>{summary['trajectory_metrics']['stop_ratio']['mean']:.1%}</td><td>{summary['trajectory_metrics']['stop_ratio']['median']:.1%}</td><td>{summary['trajectory_metrics']['stop_ratio']['min']:.1%}</td><td>{summary['trajectory_metrics']['stop_ratio']['max']:.1%}</td></tr>
+          <tr><td>转向占比</td><td>{summary['trajectory_metrics']['turn_ratio']['mean']:.1%}</td><td>{summary['trajectory_metrics']['turn_ratio']['median']:.1%}</td><td>{summary['trajectory_metrics']['turn_ratio']['min']:.1%}</td><td>{summary['trajectory_metrics']['turn_ratio']['max']:.1%}</td></tr>
         </tbody>
       </table>
     </div>
     <div class=\"card\">
-      <h2>Trajectory-Mode Only</h2>
+      <h2>仅 trajectory 模式</h2>
       <table>
         <tbody>
-          <tr><th>Trajectory episodes</th><td>{summary['trajectory_episode_summary']['episode_count']}</td></tr>
-          <tr><th>Avg duration (s)</th><td>{summary['trajectory_episode_summary']['duration_seconds']['mean']:.2f}</td></tr>
-          <tr><th>Avg action changes</th><td>{summary['trajectory_episode_summary']['action_change_count']['mean']:.2f}</td></tr>
-          <tr><th>Avg stop ratio</th><td>{summary['trajectory_episode_summary']['stop_ratio']['mean']:.1%}</td></tr>
-          <tr><th>Avg turn ratio</th><td>{summary['trajectory_episode_summary']['turn_ratio']['mean']:.1%}</td></tr>
+          <tr><th>trajectory episode 数</th><td>{summary['trajectory_episode_summary']['episode_count']}</td></tr>
+          <tr><th>平均时长（秒）</th><td>{summary['trajectory_episode_summary']['duration_seconds']['mean']:.2f}</td></tr>
+          <tr><th>平均动作切换次数</th><td>{summary['trajectory_episode_summary']['action_change_count']['mean']:.2f}</td></tr>
+          <tr><th>平均停止占比</th><td>{summary['trajectory_episode_summary']['stop_ratio']['mean']:.1%}</td></tr>
+          <tr><th>平均转向占比</th><td>{summary['trajectory_episode_summary']['turn_ratio']['mean']:.1%}</td></tr>
         </tbody>
       </table>
     </div>
     <div class=\"card\">
-      <h2>Instructions Across Scenes</h2>
+      <h2>跨场景重复指令</h2>
       <table>
-        <thead><tr><th>Instruction</th><th>Scenes</th></tr></thead>
-        <tbody>{multi_scene_rows or '<tr><td colspan="2">No repeated instruction spans multiple scenes yet.</td></tr>'}</tbody>
+        <thead><tr><th>指令</th><th>场景s</th></tr></thead>
+        <tbody>{multi_scene_rows or '<tr><td colspan="2">当前还没有跨多个场景重复出现的指令。</td></tr>'}</tbody>
       </table>
     </div>
     <div class=\"card\">
-      <h2>Instructions Across Targets</h2>
+      <h2>跨目标重复指令</h2>
       <table>
-        <thead><tr><th>Instruction</th><th>Targets</th></tr></thead>
-        <tbody>{multi_target_rows or '<tr><td colspan="2">No repeated instruction spans multiple targets yet.</td></tr>'}</tbody>
+        <thead><tr><th>指令</th><th>目标s</th></tr></thead>
+        <tbody>{multi_target_rows or '<tr><td colspan="2">当前还没有跨多个目标重复出现的指令。</td></tr>'}</tbody>
       </table>
     </div>
   </div>
   <div class=\"card\">
     <table>
-      <thead><tr><th>Episode</th><th>Instruction</th><th>Capture Mode</th><th>Task Family</th><th>Target</th><th>Frames</th><th>Duration(s)</th><th>Action Changes</th><th>Stop Ratio</th><th>Turn Ratio</th><th>Scene</th><th>Operator</th><th>Warnings</th><th>Info</th></tr></thead>
+      <thead><tr><th>Episode</th><th>指令</th><th>采集模式</th><th>任务族</th><th>目标</th><th>帧数</th><th>Duration(s)</th><th>Action Changes</th><th>Stop Ratio</th><th>Turn Ratio</th><th>场景</th><th>操作员</th><th>警告</th><th>信息</th></tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table>
   </div>
@@ -694,7 +690,7 @@ def main() -> None:
     data_root = args.data_root.resolve()
     episodes = load_episodes(data_root, args.max_episodes)
     write_reports(episodes, args.output_dir.resolve(), data_root, args.seed, args.num_samples)
-    print(f"wrote sanity report for {len(episodes)} episodes to {args.output_dir.resolve()}")
+    print(f"已为 {len(episodes)} 条 episode 生成体检报告，输出目录：{args.output_dir.resolve()}")
 
 
 if __name__ == "__main__":

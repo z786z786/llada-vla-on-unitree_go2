@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 struct SegmentLabelInput
 {
@@ -35,9 +36,12 @@ struct UiStatusSnapshot
     bool running = false;
     bool webUiEnabled = false;
     int webPort = 0;
+    bool startupGateActive = false;
+    std::string startupPrompt;
     std::string sessionDir;
     std::string captureMode;
     std::string captureState;
+    std::string stopPhase;
     std::string safetyState;
     std::string faultReason;
     bool recording = false;
@@ -61,8 +65,6 @@ struct UiStatusSnapshot
     std::string taskFamily;
     std::string targetType;
     std::string targetDescription;
-    std::string targetInstanceId;
-    std::string taskTagsCsv;
     std::string collectorNotes;
     double cmdVxMax = 0.0;
     double cmdVyMax = 0.0;
@@ -89,8 +91,6 @@ struct UiConfigUpdateInput
     std::string taskFamily;
     std::string targetType;
     std::string targetDescription;
-    std::string targetInstanceId;
-    std::string taskTagsCsv;
     std::string collectorNotes;
     double cmdVxMax = 0.0;
     double cmdVyMax = 0.0;
@@ -102,14 +102,17 @@ struct WebUiServerConfig
     int port = 8080;
     std::string assetDir;
     std::function<UiStatusSnapshot()> statusProvider;
+    std::function<UiActionResult()> acknowledgeStartupHandler;
     std::function<UiActionResult()> startHandler;
     std::function<UiActionResult()> stopHandler;
     std::function<UiActionResult()> discardHandler;
     std::function<UiActionResult()> estopHandler;
     std::function<UiActionResult()> clearFaultHandler;
+    std::function<UiActionResult()> quitHandler;
     std::function<UiActionResult(const SegmentLabelInput&)> submitLabelHandler;
     std::function<UiActionResult(const UiConfigUpdateInput&)> updateConfigHandler;
-    std::function<UiActionResult()> saveDefaultsHandler;
+    std::function<UiActionResult(const UiConfigUpdateInput&)> saveDefaultsHandler;
+    std::function<std::vector<uint8_t>()> latestImageJpegProvider;
 };
 
 class WebUiServer

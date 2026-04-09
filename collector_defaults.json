@@ -1,0 +1,13 @@
+{
+  "scene_id": "earth",
+  "operator_id": "wxh",
+  "instruction": "go to the door",
+  "capture_mode": "trajectory",
+  "task_family": "goal_navigation",
+  "target_type": "door",
+  "target_description": "gray and iron door on the left",
+  "collector_notes": "",
+  "cmd_vx_max": 0.75,
+  "cmd_vy_max": 0.5,
+  "cmd_wz_max": 0.75
+}

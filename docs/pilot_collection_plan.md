@@ -1,27 +1,27 @@
-# Pilot Collection Plan
+# 首轮采集计划
 
-This note is now aligned with the keyboard-only Go2 collection loop.
+这份说明与当前的键盘 Go2 采集闭环保持一致。
 
-## Goal
+## 目标
 
-Collect enough short, clean episodes to answer three questions:
+先收集足够多、足够干净的短片段，回答三个问题：
 
-- does the camera stream line up with the operator intent?
-- do `vx`, `vy`, `wz` describe the behavior we care about?
-- is the dataset learnable with the current baseline interface?
+- 相机流是否和操作员意图对齐
+- `vx`、`vy`、`wz` 是否能表达我们关心的行为
+- 以当前基线接口来看，这批数据是否可学
 
-## Required Metadata Per Session
+## 每个 Session 必填元数据
 
-Before recording, set at startup:
+开始采集前，在启动命令里设置：
 
 - `scene_id`
 - `operator_id`
 
-Each episode gets its `instruction` only after the segment ends.
+每条 episode 的 `instruction` 在片段结束后确定。
 
-## Instruction Set
+## 指令集合
 
-Use only the controlled set:
+只使用受控集合：
 
 - `go forward`
 - `move backward`
@@ -33,34 +33,33 @@ Use only the controlled set:
 - `turn right`
 - `stay still`
 
-## Collection Flow
+## 采集流程
 
-1. start `go2_collector`
-2. use keyboard teleop to position the robot
-3. press `R` to start a capture segment
-4. execute exactly one intended behavior
-5. press `T` to end the segment
-6. choose the instruction number and press Enter
-7. if the segment is bad, press `ESC` during labeling to discard it
+1. 启动 `go2_collector`
+2. 用键盘遥操作把机器人移动到起始位姿
+3. 按 `R` 启动一个采集段
+4. 执行一个明确、单一的目标动作
+5. 结束该段并保存有效数据
+6. 若片段质量差，立刻丢弃并重采
 
-Frames outside the explicit segment are not written to disk.
+显式采集段之外的帧不会写入磁盘。
 
-## Minimum Coverage Goal
+## 最低覆盖目标
 
-Aim for:
+建议至少覆盖：
 
-- multiple sessions
-- multiple scenes
-- all core motion instructions represented
-- both easy and slightly messy examples
+- 多个 session
+- 多个 scene
+- 所有核心动作指令
+- 既有干净样本，也有少量轻微扰动样本
 
-## Stop Conditions
+## 需要暂停采集并修复流水线的情况
 
-Pause collection and fix the pipeline if you see:
+若出现以下情况，应先停下来修系统：
 
-- missing images
-- wrong instruction labels
-- persistent flat action traces
-- obvious image lag or stale action timestamps
-- repeated safety faults during normal teleop
-- heavy bias toward a single instruction
+- 图像文件缺失
+- 指令标签错误
+- 动作曲线长期贴零
+- 明显图像延迟或时间戳陈旧
+- 正常遥操作时仍频繁触发 safety fault
+- 数据极端偏向单一 instruction

@@ -53,9 +53,26 @@ constexpr float kLinearDecelPerSecond = 4.5f;
 constexpr float kYawAccelPerSecond = 4.5f;
 constexpr float kYawDecelPerSecond = 6.0f;
 constexpr auto kCaptureStartDelay = std::chrono::milliseconds(500);
+constexpr auto kStartupGateReminderInterval = std::chrono::seconds(2);
+constexpr auto kTrajectoryFinalizeGracePeriod = std::chrono::milliseconds(400);
+constexpr auto kTrajectoryStopReleaseTimeout = std::chrono::milliseconds(1200);
 constexpr char kEscapeKey = 27;
 constexpr char kBackspace = 127;
 constexpr char kCtrlH = 8;
+constexpr char kStartupAcknowledgeKey = 'o';
+
+struct TrajectoryMotionGateConfig
+{
+    float vxStartThreshold = 0.04f;
+    float vyStartThreshold = 0.04f;
+    float wzStartThreshold = 0.10f;
+    float vxStopThreshold = 0.02f;
+    float vyStopThreshold = 0.02f;
+    float wzStopThreshold = 0.06f;
+    size_t startConsecutiveFrames = 4;
+    size_t stopConsecutiveFrames = 6;
+    size_t preRollFrames = 4;
+};
 
 const std::vector<std::string> kAllowedInstructions = {
     "go forward",
@@ -97,9 +114,7 @@ struct Config
     std::string taskFamily;
     std::string targetType;
     std::string targetDescription;
-    std::string targetInstanceId;
     std::string collectorNotes;
-    std::vector<std::string> taskTags;
     double cmdVxMax = kDefaultCmdVxMax;
     double cmdVyMax = kDefaultCmdVyMax;
     double cmdWzMax = kDefaultCmdWzMax;
@@ -116,9 +131,7 @@ struct EditableCollectorConfig
     std::string taskFamily;
     std::string targetType;
     std::string targetDescription;
-    std::string targetInstanceId;
     std::string collectorNotes;
-    std::vector<std::string> taskTags;
     double cmdVxMax = kDefaultCmdVxMax;
     double cmdVyMax = kDefaultCmdVyMax;
     double cmdWzMax = kDefaultCmdWzMax;
@@ -133,8 +146,6 @@ struct TaskMetadata
     std::string taskFamily;
     std::string targetType;
     std::string targetDescription;
-    std::string targetInstanceId;
-    std::vector<std::string> taskTags;
     std::string collectorNotes;
     std::string instructionSource;
     std::string segmentStatus;
@@ -200,6 +211,7 @@ struct EpisodeFrame
     float controlActionVx = 0.0f;
     float controlActionVy = 0.0f;
     float controlActionWz = 0.0f;
+    bool motionInputActive = false;
     std::vector<uint8_t> jpegBytes;
 };
 
@@ -211,8 +223,6 @@ struct EpisodeSummary
     std::string taskFamily;
     std::string targetType;
     std::string targetDescription;
-    std::string targetInstanceId;
-    std::vector<std::string> taskTags;
     std::string collectorNotes;
     std::string instructionSource;
     std::string segmentStatus;
@@ -466,13 +476,33 @@ std::string FormatTimestampForPath(double timestampSeconds, const char* format)
 
 fs::path CollectorRootFromArgv0(const char* argv0)
 {
-    const fs::path executablePath = fs::absolute(argv0);
+    std::error_code error;
+    fs::path executablePath = fs::read_symlink("/proc/self/exe", error);
+    if (error || executablePath.empty())
+    {
+        error.clear();
+        executablePath = fs::weakly_canonical(fs::absolute(argv0), error);
+        if (error || executablePath.empty())
+        {
+            executablePath = fs::absolute(argv0);
+        }
+    }
     return executablePath.parent_path().parent_path().parent_path();
 }
 
 fs::path CollectorDefaultsPath(const fs::path& collectorRoot)
 {
+    return collectorRoot / "collector_defaults.json";
+}
+
+fs::path LegacyCollectorDefaultsPath(const fs::path& collectorRoot)
+{
     return collectorRoot / "collector_webui_defaults.json";
+}
+
+std::string StartupPromptText()
+{
+    return "collector 已完成初始化；请先在 WebUI 点击 Apply For Next Segment，或按 O 使用当前配置解锁移动与录制";
 }
 
 std::string SafetyStateName(SafetyState state)
@@ -505,6 +535,23 @@ std::string CaptureStateName(CaptureState state)
         return "fault";
     }
     return "unknown";
+}
+
+std::string TrajectoryStopPhaseName(bool pendingLabel, bool stopRequested, bool waitingForRelease)
+{
+    if (pendingLabel)
+    {
+        return "label_ready";
+    }
+    if (!stopRequested)
+    {
+        return "idle";
+    }
+    if (waitingForRelease)
+    {
+        return "waiting_release";
+    }
+    return "finalizing";
 }
 
 std::string MotionInstructionName(MotionInstruction motion)
@@ -773,14 +820,6 @@ void ApplyDefaultsFile(const fs::path& defaultsPath, Config& config)
     {
         config.targetDescription = value.value();
     }
-    if (const auto value = ExtractJsonStringFieldLocal(body, "target_instance_id"); value.has_value())
-    {
-        config.targetInstanceId = value.value();
-    }
-    if (const auto value = ExtractJsonStringFieldLocal(body, "task_tags_csv"); value.has_value())
-    {
-        config.taskTags = SplitCsvList(value.value());
-    }
     if (const auto value = ExtractJsonStringFieldLocal(body, "collector_notes"); value.has_value())
     {
         config.collectorNotes = value.value();
@@ -799,29 +838,79 @@ void ApplyDefaultsFile(const fs::path& defaultsPath, Config& config)
     }
 }
 
+void ApplyCollectorDefaults(const fs::path& collectorRoot, Config& config)
+{
+    const fs::path defaultsPath = CollectorDefaultsPath(collectorRoot);
+    if (fs::exists(defaultsPath))
+    {
+        ApplyDefaultsFile(defaultsPath, config);
+        return;
+    }
+    const fs::path legacyDefaultsPath = LegacyCollectorDefaultsPath(collectorRoot);
+    if (fs::exists(legacyDefaultsPath))
+    {
+        ApplyDefaultsFile(legacyDefaultsPath, config);
+    }
+}
+
 void SaveDefaultsFile(const fs::path& defaultsPath, const EditableCollectorConfig& config)
 {
-    std::ofstream output(defaultsPath, std::ios::out | std::ios::trunc);
-    if (!output.is_open())
+    const fs::path parentDir = defaultsPath.parent_path();
+    std::error_code error;
+    if (!parentDir.empty())
     {
-        throw std::runtime_error("写入 collector 默认配置失败");
+        fs::create_directories(parentDir, error);
+        if (error)
+        {
+            throw std::runtime_error("创建 collector 默认配置目录失败: " + error.message());
+        }
     }
 
-    output << "{\n"
-           << "  \"scene_id\": " << JsonString(config.sceneId) << ",\n"
-           << "  \"operator_id\": " << JsonString(config.operatorId) << ",\n"
-           << "  \"instruction\": " << JsonString(config.instruction) << ",\n"
-           << "  \"capture_mode\": " << JsonString(CaptureModeName(config.captureMode)) << ",\n"
-           << "  \"task_family\": " << JsonString(config.taskFamily) << ",\n"
-           << "  \"target_type\": " << JsonString(config.targetType) << ",\n"
-           << "  \"target_description\": " << JsonString(config.targetDescription) << ",\n"
-           << "  \"target_instance_id\": " << JsonString(config.targetInstanceId) << ",\n"
-           << "  \"task_tags_csv\": " << JsonString(JoinCsvList(config.taskTags)) << ",\n"
-           << "  \"collector_notes\": " << JsonString(config.collectorNotes) << ",\n"
-           << "  \"cmd_vx_max\": " << config.cmdVxMax << ",\n"
-           << "  \"cmd_vy_max\": " << config.cmdVyMax << ",\n"
-           << "  \"cmd_wz_max\": " << config.cmdWzMax << "\n"
-           << "}\n";
+    const fs::path tempPath = defaultsPath.string() + ".tmp";
+    try
+    {
+        std::ofstream output(tempPath, std::ios::out | std::ios::trunc);
+        if (!output.is_open())
+        {
+            throw std::runtime_error("写入 collector 默认配置失败: 无法打开临时文件");
+        }
+
+        output << "{\n"
+               << "  \"scene_id\": " << JsonString(config.sceneId) << ",\n"
+               << "  \"operator_id\": " << JsonString(config.operatorId) << ",\n"
+               << "  \"instruction\": " << JsonString(config.instruction) << ",\n"
+               << "  \"capture_mode\": " << JsonString(CaptureModeName(config.captureMode)) << ",\n"
+               << "  \"task_family\": " << JsonString(config.taskFamily) << ",\n"
+               << "  \"target_type\": " << JsonString(config.targetType) << ",\n"
+               << "  \"target_description\": " << JsonString(config.targetDescription) << ",\n"
+               << "  \"collector_notes\": " << JsonString(config.collectorNotes) << ",\n"
+               << "  \"cmd_vx_max\": " << config.cmdVxMax << ",\n"
+               << "  \"cmd_vy_max\": " << config.cmdVyMax << ",\n"
+               << "  \"cmd_wz_max\": " << config.cmdWzMax << "\n"
+               << "}\n";
+        output.flush();
+        if (!output.good())
+        {
+            throw std::runtime_error("写入 collector 默认配置失败: 写入未完成");
+        }
+        output.close();
+        if (!output.good())
+        {
+            throw std::runtime_error("写入 collector 默认配置失败: 关闭文件时出错");
+        }
+
+        fs::rename(tempPath, defaultsPath, error);
+        if (error)
+        {
+            throw std::runtime_error("替换 collector 默认配置失败: " + error.message());
+        }
+    }
+    catch (...)
+    {
+        std::error_code removeError;
+        fs::remove(tempPath, removeError);
+        throw;
+    }
 }
 
 std::optional<Config::InputBackend> ParseInputBackend(const std::string& value)
@@ -940,6 +1029,16 @@ EffectiveControlAction ResolveControlAction(const VelocityCommand& rawAction, do
     return resolved;
 }
 
+TrajectoryMotionGateConfig BuildTrajectoryMotionGateConfig(double sampleHz)
+{
+    const double safeHz = std::max(sampleHz, 1.0);
+    TrajectoryMotionGateConfig config;
+    config.startConsecutiveFrames = std::max<size_t>(3, static_cast<size_t>(std::lround(0.35 * safeHz)));
+    config.stopConsecutiveFrames = std::max<size_t>(5, static_cast<size_t>(std::lround(0.60 * safeHz)));
+    config.preRollFrames = std::max<size_t>(3, static_cast<size_t>(std::lround(0.40 * safeHz)));
+    return config;
+}
+
 void PrintUsage(const char* program)
 {
     std::cout
@@ -957,8 +1056,6 @@ void PrintUsage(const char* program)
         << "  --task-family TEXT       Optional task family, e.g. goal_navigation / visual_following / obstacle_aware_navigation\n"
         << "  --target-type TEXT       Optional target type, e.g. door / person / obstacle\n"
         << "  --target-description TEXT  Optional free-text target description, e.g. red door on the left\n"
-        << "  --target-instance-id TEXT  Optional target instance identifier used by the operator during collection\n"
-        << "  --task-tags CSV          Optional comma-separated tags, e.g. occluded,left_turn,low_light\n"
         << "  --collector-notes TEXT   Optional free-text notes stored with each episode\n"
         << "  --cmd-vx-max FLOAT       Max forward/backward speed in m/s\n"
         << "  --cmd-vy-max FLOAT       Max strafe speed in m/s\n"
@@ -967,6 +1064,7 @@ void PrintUsage(const char* program)
         << "  --web-port INT           Local Web UI port (default: 8080)\n"
         << "  --help                   Show this help\n\n"
         << "Keyboard:\n"
+        << "  O    apply current config and unlock teleop/recording\n"
         << "  W/S  forward/backward\n"
         << "  A/D  strafe left/right\n"
         << "  Q/E  turn left/right\n"
@@ -983,7 +1081,7 @@ void PrintUsage(const char* program)
         << "  tty is a fallback mode 和 may feel less stable for combined keys\n"
         << "Capture modes:\n"
         << "  single_action arms on R, locks one motion key, waits 0.5s, records until key release, 然后进入标注\n"
-        << "  trajectory starts recording immediately on R, allows turning/strafe changes, 和 ends on T for labeling\n";
+        << "  trajectory arms on R, auto-detects effective motion before logging, 和 on T waits for motion settle before labeling\n";
 }
 
 std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
@@ -992,7 +1090,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
     const fs::path collectorRoot = CollectorRootFromArgv0(argv[0]);
     config.collectorRoot = collectorRoot;
     config.outputDir = collectorRoot / kDefaultDataDirName;
-    ApplyDefaultsFile(CollectorDefaultsPath(collectorRoot), config);
+    ApplyCollectorDefaults(collectorRoot, config);
 
     for (int index = 1; index < argc; ++index)
     {
@@ -1131,23 +1229,14 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
             }
             config.targetDescription = argv[++index];
         }
-        else if (arg == "--target-instance-id")
+        else if (arg == "--target-instance-id" || arg == "--task-tags")
         {
             if (index + 1 >= argc)
             {
-                error = "参数缺少取值：--target-instance-id";
+                error = "参数缺少取值：" + arg;
                 return std::nullopt;
             }
-            config.targetInstanceId = argv[++index];
-        }
-        else if (arg == "--task-tags")
-        {
-            if (index + 1 >= argc)
-            {
-                error = "参数缺少取值：--task-tags";
-                return std::nullopt;
-            }
-            config.taskTags = SplitCsvList(argv[++index]);
+            ++index;
         }
         else if (arg == "--collector-notes")
         {
@@ -1216,7 +1305,6 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
     config.taskFamily = Trim(config.taskFamily);
     config.targetType = Trim(config.targetType);
     config.targetDescription = Trim(config.targetDescription);
-    config.targetInstanceId = Trim(config.targetInstanceId);
     config.collectorNotes = Trim(config.collectorNotes);
 
     if (config.networkInterface.empty())
@@ -1395,7 +1483,11 @@ public:
         return status;
     }
 
-    void BeginSegment(const std::string& sceneId, const std::string& operatorId, const TaskMetadata& taskMetadata)
+    void BeginSegment(
+        const std::string& sceneId,
+        const std::string& operatorId,
+        const TaskMetadata& taskMetadata,
+        const std::optional<TrajectoryMotionGateConfig>& trajectoryGate = std::nullopt)
     {
         const std::string trimmedSceneId = Trim(sceneId);
         const std::string trimmedOperatorId = Trim(operatorId);
@@ -1414,6 +1506,13 @@ public:
         pendingOperatorId_ = trimmedOperatorId;
         pendingTaskMetadata_ = taskMetadata;
         pendingEpisodeId_.clear();
+        trajectoryGateConfig_ = trajectoryGate;
+        effectiveMotionStarted_ = false;
+        stopReady_ = false;
+        stopRequested_ = false;
+        startCandidateCount_ = 0;
+        stopCandidateCount_ = 0;
+        preRollFrames_.clear();
         capturing_ = true;
         pendingLabel_ = false;
     }
@@ -1426,7 +1525,8 @@ public:
         const LatestImage& image,
         double stateTimestamp,
         double rawActionTimestamp,
-        double imageTimestamp)
+        double imageTimestamp,
+        bool motionInputActive)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!capturing_)
@@ -1438,7 +1538,7 @@ public:
             return false;
         }
 
-        pendingFrames_.push_back(EpisodeFrame{
+        EpisodeFrame frame{
             timestamp,
             stateTimestamp,
             controlAction.timestamp,
@@ -1454,8 +1554,37 @@ public:
             controlAction.command.vx,
             controlAction.command.vy,
             controlAction.command.wz,
+            motionInputActive,
             image.jpegBytes,
-        });
+        };
+
+        if (!trajectoryGateConfig_.has_value())
+        {
+            pendingFrames_.push_back(std::move(frame));
+            return true;
+        }
+
+        PushPreRollFrameLocked(frame);
+        if (!effectiveMotionStarted_)
+        {
+            if (ShouldStartEffectiveMotionLocked(frame))
+            {
+                effectiveMotionStarted_ = true;
+                pendingFrames_.insert(pendingFrames_.end(), preRollFrames_.begin(), preRollFrames_.end());
+                preRollFrames_.clear();
+                return true;
+            }
+            return false;
+        }
+
+        pendingFrames_.push_back(std::move(frame));
+        if (stopRequested_)
+        {
+            if (ShouldStopEffectiveMotionLocked(pendingFrames_.back()))
+            {
+                stopReady_ = true;
+            }
+        }
         return true;
     }
 
@@ -1467,6 +1596,15 @@ public:
             return 0;
         }
         capturing_ = false;
+        stopRequested_ = false;
+        stopReady_ = false;
+        preRollFrames_.clear();
+        startCandidateCount_ = 0;
+        stopCandidateCount_ = 0;
+        if (trajectoryGateConfig_.has_value())
+        {
+            TrimLeadingTrailingLowMotionFramesLocked();
+        }
         pendingLabel_ = !pendingFrames_.empty();
         return pendingFrames_.size();
     }
@@ -1481,6 +1619,46 @@ public:
         pendingSceneId_.clear();
         pendingOperatorId_.clear();
         pendingTaskMetadata_ = TaskMetadata{};
+        trajectoryGateConfig_.reset();
+        effectiveMotionStarted_ = false;
+        stopReady_ = false;
+        stopRequested_ = false;
+        startCandidateCount_ = 0;
+        stopCandidateCount_ = 0;
+        preRollFrames_.clear();
+    }
+
+    void RequestTrajectoryStop()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (capturing_ && trajectoryGateConfig_.has_value())
+        {
+            stopRequested_ = true;
+            stopCandidateCount_ = 0;
+        }
+    }
+
+    bool IsTrajectoryStopRequested() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stopRequested_;
+    }
+
+    bool HasEffectiveMotion() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return effectiveMotionStarted_ && !pendingFrames_.empty();
+    }
+
+    bool ConsumeTrajectoryStopReady()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!stopReady_)
+        {
+            return false;
+        }
+        stopReady_ = false;
+        return true;
     }
 
     std::optional<std::string> FinalizePendingSegment(const std::string& fallbackInstruction, const TaskMetadata& labelMetadata)
@@ -1517,8 +1695,6 @@ public:
                     << "  \"task_family\": " << JsonString(resolvedTaskMetadata.taskFamily) << ",\n"
                     << "  \"target_type\": " << JsonString(resolvedTaskMetadata.targetType) << ",\n"
                     << "  \"target_description\": " << JsonString(resolvedTaskMetadata.targetDescription) << ",\n"
-                    << "  \"target_instance_id\": " << JsonString(resolvedTaskMetadata.targetInstanceId) << ",\n"
-                    << "  \"task_tags\": " << JsonStringArray(resolvedTaskMetadata.taskTags) << ",\n"
                     << "  \"collector_notes\": " << JsonString(resolvedTaskMetadata.collectorNotes) << ",\n"
                     << "  \"instruction_source\": " << JsonString(resolvedTaskMetadata.instructionSource) << ",\n"
                     << "  \"segment_status\": " << JsonString(segmentStatus) << ",\n"
@@ -1572,7 +1748,6 @@ public:
                         << "        \"task_family\": " << JsonString(resolvedTaskMetadata.taskFamily) << ",\n"
                         << "        \"target_type\": " << JsonString(resolvedTaskMetadata.targetType) << ",\n"
                         << "        \"target_description\": " << JsonString(resolvedTaskMetadata.targetDescription) << ",\n"
-                        << "        \"target_instance_id\": " << JsonString(resolvedTaskMetadata.targetInstanceId) << ",\n"
                         << "        \"instruction_source\": " << JsonString(resolvedTaskMetadata.instructionSource) << ",\n"
                         << "        \"segment_status\": " << JsonString(segmentStatus) << ",\n"
                         << "        \"success\": " << JsonString(success) << ",\n"
@@ -1610,8 +1785,6 @@ public:
         summary.taskFamily = resolvedTaskMetadata.taskFamily;
         summary.targetType = resolvedTaskMetadata.targetType;
         summary.targetDescription = resolvedTaskMetadata.targetDescription;
-        summary.targetInstanceId = resolvedTaskMetadata.targetInstanceId;
-        summary.taskTags = resolvedTaskMetadata.taskTags;
         summary.collectorNotes = resolvedTaskMetadata.collectorNotes;
         summary.instructionSource = resolvedTaskMetadata.instructionSource;
         summary.segmentStatus = segmentStatus;
@@ -1636,6 +1809,97 @@ public:
     }
 
 private:
+    bool IsCommandAboveStartThresholdLocked(const EpisodeFrame& frame) const
+    {
+        const auto& config = trajectoryGateConfig_.value();
+        return std::fabs(frame.rawActionVx) > config.vxStartThreshold ||
+               std::fabs(frame.rawActionVy) > config.vyStartThreshold ||
+               std::fabs(frame.rawActionWz) > config.wzStartThreshold;
+    }
+
+    bool IsCommandBelowStopThresholdLocked(const EpisodeFrame& frame) const
+    {
+        const auto& config = trajectoryGateConfig_.value();
+        return std::fabs(frame.rawActionVx) <= config.vxStopThreshold &&
+               std::fabs(frame.rawActionVy) <= config.vyStopThreshold &&
+               std::fabs(frame.rawActionWz) <= config.wzStopThreshold;
+    }
+
+    bool IsLowMotionFrameLocked(const EpisodeFrame& frame) const
+    {
+        return !frame.motionInputActive && IsCommandBelowStopThresholdLocked(frame);
+    }
+
+    bool ShouldStartEffectiveMotionLocked(const EpisodeFrame& frame)
+    {
+        if (frame.motionInputActive && IsCommandAboveStartThresholdLocked(frame))
+        {
+            ++startCandidateCount_;
+        }
+        else
+        {
+            startCandidateCount_ = 0;
+        }
+        return startCandidateCount_ >= trajectoryGateConfig_->startConsecutiveFrames;
+    }
+
+    bool ShouldStopEffectiveMotionLocked(const EpisodeFrame& frame)
+    {
+        if (!frame.motionInputActive && IsCommandBelowStopThresholdLocked(frame))
+        {
+            ++stopCandidateCount_;
+        }
+        else
+        {
+            stopCandidateCount_ = 0;
+        }
+        return stopCandidateCount_ >= trajectoryGateConfig_->stopConsecutiveFrames;
+    }
+
+    void PushPreRollFrameLocked(const EpisodeFrame& frame)
+    {
+        preRollFrames_.push_back(frame);
+        const size_t maxFrames = std::max<size_t>(1, trajectoryGateConfig_->preRollFrames);
+        if (preRollFrames_.size() > maxFrames)
+        {
+            preRollFrames_.erase(preRollFrames_.begin());
+        }
+    }
+
+    void TrimLeadingTrailingLowMotionFramesLocked()
+    {
+        if (!trajectoryGateConfig_.has_value() || pendingFrames_.empty())
+        {
+            return;
+        }
+
+        size_t startIndex = 0;
+        while (startIndex < pendingFrames_.size() && IsLowMotionFrameLocked(pendingFrames_[startIndex]))
+        {
+            ++startIndex;
+        }
+
+        size_t endIndex = pendingFrames_.size();
+        while (endIndex > startIndex && IsLowMotionFrameLocked(pendingFrames_[endIndex - 1]))
+        {
+            --endIndex;
+        }
+
+        if (startIndex == 0 && endIndex == pendingFrames_.size())
+        {
+            return;
+        }
+
+        if (startIndex >= endIndex)
+        {
+            pendingFrames_.clear();
+            return;
+        }
+
+        pendingFrames_ = std::vector<EpisodeFrame>(pendingFrames_.begin() + static_cast<std::ptrdiff_t>(startIndex),
+                                                   pendingFrames_.begin() + static_cast<std::ptrdiff_t>(endIndex));
+    }
+
     void RewriteIndexLocked() const
     {
         std::vector<EpisodeSummary> summaries;
@@ -1673,8 +1937,6 @@ private:
                       << "      \"task_family\": " << JsonString(summary.taskFamily) << ",\n"
                       << "      \"target_type\": " << JsonString(summary.targetType) << ",\n"
                       << "      \"target_description\": " << JsonString(summary.targetDescription) << ",\n"
-                      << "      \"target_instance_id\": " << JsonString(summary.targetInstanceId) << ",\n"
-                      << "      \"task_tags\": " << JsonStringArray(summary.taskTags) << ",\n"
                       << "      \"collector_notes\": " << JsonString(summary.collectorNotes) << ",\n"
                       << "      \"instruction_source\": " << JsonString(summary.instructionSource) << ",\n"
                       << "      \"segment_status\": " << JsonString(summary.segmentStatus) << ",\n"
@@ -1703,10 +1965,17 @@ private:
     fs::path indexPath_;
     mutable std::mutex mutex_;
     std::vector<EpisodeFrame> pendingFrames_;
+    std::vector<EpisodeFrame> preRollFrames_;
     std::map<std::string, EpisodeSummary> episodeHistory_;
     int nextEpisodeIndex_ = 1;
     bool capturing_ = false;
     bool pendingLabel_ = false;
+    bool effectiveMotionStarted_ = false;
+    bool stopReady_ = false;
+    bool stopRequested_ = false;
+    size_t startCandidateCount_ = 0;
+    size_t stopCandidateCount_ = 0;
+    std::optional<TrajectoryMotionGateConfig> trajectoryGateConfig_;
     std::string pendingSceneId_;
     std::string pendingOperatorId_;
     TaskMetadata pendingTaskMetadata_;
@@ -1718,7 +1987,9 @@ class CollectorApp
 {
 public:
     explicit CollectorApp(const Config& config)
-        : config_(config), logger_(config.outputDir)
+        : config_(config),
+          logger_(config.outputDir),
+          trajectoryGateConfig_(BuildTrajectoryMotionGateConfig(config.videoPollHz))
     {
         editableConfig_.captureMode = config.captureMode;
         editableConfig_.sceneId = config.sceneId;
@@ -1727,9 +1998,7 @@ public:
         editableConfig_.taskFamily = config.taskFamily;
         editableConfig_.targetType = config.targetType;
         editableConfig_.targetDescription = config.targetDescription;
-        editableConfig_.targetInstanceId = config.targetInstanceId;
         editableConfig_.collectorNotes = config.collectorNotes;
-        editableConfig_.taskTags = config.taskTags;
         editableConfig_.cmdVxMax = config.cmdVxMax;
         editableConfig_.cmdVyMax = config.cmdVyMax;
         editableConfig_.cmdWzMax = config.cmdWzMax;
@@ -1756,7 +2025,7 @@ public:
         return editableConfig_;
     }
 
-    UiActionResult UpdateEditableConfig(const UiConfigUpdateInput& input)
+    UiActionResult BuildEditableConfigFromInput(const UiConfigUpdateInput& input, EditableCollectorConfig* updatedOut) const
     {
         EditableCollectorConfig updated = GetEditableConfigSnapshot();
         const auto loggerStatus = logger_.GetStatus();
@@ -1771,9 +2040,7 @@ public:
         updated.taskFamily = Trim(input.taskFamily);
         updated.targetType = Trim(input.targetType);
         updated.targetDescription = Trim(input.targetDescription);
-        updated.targetInstanceId = Trim(input.targetInstanceId);
         updated.collectorNotes = Trim(input.collectorNotes);
-        updated.taskTags = SplitCsvList(input.taskTagsCsv);
         updated.cmdVxMax = input.cmdVxMax;
         updated.cmdVyMax = input.cmdVyMax;
         updated.cmdWzMax = input.cmdWzMax;
@@ -1784,15 +2051,155 @@ public:
             return ActionError("validation_error", "capture_mode 非法");
         }
         updated.captureMode = captureMode.value();
-        if (updated.captureMode != GetEditableConfigSnapshot().captureMode &&
-            (captureState == CaptureState::Capturing ||
-             captureState == CaptureState::Armed ||
-             captureState == CaptureState::DelayBeforeLog ||
-             loggerStatus.pendingLabel))
+
+        const UiActionResult validation = ValidateEditableConfigForUse(updated, captureState, loggerStatus.pendingLabel);
+        if (!validation.ok)
         {
-            return ActionError("invalid_state", "当前有活动区间时不能切换 capture_mode");
+            return validation;
         }
 
+        *updatedOut = updated;
+        return ActionOk("collector config valid");
+    }
+
+    UiActionResult CommitEditableConfig(const EditableCollectorConfig& updated, bool unlockStartupGate, bool emitUnlockLog)
+    {
+        {
+            std::lock_guard<std::mutex> lock(editableConfigMutex_);
+            editableConfig_ = updated;
+        }
+
+        bool unlocked = false;
+        if (unlockStartupGate)
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            if (startupGateActive_)
+            {
+                startupGateActive_ = false;
+                lastStartupGateReminder_ = std::chrono::steady_clock::time_point{};
+                unlocked = true;
+            }
+        }
+
+        if (unlocked)
+        {
+            ResetActiveMotionKeys();
+            if (emitUnlockLog)
+            {
+                PrintLine("collector 参数已应用；已解锁移动与录制，按 R 开始采集");
+            }
+            return ActionOk("collector 参数已应用；已解锁移动与录制");
+        }
+        return ActionOk("collector 参数已更新，将用于后续采集段");
+    }
+
+    UiActionResult UpdateEditableConfig(const UiConfigUpdateInput& input)
+    {
+        EditableCollectorConfig updated;
+        const UiActionResult validationResult = BuildEditableConfigFromInput(input, &updated);
+        if (!validationResult.ok)
+        {
+            return validationResult;
+        }
+        try
+        {
+            SaveDefaultsFile(CollectorDefaultsPath(config_.collectorRoot), updated);
+        }
+        catch (const std::exception& ex)
+        {
+            return ActionError("save_defaults_failed", ex.what());
+        }
+
+        const bool wasLocked = IsStartupGateActive();
+        const UiActionResult applyResult = CommitEditableConfig(updated, true, false);
+        if (!applyResult.ok)
+        {
+            return applyResult;
+        }
+
+        if (wasLocked)
+        {
+            PrintLine("collector 参数已应用并保存为默认值；已解锁移动与录制，按 R 开始采集");
+            return ActionOk("collector 参数已应用并保存为默认值；已解锁移动与录制");
+        }
+        PrintLine("collector 参数已更新并保存为默认值，将用于后续采集段");
+        return ActionOk("collector 参数已更新并保存为默认值，将用于后续采集段");
+    }
+
+    UiActionResult SaveEditableConfigAsDefaults(const UiConfigUpdateInput& input)
+    {
+        EditableCollectorConfig updated;
+        const UiActionResult validationResult = BuildEditableConfigFromInput(input, &updated);
+        if (!validationResult.ok)
+        {
+            return validationResult;
+        }
+        try
+        {
+            SaveDefaultsFile(CollectorDefaultsPath(config_.collectorRoot), updated);
+            const UiActionResult applyResult = CommitEditableConfig(updated, false, false);
+            if (!applyResult.ok)
+            {
+                return applyResult;
+            }
+            return ActionOk("已保存为下次启动默认值");
+        }
+        catch (const std::exception& ex)
+        {
+            return ActionError("save_defaults_failed", ex.what());
+        }
+    }
+
+    bool IsStartupGateActive() const
+    {
+        std::lock_guard<std::mutex> lock(stateMachineMutex_);
+        return startupGateActive_;
+    }
+
+    void MaybePrintStartupGateReminder()
+    {
+        bool shouldPrint = false;
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            if (!startupGateActive_)
+            {
+                return;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (lastStartupGateReminder_.time_since_epoch().count() == 0 ||
+                now - lastStartupGateReminder_ >= kStartupGateReminderInterval)
+            {
+                lastStartupGateReminder_ = now;
+                shouldPrint = true;
+            }
+        }
+        if (shouldPrint)
+        {
+            PrintLine("当前尚未解锁移动；请先点击 Apply For Next Segment，或按 O 使用当前配置解锁");
+        }
+    }
+
+    void PrintStartupInstructions() const
+    {
+        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
+        std::lock_guard<std::mutex> lock(outputMutex_);
+        std::cout << "\r\33[2KCollector Startup" << std::endl;
+        std::cout << "  采集前检查：确认周围安全、机器人姿态稳定、状态已正常更新" << std::endl;
+        std::cout << "  主控键位：W/S 前后  A/D 横移  Q/E 转向  R 开始录制  T 结束录制  ESC 丢弃当前段" << std::endl;
+        std::cout << "  其他键位：C 清 fault/切换站立  P 状态  H 帮助  X 退出" << std::endl;
+        std::cout << "  标注快捷键：待标注时按 1/2/3/4 直接完成评分" << std::endl;
+        std::cout << "  安全键位：Space 急停（始终有效）" << std::endl;
+        std::cout << "  解锁方式：先在 WebUI 填写并点击 Apply For Next Segment；终端可按 O 使用当前配置解锁" << std::endl;
+        std::cout << "  当前模式：capture_mode=" << CaptureModeName(editable.captureMode)
+                  << " input_backend=" << InputBackendName(config_.inputBackend) << std::endl;
+        std::cout << "  " << StartupPromptText() << std::endl;
+    }
+
+    UiActionResult ValidateEditableConfigForUse(
+        const EditableCollectorConfig& updated,
+        CaptureState captureState,
+        bool hasPendingLabel) const
+    {
         if (updated.sceneId.empty())
         {
             return ActionError("validation_error", "scene_id 不能为空");
@@ -1809,24 +2216,104 @@ public:
         {
             return ActionError("validation_error", "速度上限必须为正数");
         }
-
+        if (updated.captureMode != GetEditableConfigSnapshot().captureMode &&
+            (captureState == CaptureState::Capturing ||
+             captureState == CaptureState::Armed ||
+             captureState == CaptureState::DelayBeforeLog ||
+             hasPendingLabel))
         {
-            std::lock_guard<std::mutex> lock(editableConfigMutex_);
-            editableConfig_ = updated;
+            return ActionError("invalid_state", "当前有活动区间时不能切换 capture_mode");
         }
-        return ActionOk("collector 参数已更新，将用于后续采集段");
+        return ActionOk("collector config valid");
     }
 
-    UiActionResult SaveEditableConfigAsDefaults()
+    UiActionResult AcknowledgeStartupAndEnterReady(bool emitLog)
     {
+        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
+        const auto loggerStatus = logger_.GetStatus();
+        CaptureState captureState;
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            captureState = captureState_;
+        }
+
+        const UiActionResult validation = ValidateEditableConfigForUse(editable, captureState, loggerStatus.pendingLabel);
+        if (!validation.ok)
+        {
+            if (emitLog)
+            {
+                PrintLine("当前配置无效，无法解锁：" + validation.message);
+            }
+            return validation;
+        }
+
         try
         {
-            SaveDefaultsFile(CollectorDefaultsPath(config_.collectorRoot), GetEditableConfigSnapshot());
-            return ActionOk("已保存为下次启动默认值");
+            SaveDefaultsFile(CollectorDefaultsPath(config_.collectorRoot), editable);
         }
         catch (const std::exception& ex)
         {
+            if (emitLog)
+            {
+                PrintLine(std::string("保存默认配置失败，无法解锁：") + ex.what());
+            }
             return ActionError("save_defaults_failed", ex.what());
+        }
+
+        bool unlocked = false;
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            if (startupGateActive_)
+            {
+                startupGateActive_ = false;
+                lastStartupGateReminder_ = std::chrono::steady_clock::time_point{};
+                unlocked = true;
+            }
+        }
+
+        if (unlocked)
+        {
+            ResetActiveMotionKeys();
+        }
+        if (emitLog)
+        {
+            if (unlocked)
+            {
+                PrintLine("collector 参数已应用并保存为默认值；已解锁移动与录制，按 R 开始采集");
+            }
+            else
+            {
+                PrintLine("collector 已在操作模式；当前配置已保存为默认值");
+            }
+        }
+        return ActionOk(unlocked ? "collector config applied, defaults saved, and startup gate cleared" : "collector config applied and defaults saved");
+    }
+
+    void ResetTrajectoryStopFlowLocked()
+    {
+        trajectoryStopRequested_ = false;
+        trajectoryStopWaitingForRelease_ = false;
+        trajectoryStopFinalizeDeadline_ = std::chrono::steady_clock::time_point{};
+        trajectoryStopForceFinalizeDeadline_ = std::chrono::steady_clock::time_point{};
+    }
+
+    void StartTrajectoryFinalizeGracePeriod(const std::string& reason, bool emitLog)
+    {
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            if (captureState_ != CaptureState::Capturing || !trajectoryStopRequested_)
+            {
+                return;
+            }
+            trajectoryStopWaitingForRelease_ = false;
+            if (trajectoryStopFinalizeDeadline_.time_since_epoch().count() == 0)
+            {
+                trajectoryStopFinalizeDeadline_ = std::chrono::steady_clock::now() + kTrajectoryFinalizeGracePeriod;
+            }
+        }
+        if (emitLog)
+        {
+            PrintLine(reason);
         }
     }
 
@@ -1872,11 +2359,13 @@ public:
             webConfig.port = config_.webPort;
             webConfig.assetDir = (config_.collectorRoot / "native" / "web_ui_assets").string();
             webConfig.statusProvider = [this]() { return GetUiStatusSnapshot(); };
+            webConfig.acknowledgeStartupHandler = [this]() { return RequestAcknowledgeStartup(); };
             webConfig.startHandler = [this]() { return RequestBeginSegment(); };
             webConfig.stopHandler = [this]() { return RequestStopSegmentForLabel(); };
             webConfig.discardHandler = [this]() { return RequestDiscardSegment("discarded by web ui"); };
             webConfig.estopHandler = [this]() { return RequestEmergencyStopFromUi(); };
             webConfig.clearFaultHandler = [this]() { return RequestClearFaultFromUi(); };
+            webConfig.quitHandler = [this]() { return RequestQuitFromUi(); };
             webConfig.submitLabelHandler = [this](const SegmentLabelInput& input)
             {
                 return SubmitPendingLabel(input);
@@ -1885,10 +2374,11 @@ public:
             {
                 return UpdateEditableConfig(input);
             };
-            webConfig.saveDefaultsHandler = [this]()
+            webConfig.saveDefaultsHandler = [this](const UiConfigUpdateInput& input)
             {
-                return SaveEditableConfigAsDefaults();
+                return SaveEditableConfigAsDefaults(input);
             };
+            webConfig.latestImageJpegProvider = [this]() { return GetLatestImageJpeg(); };
             webUiServer_ = std::make_unique<WebUiServer>(webConfig);
             webUiServer_->Start();
         }
@@ -1906,8 +2396,8 @@ public:
         {
             PrintLine("Web UI：http://127.0.0.1:" + std::to_string(config_.webPort));
         }
-        PrintLine("collector 已就绪；按 H 查看帮助");
-        PrintHelp();
+        PrintLine("collector 已就绪；当前移动已锁定，需先应用一次配置");
+        PrintStartupInstructions();
     }
 
     void Shutdown()
@@ -1972,6 +2462,7 @@ public:
             command = latestCommand_;
         }
 
+        const auto loggerStatus = logger_.GetStatus();
         UiStatusSnapshot snapshot;
         CaptureState captureState;
         SafetyState safetyState;
@@ -1981,13 +2472,15 @@ public:
             captureState = captureState_;
             safetyState = safetyState_;
             faultReason = latchedFaultReason_;
+            snapshot.startupGateActive = startupGateActive_;
+            snapshot.stopPhase = TrajectoryStopPhaseName(false, trajectoryStopRequested_, trajectoryStopWaitingForRelease_);
         }
-        const auto loggerStatus = logger_.GetStatus();
         const EditableCollectorConfig editable = GetEditableConfigSnapshot();
         const double nowSeconds = NowSeconds();
         snapshot.running = running_.load();
         snapshot.webUiEnabled = config_.webUiEnabled;
         snapshot.webPort = config_.webPort;
+        snapshot.startupPrompt = StartupPromptText();
         snapshot.sessionDir = logger_.OutputDir().string();
         snapshot.captureMode = CaptureModeName(editable.captureMode);
         snapshot.bufferedFrames = loggerStatus.bufferedFrames;
@@ -2012,8 +2505,6 @@ public:
         snapshot.taskFamily = editable.taskFamily;
         snapshot.targetType = editable.targetType;
         snapshot.targetDescription = editable.targetDescription;
-        snapshot.targetInstanceId = editable.targetInstanceId;
-        snapshot.taskTagsCsv = JoinCsvList(editable.taskTags);
         snapshot.collectorNotes = editable.collectorNotes;
         snapshot.cmdVxMax = editable.cmdVxMax;
         snapshot.cmdVyMax = editable.cmdVyMax;
@@ -2029,10 +2520,15 @@ public:
         snapshot.pendingEpisodeId = loggerStatus.pendingEpisodeId;
         snapshot.pendingLabelBufferedFrames = loggerStatus.bufferedFrames;
         snapshot.captureState = CaptureStateName(captureState);
+        if (loggerStatus.pendingLabel)
+        {
+            snapshot.stopPhase = "label_ready";
+        }
         snapshot.safetyState = SafetyStateName(safetyState);
         snapshot.faultReason = faultReason;
         snapshot.recording = captureState == CaptureState::Capturing;
-        snapshot.actions.canStartRecording = safetyState == SafetyState::SafeReady &&
+        snapshot.actions.canStartRecording = !snapshot.startupGateActive &&
+                                             safetyState == SafetyState::SafeReady &&
                                              captureState == CaptureState::Idle &&
                                              !loggerStatus.pendingLabel;
         snapshot.actions.canStopRecording = captureState == CaptureState::Capturing;
@@ -2049,6 +2545,11 @@ public:
     UiActionResult RequestBeginSegment()
     {
         return BeginSegmentInternal(true);
+    }
+
+    UiActionResult RequestAcknowledgeStartup()
+    {
+        return AcknowledgeStartupAndEnterReady(true);
     }
 
     UiActionResult RequestStopSegmentForLabel()
@@ -2097,6 +2598,13 @@ public:
         return ActionOk("safety fault 已清除");
     }
 
+    UiActionResult RequestQuitFromUi()
+    {
+        RequestQuit();
+        PrintLine("collector 正在退出");
+        return ActionOk("collector 正在退出");
+    }
+
     UiActionResult SubmitPendingLabel(const SegmentLabelInput& input)
     {
         const auto loggerStatus = logger_.GetStatus();
@@ -2131,6 +2639,16 @@ public:
         labelMetadata.success = success;
         labelMetadata.terminationReason = terminationReason;
         return FinalizePendingLabelInternal(labelMetadata, true);
+    }
+
+    std::vector<uint8_t> GetLatestImageJpeg() const
+    {
+        std::lock_guard<std::mutex> lock(imageMutex_);
+        if (!latestImage_.valid || latestImage_.jpegBytes.empty())
+        {
+            return {};
+        }
+        return latestImage_.jpegBytes;
     }
 
 private:
@@ -2212,6 +2730,63 @@ private:
             return MotionInstruction::TurnLeft;
         }
         return MotionInstruction::TurnRight;
+    }
+
+    static bool IsMotionInputActive(const MotionStateSnapshot& motionState)
+    {
+        return motionState.forward || motionState.backward || motionState.left ||
+               motionState.right || motionState.yawLeft || motionState.yawRight;
+    }
+
+    void UpdateTrajectoryStopFlow(const MotionStateSnapshot& motionState)
+    {
+        bool shouldStartGrace = false;
+        bool timedOut = false;
+        bool shouldFinalize = false;
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            if (captureState_ != CaptureState::Capturing || !trajectoryStopRequested_)
+            {
+                return;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (trajectoryStopWaitingForRelease_)
+            {
+                if (!IsMotionInputActive(motionState))
+                {
+                    shouldStartGrace = true;
+                }
+                else if (trajectoryStopForceFinalizeDeadline_.time_since_epoch().count() != 0 &&
+                         now >= trajectoryStopForceFinalizeDeadline_)
+                {
+                    shouldStartGrace = true;
+                    timedOut = true;
+                }
+            }
+            else if (trajectoryStopFinalizeDeadline_.time_since_epoch().count() != 0 &&
+                     now >= trajectoryStopFinalizeDeadline_)
+            {
+                shouldFinalize = true;
+            }
+        }
+
+        if (shouldStartGrace)
+        {
+            if (timedOut)
+            {
+                StartTrajectoryFinalizeGracePeriod("Stopping segment timed out; finalizing segment... press score key", true);
+            }
+            else
+            {
+                StartTrajectoryFinalizeGracePeriod("Finalizing segment... press score key", true);
+            }
+            return;
+        }
+        if (shouldFinalize)
+        {
+            CompleteTrajectoryStopIfReady(true);
+        }
     }
 
     void PrintLine(const std::string& line) const
@@ -2304,42 +2879,49 @@ private:
         return std::nullopt;
     }
 
-    std::optional<std::string> PromptSegmentStatus()
+    std::optional<SegmentLabelInput> PromptQuickLabel()
     {
-        return PromptForSelection(
-            "请选择 segment_status",
+        const auto selection = PromptForSelection(
+            "请选择数据评分",
             {
-                {"1", SegmentStatusName(SegmentStatus::Clean)},
-                {"2", SegmentStatusName(SegmentStatus::Usable)},
-                {"3", SegmentStatusName(SegmentStatus::Discard)},
+                {"1", "好的成功示范 (clean + success + goal_reached)"},
+                {"2", "可用但不完美 (usable + partial + near_goal_stop)"},
+                {"3", "失败但有价值 (usable + fail + operator_stop)"},
+                {"4", "丢弃 (discard)"},
             });
-    }
+        if (!selection.has_value())
+        {
+            return std::nullopt;
+        }
 
-    std::optional<std::string> PromptSuccessLabel()
-    {
-        return PromptForSelection(
-            "请选择 success",
-            {
-                {"1", SuccessLabelName(SuccessLabel::Success)},
-                {"2", SuccessLabelName(SuccessLabel::Partial)},
-                {"3", SuccessLabelName(SuccessLabel::Fail)},
-            });
-    }
-
-    std::optional<std::string> PromptTerminationReason()
-    {
-        return PromptForSelection(
-            "请选择 termination_reason",
-            {
-                {"1", TerminationReasonName(TerminationReason::GoalReached)},
-                {"2", TerminationReasonName(TerminationReason::NearGoalStop)},
-                {"3", TerminationReasonName(TerminationReason::Occluded)},
-                {"4", TerminationReasonName(TerminationReason::TargetLost)},
-                {"5", TerminationReasonName(TerminationReason::OperatorStop)},
-                {"6", TerminationReasonName(TerminationReason::BadDemo)},
-                {"7", TerminationReasonName(TerminationReason::Unsafe)},
-                {"8", TerminationReasonName(TerminationReason::Timeout)},
-            });
+        SegmentLabelInput input;
+        if (selection.value() == "好的成功示范 (clean + success + goal_reached)")
+        {
+            input.segmentStatus = SegmentStatusName(SegmentStatus::Clean);
+            input.success = SuccessLabelName(SuccessLabel::Success);
+            input.terminationReason = TerminationReasonName(TerminationReason::GoalReached);
+            return input;
+        }
+        if (selection.value() == "可用但不完美 (usable + partial + near_goal_stop)")
+        {
+            input.segmentStatus = SegmentStatusName(SegmentStatus::Usable);
+            input.success = SuccessLabelName(SuccessLabel::Partial);
+            input.terminationReason = TerminationReasonName(TerminationReason::NearGoalStop);
+            return input;
+        }
+        if (selection.value() == "失败但有价值 (usable + fail + operator_stop)")
+        {
+            input.segmentStatus = SegmentStatusName(SegmentStatus::Usable);
+            input.success = SuccessLabelName(SuccessLabel::Fail);
+            input.terminationReason = TerminationReasonName(TerminationReason::OperatorStop);
+            return input;
+        }
+        if (selection.value() == "丢弃 (discard)")
+        {
+            input.segmentStatus = SegmentStatusName(SegmentStatus::Discard);
+            return input;
+        }
+        return std::nullopt;
     }
 
     void PrintHelp() const
@@ -2347,9 +2929,11 @@ private:
         const EditableCollectorConfig editable = GetEditableConfigSnapshot();
         std::lock_guard<std::mutex> lock(outputMutex_);
         std::cout << "\r\33[2KKeys:" << std::endl;
+        std::cout << "  O apply current config and unlock teleop/recording" << std::endl;
         std::cout << "  W/S forward/backward  A/D strafe  Q/E yaw" << std::endl;
         std::cout << "  R start capture flow  ESC cancel current armed/capture segment" << std::endl;
         std::cout << "  Space emergency stop  C clear fault or toggle stand up/down  P status  H help  X quit" << std::endl;
+        std::cout << "  pending label: 1 good demo  2 usable imperfect  3 failed but valuable  4 discard" << std::endl;
         if (editable.captureMode == Config::CaptureMode::SingleAction)
         {
             std::cout << "  single_action 模式：检测到第一个有效单动作输入后，等待 0.5 秒开始录制，松键自动结束" << std::endl;
@@ -2357,7 +2941,7 @@ private:
         }
         else
         {
-            std::cout << "  trajectory 模式：按 R 立即开始录制，允许多阶段动作变化，按 T 结束后进行标注" << std::endl;
+            std::cout << "  trajectory 模式：按 R 进入 armed，连续有效动作后开始写入，按 T 请求结束并等待动作回落后标注" << std::endl;
             std::cout << "  该模式下必须提供 --instruction，并作为轨迹级语义标签保存" << std::endl;
         }
         std::cout << "  input_backend=" << InputBackendName(config_.inputBackend)
@@ -2401,12 +2985,14 @@ private:
         CaptureState captureState;
         std::string activeInstruction;
         double armDelayRemaining = 0.0;
+        bool startupGateActive = false;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
             safetyState = safetyState_;
             faultReason = latchedFaultReason_;
             captureState = captureState_;
             activeInstruction = MotionInstructionName(activeMotionInstruction_);
+            startupGateActive = startupGateActive_;
             if (captureState_ == CaptureState::DelayBeforeLog)
             {
                 armDelayRemaining = std::max(
@@ -2418,6 +3004,7 @@ private:
         std::ostringstream oss;
         oss << std::boolalpha
             << "capture_state=" << CaptureStateName(captureState)
+            << " startup_gate=" << (startupGateActive ? "waiting" : "ready")
             << " safety_state=" << SafetyStateName(safetyState)
             << " fault_reason=" << (faultReason.empty() ? "-" : faultReason)
             << " scene_id=" << editable.sceneId
@@ -2529,6 +3116,7 @@ private:
             captureState_ = CaptureState::Fault;
             activeMotionInstruction_ = MotionInstruction::None;
             captureStartDeadline_ = std::chrono::steady_clock::time_point{};
+            ResetTrajectoryStopFlowLocked();
         }
         logger_.DiscardPendingSegment();
         ResetActiveMotionKeys();
@@ -2616,8 +3204,6 @@ private:
         metadata.taskFamily = editable.taskFamily;
         metadata.targetType = editable.targetType;
         metadata.targetDescription = editable.targetDescription;
-        metadata.targetInstanceId = editable.targetInstanceId;
-        metadata.taskTags = editable.taskTags;
         metadata.collectorNotes = editable.collectorNotes;
         metadata.instructionSource = metadata.instruction.empty() ? "motion_label" : "semantic_text";
         return metadata;
@@ -2626,7 +3212,17 @@ private:
     UiActionResult BeginSegmentInternal(bool emitLog)
     {
         const bool hasPendingLabel = logger_.GetStatus().pendingLabel;
+        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
+        const TaskMetadata configuredTaskMetadata = ConfiguredTaskMetadata();
         std::lock_guard<std::mutex> lock(stateMachineMutex_);
+        if (startupGateActive_)
+        {
+            if (emitLog)
+            {
+                PrintLine("当前尚未解锁移动；请先点击 Apply For Next Segment，或按 O 使用当前配置解锁");
+            }
+            return ActionError("startup_gate_active", "请先点击 Apply For Next Segment，或按 O 使用当前配置解锁");
+        }
         if (safetyState_ != SafetyState::SafeReady)
         {
             if (emitLog)
@@ -2662,17 +3258,17 @@ private:
 
         try
         {
-            const EditableCollectorConfig editable = GetEditableConfigSnapshot();
             if (editable.captureMode == Config::CaptureMode::Trajectory)
             {
-                logger_.BeginSegment(editable.sceneId, editable.operatorId, ConfiguredTaskMetadata());
+                logger_.BeginSegment(editable.sceneId, editable.operatorId, configuredTaskMetadata, trajectoryGateConfig_);
                 captureState_ = CaptureState::Capturing;
                 activeMotionInstruction_ = MotionInstruction::None;
                 captureStartDeadline_ = std::chrono::steady_clock::time_point{};
                 pendingLabelFallbackInstruction_.clear();
+                ResetTrajectoryStopFlowLocked();
                 if (emitLog)
                 {
-                    PrintLine("trajectory 采集已开始；按 T 结束并标注，按 ESC 丢弃");
+                    PrintLine("trajectory 已 armed；检测到连续有效动作后开始写入，按 T 请求结束，按 ESC 丢弃");
                 }
             }
             else
@@ -2681,6 +3277,7 @@ private:
                 activeMotionInstruction_ = MotionInstruction::None;
                 captureStartDeadline_ = std::chrono::steady_clock::time_point{};
                 pendingLabelFallbackInstruction_.clear();
+                ResetTrajectoryStopFlowLocked();
                 if (emitLog)
                 {
                     PrintLine("采集段已 armed，等待单一有效动作输入");
@@ -2699,10 +3296,49 @@ private:
         return ActionOk("segment started");
     }
 
+    UiActionResult FinalizeCaptureForLabelInternal(MotionInstruction instruction, bool emitLog)
+    {
+        const size_t frameCount = logger_.EndSegmentForLabel();
+        if (frameCount == 0)
+        {
+            logger_.DiscardPendingSegment();
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
+            activeMotionInstruction_ = MotionInstruction::None;
+            captureStartDeadline_ = std::chrono::steady_clock::time_point{};
+            pendingLabelFallbackInstruction_.clear();
+            ResetTrajectoryStopFlowLocked();
+            if (emitLog)
+            {
+                PrintLine("该段未记录到有效动作帧，已丢弃");
+            }
+            return ActionError("empty_segment", "该段未记录到有效动作帧");
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
+            activeMotionInstruction_ = MotionInstruction::None;
+            captureStartDeadline_ = std::chrono::steady_clock::time_point{};
+            pendingLabelFallbackInstruction_ = MotionInstructionName(instruction);
+            ResetTrajectoryStopFlowLocked();
+        }
+        if (emitLog)
+        {
+            PrintLine("Entering labeling state... press 1/2/3/4");
+        }
+        return ActionOk("segment stopped for labeling");
+    }
+
     UiActionResult StopSegmentForLabelInternal(bool emitLog)
     {
         const bool hasPendingLabel = logger_.GetStatus().pendingLabel;
+        const Config::CaptureMode captureModeSnapshot = GetEditableConfigSnapshot().captureMode;
         MotionInstruction instruction = MotionInstruction::None;
+        Config::CaptureMode captureMode = captureModeSnapshot;
+        bool requestTrajectoryStop = false;
+        bool finalizeImmediately = false;
+        bool waitingForRelease = false;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
             if (captureState_ != CaptureState::Capturing)
@@ -2718,36 +3354,76 @@ private:
                 return ActionError("not_capturing", "当前没有可结束的采集段");
             }
             instruction = activeMotionInstruction_;
+            if (captureMode == Config::CaptureMode::Trajectory)
+            {
+                if (trajectoryStopRequested_)
+                {
+                    return ActionError("already_stopping", "trajectory 已收到结束请求，正在等待动作回落");
+                }
+                requestTrajectoryStop = true;
+            }
         }
 
-        const size_t frameCount = logger_.EndSegmentForLabel();
-        if (frameCount == 0)
+        if (captureMode == Config::CaptureMode::Trajectory)
         {
-            logger_.DiscardPendingSegment();
-            std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
-            activeMotionInstruction_ = MotionInstruction::None;
-            captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-            pendingLabelFallbackInstruction_.clear();
+            if (!logger_.HasEffectiveMotion())
+            {
+                finalizeImmediately = true;
+            }
+            else
+            {
+                const bool motionInputActive = IsMotionInputActive(GetMotionStateSnapshot());
+                std::lock_guard<std::mutex> lock(stateMachineMutex_);
+                trajectoryStopRequested_ = true;
+                trajectoryStopWaitingForRelease_ = motionInputActive;
+                trajectoryStopFinalizeDeadline_ = motionInputActive
+                                                      ? std::chrono::steady_clock::time_point{}
+                                                      : std::chrono::steady_clock::now() + kTrajectoryFinalizeGracePeriod;
+                trajectoryStopForceFinalizeDeadline_ = std::chrono::steady_clock::now() + kTrajectoryStopReleaseTimeout;
+                waitingForRelease = motionInputActive;
+            }
+        }
+
+        if (finalizeImmediately)
+        {
+            return FinalizeCaptureForLabelInternal(instruction, emitLog);
+        }
+
+        if (requestTrajectoryStop)
+        {
             if (emitLog)
             {
-                PrintLine("该段未记录到有效帧，已丢弃");
+                if (waitingForRelease)
+                {
+                    PrintLine("Stopping segment... waiting for input release");
+                }
+                else
+                {
+                    PrintLine("Finalizing segment... press score key");
+                }
             }
-            return ActionError("empty_segment", "该段未记录到有效帧");
+            return ActionOk("trajectory stop requested");
         }
+        return FinalizeCaptureForLabelInternal(instruction, emitLog);
+    }
 
+    void CompleteTrajectoryStopIfReady(bool emitLog)
+    {
+        MotionInstruction instruction = MotionInstruction::None;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
-            activeMotionInstruction_ = MotionInstruction::None;
-            captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-            pendingLabelFallbackInstruction_ = MotionInstructionName(instruction);
+            if (captureState_ != CaptureState::Capturing || !trajectoryStopRequested_)
+            {
+                return;
+            }
+            instruction = activeMotionInstruction_;
         }
-        if (emitLog)
+        const UiActionResult result = FinalizeCaptureForLabelInternal(instruction, emitLog);
+        if (!result.ok || config_.webUiEnabled)
         {
-            PrintLine("采集段已结束，等待标注或丢弃");
+            return;
         }
-        return ActionOk("segment stopped for labeling");
+        PromptAndFinalizePendingSegment();
     }
 
     UiActionResult DiscardSegmentInternal(const std::string& reason, bool emitLog)
@@ -2771,6 +3447,7 @@ private:
             activeMotionInstruction_ = MotionInstruction::None;
             captureStartDeadline_ = std::chrono::steady_clock::time_point{};
             pendingLabelFallbackInstruction_.clear();
+            ResetTrajectoryStopFlowLocked();
         }
         logger_.DiscardPendingSegment();
         if (emitLog)
@@ -2828,35 +3505,14 @@ private:
 
     void PromptAndFinalizePendingSegment()
     {
-        const auto segmentStatus = PromptSegmentStatus();
-        if (!segmentStatus.has_value())
+        const auto quickLabel = PromptQuickLabel();
+        if (!quickLabel.has_value())
         {
             DiscardSegmentInternal("cancelled during labeling", true);
             return;
         }
 
-        SegmentLabelInput input;
-        input.segmentStatus = segmentStatus.value();
-        if (input.segmentStatus != SegmentStatusName(SegmentStatus::Discard))
-        {
-            const auto success = PromptSuccessLabel();
-            if (!success.has_value())
-            {
-                DiscardSegmentInternal("cancelled during labeling", true);
-                return;
-            }
-            input.success = success.value();
-
-            const auto terminationReason = PromptTerminationReason();
-            if (!terminationReason.has_value())
-            {
-                DiscardSegmentInternal("cancelled during labeling", true);
-                return;
-            }
-            input.terminationReason = terminationReason.value();
-        }
-
-        const UiActionResult result = SubmitPendingLabel(input);
+        const UiActionResult result = SubmitPendingLabel(quickLabel.value());
         if (!result.ok)
         {
             PrintLine("标注提交失败：" + result.message);
@@ -2872,6 +3528,10 @@ private:
     {
         const UiActionResult result = StopSegmentForLabelInternal(true);
         if (!result.ok)
+        {
+            return;
+        }
+        if (!logger_.GetStatus().pendingLabel)
         {
             return;
         }
@@ -2934,6 +3594,10 @@ private:
 
     void UpdateCaptureStateFromMotion(const MotionStateSnapshot& motionState)
     {
+        if (IsStartupGateActive())
+        {
+            return;
+        }
         if (GetEditableConfigSnapshot().captureMode == Config::CaptureMode::Trajectory)
         {
             return;
@@ -3091,6 +3755,18 @@ private:
 
     VelocityCommand ComputeKeyboardCommand()
     {
+        if (IsStartupGateActive())
+        {
+            VelocityCommand command;
+            command.timestamp = NowSeconds();
+            command.valid = true;
+            return command;
+        }
+        bool stopRequested = false;
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            stopRequested = trajectoryStopRequested_;
+        }
         const auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(keyMutex_);
         const float deltaSeconds = lastCommandUpdate_.time_since_epoch().count() == 0
@@ -3098,12 +3774,12 @@ private:
                                        : std::chrono::duration<float>(now - lastCommandUpdate_).count();
         lastCommandUpdate_ = now;
 
-        const float forward = (keyW_.pressed || keyW_.deadline > now) ? 1.0f : 0.0f;
-        const float backward = (keyS_.pressed || keyS_.deadline > now) ? 1.0f : 0.0f;
-        const float left = (keyA_.pressed || keyA_.deadline > now) ? 1.0f : 0.0f;
-        const float right = (keyD_.pressed || keyD_.deadline > now) ? 1.0f : 0.0f;
-        const float yawLeft = (keyQ_.pressed || keyQ_.deadline > now) ? 1.0f : 0.0f;
-        const float yawRight = (keyE_.pressed || keyE_.deadline > now) ? 1.0f : 0.0f;
+        const float forward = stopRequested ? 0.0f : ((keyW_.pressed || keyW_.deadline > now) ? 1.0f : 0.0f);
+        const float backward = stopRequested ? 0.0f : ((keyS_.pressed || keyS_.deadline > now) ? 1.0f : 0.0f);
+        const float left = stopRequested ? 0.0f : ((keyA_.pressed || keyA_.deadline > now) ? 1.0f : 0.0f);
+        const float right = stopRequested ? 0.0f : ((keyD_.pressed || keyD_.deadline > now) ? 1.0f : 0.0f);
+        const float yawLeft = stopRequested ? 0.0f : ((keyQ_.pressed || keyQ_.deadline > now) ? 1.0f : 0.0f);
+        const float yawRight = stopRequested ? 0.0f : ((keyE_.pressed || keyE_.deadline > now) ? 1.0f : 0.0f);
 
         float targetVx = forward - backward;
         float targetVy = left - right;
@@ -3131,13 +3807,42 @@ private:
 
     void ProcessTeleopChar(char ch, bool allowMotionKeys = true)
     {
+        const char lowered = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (IsStartupGateActive())
+        {
+            if (ch == ' ')
+            {
+                RequestEmergencyStop("键盘急停");
+                return;
+            }
+
+            switch (lowered)
+            {
+            case kStartupAcknowledgeKey:
+                AcknowledgeStartupAndEnterReady(true);
+                return;
+            case 'h':
+                PrintStartupInstructions();
+                return;
+            case 'p':
+                PrintStatus();
+                return;
+            case 'x':
+                RequestQuit();
+                return;
+            default:
+                MaybePrintStartupGateReminder();
+                return;
+            }
+        }
+
         if (ch == kEscapeKey)
         {
             CancelCurrentSegment("cancelled by operator");
             return;
         }
 
-        switch (std::tolower(static_cast<unsigned char>(ch)))
+        switch (lowered)
         {
         case 'w':
         case 'a':
@@ -3164,6 +3869,9 @@ private:
             break;
         case 'h':
             PrintHelp();
+            break;
+        case kStartupAcknowledgeKey:
+            PrintLine("collector 已在操作模式；修改配置后请在 WebUI 点击 Apply For Next Segment");
             break;
         case 'x':
             RequestQuit();
@@ -3247,6 +3955,11 @@ private:
 
     bool HandleEvdevKey(uint16_t code, bool pressed)
     {
+        if (IsStartupGateActive())
+        {
+            return true;
+        }
+
         switch (code)
         {
         case KEY_W:
@@ -3314,6 +4027,12 @@ private:
                 ProcessTeleopChar('h');
             }
             return true;
+        case KEY_O:
+            if (pressed)
+            {
+                ProcessTeleopChar(kStartupAcknowledgeKey);
+            }
+            return true;
         case KEY_X:
             if (pressed)
             {
@@ -3359,6 +4078,7 @@ private:
 
             const MotionStateSnapshot motionState = GetMotionStateSnapshot();
             UpdateCaptureStateFromMotion(motionState);
+            UpdateTrajectoryStopFlow(motionState);
             VelocityCommand command = ComputeKeyboardCommand();
             CaptureState captureState;
             SafetyState safetyState;
@@ -3517,6 +4237,8 @@ private:
             const bool ready = captureState == CaptureState::Capturing && state.valid && hasFreshImage;
             if (ready)
             {
+                const MotionStateSnapshot motionState = GetMotionStateSnapshot();
+                const bool motionInputActive = IsMotionInputActive(motionState);
                 const double sampleTimestamp = image.timestamp;
                 const EffectiveControlAction controlAction = ResolveControlAction(action, sampleTimestamp);
                 try
@@ -3529,7 +4251,8 @@ private:
                         image,
                         state.timestamp,
                         action.timestamp,
-                        image.timestamp);
+                        image.timestamp,
+                        motionInputActive);
                     lastLoggedImageSequence = image.sequence;
                 }
                 catch (const std::exception& ex)
@@ -3572,6 +4295,7 @@ private:
 
     Config config_;
     TrajectoryLogger logger_;
+    TrajectoryMotionGateConfig trajectoryGateConfig_;
     RawTerminalGuard terminalGuard_;
     std::atomic<bool> running_{false};
     std::atomic<bool> quitRequested_{false};
@@ -3594,9 +4318,15 @@ private:
     SafetyState safetyState_ = SafetyState::SafeReady;
     std::string latchedFaultReason_;
     CaptureState captureState_ = CaptureState::Idle;
+    bool startupGateActive_ = true;
+    std::chrono::steady_clock::time_point lastStartupGateReminder_{};
     MotionInstruction activeMotionInstruction_ = MotionInstruction::None;
     std::chrono::steady_clock::time_point captureStartDeadline_{};
     std::string pendingLabelFallbackInstruction_;
+    bool trajectoryStopRequested_ = false;
+    bool trajectoryStopWaitingForRelease_ = false;
+    std::chrono::steady_clock::time_point trajectoryStopFinalizeDeadline_{};
+    std::chrono::steady_clock::time_point trajectoryStopForceFinalizeDeadline_{};
     EditableCollectorConfig editableConfig_;
 
     KeyActivity keyW_;

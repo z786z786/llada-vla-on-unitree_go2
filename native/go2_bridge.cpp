@@ -132,7 +132,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (i + 1 >= argc)
             {
-                error = "missing value for --network-interface";
+                error = "参数缺少取值：--network-interface";
                 return std::nullopt;
             }
             config.networkInterface = argv[++i];
@@ -141,7 +141,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (i + 1 >= argc)
             {
-                error = "missing value for --control-hz";
+                error = "参数缺少取值：--control-hz";
                 return std::nullopt;
             }
             config.controlHz = std::stod(argv[++i]);
@@ -150,7 +150,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (i + 1 >= argc)
             {
-                error = "missing value for --video-poll-hz";
+                error = "参数缺少取值：--video-poll-hz";
                 return std::nullopt;
             }
             config.videoPollHz = std::stod(argv[++i]);
@@ -161,20 +161,20 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         }
         else
         {
-            error = "unknown argument: " + arg;
+            error = "未知参数：" + arg;
             return std::nullopt;
         }
     }
 
     if (config.controlHz <= 0.0)
     {
-        error = "--control-hz must be positive";
+        error = "--control-hz 必须为正数";
         return std::nullopt;
     }
 
     if (config.videoPollHz <= 0.0)
     {
-        error = "--video-poll-hz must be positive";
+        error = "--video-poll-hz 必须为正数";
         return std::nullopt;
     }
 
@@ -500,7 +500,7 @@ int main(int argc, char** argv)
         const auto config = ParseArgs(argc, argv, error);
         if (!config.has_value())
         {
-            std::cerr << "bridge argument error: " << error << std::endl;
+            std::cerr << "bridge 参数错误：" << error << std::endl;
             return 2;
         }
 
@@ -561,12 +561,12 @@ int main(int argc, char** argv)
     }
     catch (const std::exception& exc)
     {
-        std::cerr << "bridge fatal error: " << exc.what() << std::endl;
+        std::cerr << "bridge 致命错误：" << exc.what() << std::endl;
         return 1;
     }
     catch (...)
     {
-        std::cerr << "bridge fatal error: unknown exception" << std::endl;
+        std::cerr << "bridge 致命错误：未知异常" << std::endl;
         return 1;
     }
 }

@@ -1,9 +1,10 @@
 const summaryGrid = document.getElementById("summary-grid");
 const robotGrid = document.getElementById("robot-grid");
 const processGrid = document.getElementById("process-grid");
-const pendingMeta = document.getElementById("pending-meta");
 const actionResult = document.getElementById("action-result");
 const configForm = document.getElementById("config-form");
+const cameraThumb = document.getElementById("camera-thumb");
+const cameraMeta = document.getElementById("camera-meta");
 
 const controls = {
   start: document.getElementById("start-btn"),
@@ -11,15 +12,38 @@ const controls = {
   discard: document.getElementById("discard-btn"),
   estop: document.getElementById("estop-btn"),
   clearFault: document.getElementById("clear-fault-btn"),
-  submitLabel: document.getElementById("submit-label-btn"),
+  quit: document.getElementById("quit-btn"),
   applyConfig: document.getElementById("apply-config-btn"),
-  saveDefaults: document.getElementById("save-defaults-btn"),
 };
 
-const labelFields = {
-  segmentStatus: document.querySelectorAll('input[name="segment-status"]'),
-  success: document.querySelectorAll('input[name="success"]'),
-  terminationReason: document.querySelectorAll('input[name="termination-reason"]'),
+const ratingButtons = {
+  "1": document.getElementById("rating-1-btn"),
+  "2": document.getElementById("rating-2-btn"),
+  "3": document.getElementById("rating-3-btn"),
+  "4": document.getElementById("rating-4-btn"),
+};
+
+const ratingPresets = {
+  "1": {
+    segment_status: "clean",
+    success: "success",
+    termination_reason: "goal_reached",
+  },
+  "2": {
+    segment_status: "usable",
+    success: "partial",
+    termination_reason: "near_goal_stop",
+  },
+  "3": {
+    segment_status: "usable",
+    success: "fail",
+    termination_reason: "operator_stop",
+  },
+  "4": {
+    segment_status: "discard",
+    success: "",
+    termination_reason: "",
+  },
 };
 
 const configFields = {
@@ -30,8 +54,6 @@ const configFields = {
   taskFamily: document.getElementById("cfg-task-family"),
   targetType: document.getElementById("cfg-target-type"),
   targetDescription: document.getElementById("cfg-target-description"),
-  targetInstanceId: document.getElementById("cfg-target-instance-id"),
-  taskTagsCsv: document.getElementById("cfg-task-tags-csv"),
   collectorNotes: document.getElementById("cfg-collector-notes"),
   cmdVxMax: document.getElementById("cfg-cmd-vx-max"),
   cmdVyMax: document.getElementById("cfg-cmd-vy-max"),
@@ -39,6 +61,9 @@ const configFields = {
 };
 
 let statusCache = null;
+let lastImageRefreshAt = 0;
+let configDirty = false;
+let applyInFlight = false;
 
 function setLog(value) {
   actionResult.textContent = value;
@@ -50,23 +75,6 @@ function renderItems(target, items) {
   )).join("");
 }
 
-function getCheckedValue(nodeList) {
-  const node = Array.from(nodeList).find((item) => item.checked);
-  return node ? node.value : "";
-}
-
-function setCheckedValue(nodeList, value) {
-  Array.from(nodeList).forEach((item) => {
-    item.checked = item.value === value;
-  });
-}
-
-function setRadioDisabled(nodeList, disabled) {
-  Array.from(nodeList).forEach((item) => {
-    item.disabled = disabled;
-  });
-}
-
 async function postJson(url, body = {}) {
   const response = await fetch(url, {
     method: "POST",
@@ -76,8 +84,39 @@ async function postJson(url, body = {}) {
   return response.json();
 }
 
+function currentConfigPayload() {
+  return {
+    scene_id: configFields.sceneId.value,
+    operator_id: configFields.operatorId.value,
+    instruction: configFields.instruction.value,
+    capture_mode: configFields.captureMode.value,
+    task_family: configFields.taskFamily.value,
+    target_type: configFields.targetType.value,
+    target_description: configFields.targetDescription.value,
+    collector_notes: configFields.collectorNotes.value,
+    cmd_vx_max: Number(configFields.cmdVxMax.value),
+    cmd_vy_max: Number(configFields.cmdVyMax.value),
+    cmd_wz_max: Number(configFields.cmdWzMax.value),
+  };
+}
+
+async function applyConfigFromForm() {
+  applyInFlight = true;
+  try {
+    const result = await postJson("/api/config/update", currentConfigPayload());
+    if (result.ok) {
+      configDirty = false;
+    }
+    setLog(JSON.stringify(result, null, 2));
+    await refreshStatus();
+    return result;
+  } finally {
+    applyInFlight = false;
+  }
+}
+
 function syncConfigForm(status) {
-  if (configForm.contains(document.activeElement)) {
+  if (configDirty || applyInFlight || configForm.contains(document.activeElement)) {
     return;
   }
   const cfg = status.run_context;
@@ -88,70 +127,95 @@ function syncConfigForm(status) {
   configFields.taskFamily.value = cfg.task_family || "";
   configFields.targetType.value = cfg.target_type || "";
   configFields.targetDescription.value = cfg.target_description || "";
-  configFields.targetInstanceId.value = cfg.target_instance_id || "";
-  configFields.taskTagsCsv.value = cfg.task_tags_csv || "";
   configFields.collectorNotes.value = cfg.collector_notes || "";
   configFields.cmdVxMax.value = cfg.cmd_vx_max ?? "";
   configFields.cmdVyMax.value = cfg.cmd_vy_max ?? "";
   configFields.cmdWzMax.value = cfg.cmd_wz_max ?? "";
 }
 
+function setRatingButtonsDisabled(disabled) {
+  Object.values(ratingButtons).forEach((button) => {
+    button.disabled = disabled;
+  });
+}
+
+function describeStopPhase(stopPhase) {
+  switch (stopPhase) {
+    case "waiting_release":
+      return "waiting_release / release motion keys";
+    case "finalizing":
+      return "finalizing / settling before label";
+    case "label_ready":
+      return "label_ready / press 1-4";
+    default:
+      return stopPhase || "idle";
+  }
+}
+
+async function submitRatingPreset(key) {
+  if (!statusCache || !statusCache.actions.can_submit_label) {
+    return;
+  }
+  const preset = ratingPresets[key];
+  if (!preset) {
+    return;
+  }
+  const result = await postJson("/api/label/submit", preset);
+  setLog(JSON.stringify(result, null, 2));
+  refreshStatus();
+}
+
 function renderStatus(status) {
   statusCache = status;
   renderItems(summaryGrid, [
     ["capture_state", status.collector.capture_state],
+    ["startup_gate", status.startup_gate.active ? "locked / apply config first" : "ready"],
+    ["label_flow", describeStopPhase(status.collector.stop_phase)],
     ["safety_state", status.collector.safety_state],
     ["recording", String(status.collector.recording)],
     ["seg_s", String(status.collector.segment_duration_s)],
-    ["frames", String(status.collector.buffered_frames)],
-    ["wait_label", status.pending_label.active ? "yes" : "no"],
-    ["pending", String(status.pending_label.buffered_frames)],
     ["fault_reason", status.collector.fault_reason || "-"],
   ]);
 
   renderItems(robotGrid, [
     ["robot_connected", String(status.robot.connected)],
     ["state_valid", String(status.robot.state_valid)],
-    ["image_valid", String(status.robot.image_valid)],
-    ["state_age_s", String(status.robot.state_age_s)],
-    ["image_age_s", String(status.robot.image_age_s)],
+    ["cmd", `vx ${Number(status.command.vx).toFixed(2)}  vy ${Number(status.command.vy).toFixed(2)}  wz ${Number(status.command.wz).toFixed(2)}`],
     ["body_height", String(status.robot.body_height)],
     ["roll", String(status.robot.roll)],
     ["pitch", String(status.robot.pitch)],
     ["yaw", String(status.robot.yaw)],
-    ["command_vx", String(status.command.vx)],
-    ["command_vy", String(status.command.vy)],
-    ["command_wz", String(status.command.wz)],
   ]);
 
   renderItems(processGrid, [
     ["network_interface", status.process_config.network_interface],
-    ["output_dir", status.process_config.output_dir],
-    ["loop_hz", String(status.process_config.loop_hz)],
-    ["video_poll_hz", String(status.process_config.video_poll_hz)],
     ["input_backend", status.process_config.input_backend],
-    ["input_device", status.process_config.input_device || "-"],
+    ["capture_mode", status.run_context.capture_mode],
+    ["output_dir", status.process_config.output_dir],
     ["defaults_path", status.process_config.defaults_path || "-"],
-  ]);
-
-  renderItems(pendingMeta, [
-    ["waiting_for_label", status.pending_label.active ? "yes" : "no"],
-    ["frames_in_pending_segment", String(status.pending_label.buffered_frames)],
   ]);
 
   syncConfigForm(status);
 
-  controls.start.disabled = !status.actions.can_start_recording;
+  controls.start.disabled = status.startup_gate.active || !status.actions.can_start_recording;
   controls.stop.disabled = !status.actions.can_stop_recording;
   controls.discard.disabled = !status.actions.can_discard_segment;
   controls.estop.disabled = !status.actions.can_estop;
   controls.clearFault.disabled = !status.actions.can_clear_fault;
-  controls.submitLabel.disabled = !status.actions.can_submit_label;
+  setRatingButtonsDisabled(!status.actions.can_submit_label);
 
-  const discardSelected = getCheckedValue(labelFields.segmentStatus) === "discard";
-  setRadioDisabled(labelFields.segmentStatus, !status.actions.can_submit_label);
-  setRadioDisabled(labelFields.success, discardSelected || !status.actions.can_submit_label);
-  setRadioDisabled(labelFields.terminationReason, discardSelected || !status.actions.can_submit_label);
+  if (status.robot.image_valid) {
+    const now = Date.now();
+    if (now - lastImageRefreshAt > 700) {
+      cameraThumb.src = `/api/image/latest.jpg?t=${now}`;
+      lastImageRefreshAt = now;
+    }
+    cameraThumb.hidden = false;
+    cameraMeta.textContent = `image age ${Number(status.robot.image_age_s).toFixed(2)}s`;
+  } else {
+    cameraThumb.hidden = true;
+    cameraMeta.textContent = "waiting for image...";
+  }
 }
 
 async function refreshStatus() {
@@ -166,58 +230,16 @@ async function refreshStatus() {
 
 document.getElementById("config-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const result = await postJson("/api/config/update", {
-    scene_id: configFields.sceneId.value,
-    operator_id: configFields.operatorId.value,
-    instruction: configFields.instruction.value,
-    capture_mode: configFields.captureMode.value,
-    task_family: configFields.taskFamily.value,
-    target_type: configFields.targetType.value,
-    target_description: configFields.targetDescription.value,
-    target_instance_id: configFields.targetInstanceId.value,
-    task_tags_csv: configFields.taskTagsCsv.value,
-    collector_notes: configFields.collectorNotes.value,
-    cmd_vx_max: Number(configFields.cmdVxMax.value),
-    cmd_vy_max: Number(configFields.cmdVyMax.value),
-    cmd_wz_max: Number(configFields.cmdWzMax.value),
-  });
-  setLog(JSON.stringify(result, null, 2));
-  refreshStatus();
+  await applyConfigFromForm();
 });
 
-controls.saveDefaults.addEventListener("click", async () => {
-  const result = await postJson("/api/config/save-defaults");
-  setLog(JSON.stringify(result, null, 2));
-  refreshStatus();
+Object.values(configFields).forEach((field) => {
+  const markDirty = () => {
+    configDirty = true;
+  };
+  field.addEventListener("input", markDirty);
+  field.addEventListener("change", markDirty);
 });
-
-document.getElementById("label-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const result = await postJson("/api/label/submit", {
-    segment_status: getCheckedValue(labelFields.segmentStatus),
-    success: getCheckedValue(labelFields.success),
-    termination_reason: getCheckedValue(labelFields.terminationReason),
-  });
-  setLog(JSON.stringify(result, null, 2));
-  if (result.ok) {
-    setCheckedValue(labelFields.segmentStatus, "clean");
-    setCheckedValue(labelFields.success, "success");
-    setCheckedValue(labelFields.terminationReason, "goal_reached");
-  }
-  refreshStatus();
-});
-
-Array.from(labelFields.segmentStatus).forEach((item) => {
-  item.addEventListener("change", () => {
-    const discardSelected = getCheckedValue(labelFields.segmentStatus) === "discard";
-    setRadioDisabled(labelFields.success, discardSelected);
-    setRadioDisabled(labelFields.terminationReason, discardSelected);
-  });
-});
-
-setCheckedValue(labelFields.segmentStatus, "clean");
-setCheckedValue(labelFields.success, "success");
-setCheckedValue(labelFields.terminationReason, "goal_reached");
 
 controls.start.addEventListener("click", async () => {
   setLog(JSON.stringify(await postJson("/api/control/start"), null, 2));
@@ -239,6 +261,15 @@ controls.clearFault.addEventListener("click", async () => {
   setLog(JSON.stringify(await postJson("/api/control/clear-fault"), null, 2));
   refreshStatus();
 });
+controls.quit.addEventListener("click", async () => {
+  setLog(JSON.stringify(await postJson("/api/control/quit"), null, 2));
+});
+
+Object.entries(ratingButtons).forEach(([key, button]) => {
+  button.addEventListener("click", async () => {
+    await submitRatingPreset(key);
+  });
+});
 
 document.addEventListener("keydown", async (event) => {
   if (event.repeat) {
@@ -248,23 +279,16 @@ document.addEventListener("keydown", async (event) => {
   if (activeTag === "INPUT" || activeTag === "TEXTAREA" || activeTag === "SELECT") {
     return;
   }
-  if (event.key === "f" || event.key === "F") {
-    if (controls.submitLabel.disabled) {
-      return;
-    }
+
+  if (event.key === "o" || event.key === "O") {
     event.preventDefault();
-    const result = await postJson("/api/label/submit", {
-      segment_status: getCheckedValue(labelFields.segmentStatus),
-      success: getCheckedValue(labelFields.success),
-      termination_reason: getCheckedValue(labelFields.terminationReason),
-    });
-    setLog(JSON.stringify(result, null, 2));
-    if (result.ok) {
-      setCheckedValue(labelFields.segmentStatus, "clean");
-      setCheckedValue(labelFields.success, "success");
-      setCheckedValue(labelFields.terminationReason, "goal_reached");
-    }
-    refreshStatus();
+    await applyConfigFromForm();
+    return;
+  }
+
+  if (statusCache && statusCache.actions.can_submit_label && ["1", "2", "3", "4"].includes(event.key)) {
+    event.preventDefault();
+    await submitRatingPreset(event.key);
   }
 });
 

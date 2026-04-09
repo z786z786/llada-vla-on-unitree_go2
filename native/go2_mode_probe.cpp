@@ -46,7 +46,7 @@ int main(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::cerr << "Usage: " << argv[0] << " networkInterface" << std::endl;
+        std::cerr << "用法: " << argv[0] << " networkInterface" << std::endl;
         return 2;
     }
 
@@ -63,22 +63,22 @@ int main(int argc, char** argv)
         std::string modeName;
         const int32_t modeRet = motionSwitcher.CheckMode(form, modeName);
 
-        std::cout << "CheckMode ret: " << modeRet << std::endl;
+        std::cout << "CheckMode 返回值：" << modeRet << std::endl;
         if (modeRet != 0)
         {
-            std::cout << "Motion mode: unknown (CheckMode failed or timed out)" << std::endl;
+            std::cout << "运动模式：未知（CheckMode 失败或超时）" << std::endl;
         }
         else if (modeName.empty())
         {
-            std::cout << "Motion mode: release/low-level or inactive" << std::endl;
+            std::cout << "运动模式：release/低层模式或未激活" << std::endl;
         }
         else
         {
-            std::cout << "Motion mode: form=" << form << " name=" << modeName;
+            std::cout << "运动模式：form=" << form << " 名称=" << modeName;
             const std::string alias = ServiceAlias(form, modeName);
             if (!alias.empty())
             {
-                std::cout << " alias=" << alias;
+                std::cout << " 别名=" << alias;
             }
             std::cout << std::endl;
         }
@@ -89,13 +89,13 @@ int main(int argc, char** argv)
 
         std::vector<unitree::robot::go2::ServiceState> services;
         const int32_t listRet = robotState.ServiceList(services);
-        std::cout << "ServiceList ret: " << listRet << std::endl;
-        std::cout << "serviceStateList size: " << services.size() << std::endl;
+        std::cout << "ServiceList 返回值：" << listRet << std::endl;
+        std::cout << "serviceStateList 数量：" << services.size() << std::endl;
         for (const auto& service : services)
         {
-            std::cout << "name=" << service.name
-                      << " status=" << service.status
-                      << " protect=" << service.protect << std::endl;
+            std::cout << "名称=" << service.name
+                      << " 状态=" << service.status
+                      << " 保护=" << service.protect << std::endl;
         }
 
         unitree::robot::ChannelFactory::Instance()->Release();
@@ -103,11 +103,11 @@ int main(int argc, char** argv)
     }
     catch (const std::exception& ex)
     {
-        std::cerr << "go2_mode_probe fatal error: " << ex.what() << std::endl;
+        std::cerr << "go2_mode_probe 致命错误：" << ex.what() << std::endl;
     }
     catch (...)
     {
-        std::cerr << "go2_mode_probe fatal error: unknown exception" << std::endl;
+        std::cerr << "go2_mode_probe 致命错误：未知异常" << std::endl;
     }
 
     return 1;

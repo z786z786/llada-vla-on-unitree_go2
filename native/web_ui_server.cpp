@@ -117,6 +117,7 @@ std::string MakeJsonStatus(const UiStatusSnapshot& status)
         << "\"session_dir\":" << JsonString(status.sessionDir) << ","
         << "\"capture_mode\":" << JsonString(status.captureMode) << ","
         << "\"capture_state\":" << JsonString(status.captureState) << ","
+        << "\"stop_phase\":" << JsonString(status.stopPhase) << ","
         << "\"safety_state\":" << JsonString(status.safetyState) << ","
         << "\"fault_reason\":" << JsonString(status.faultReason) << ","
         << "\"recording\":" << BoolJson(status.recording) << ","
@@ -147,8 +148,6 @@ std::string MakeJsonStatus(const UiStatusSnapshot& status)
         << "\"task_family\":" << JsonString(status.taskFamily) << ","
         << "\"target_type\":" << JsonString(status.targetType) << ","
         << "\"target_description\":" << JsonString(status.targetDescription) << ","
-        << "\"target_instance_id\":" << JsonString(status.targetInstanceId) << ","
-        << "\"task_tags_csv\":" << JsonString(status.taskTagsCsv) << ","
         << "\"collector_notes\":" << JsonString(status.collectorNotes) << ","
         << "\"cmd_vx_max\":" << status.cmdVxMax << ","
         << "\"cmd_vy_max\":" << status.cmdVyMax << ","
@@ -175,6 +174,10 @@ std::string MakeJsonStatus(const UiStatusSnapshot& status)
         << "\"can_submit_label\":" << BoolJson(status.actions.canSubmitLabel) << ","
         << "\"can_estop\":" << BoolJson(status.actions.canEstop) << ","
         << "\"can_clear_fault\":" << BoolJson(status.actions.canClearFault)
+        << "},"
+        << "\"startup_gate\":{"
+        << "\"active\":" << BoolJson(status.startupGateActive) << ","
+        << "\"prompt\":" << JsonString(status.startupPrompt)
         << "},"
         << "\"web_ui\":{"
         << "\"enabled\":" << BoolJson(status.webUiEnabled) << ","
@@ -370,6 +373,24 @@ std::string BuildHttpResponse(
     return oss.str();
 }
 
+std::string BuildBinaryHttpResponse(
+    int statusCode,
+    const std::string& statusText,
+    const std::string& contentType,
+    const std::vector<uint8_t>& body)
+{
+    std::ostringstream oss;
+    oss << "HTTP/1.1 " << statusCode << " " << statusText << "\r\n"
+        << "Content-Type: " << contentType << "\r\n"
+        << "Content-Length: " << body.size() << "\r\n"
+        << "Cache-Control: no-store\r\n"
+        << "Connection: close\r\n"
+        << "Access-Control-Allow-Origin: *\r\n\r\n";
+    std::string response = oss.str();
+    response.append(reinterpret_cast<const char*>(body.data()), body.size());
+    return response;
+}
+
 } // namespace
 
 struct WebUiServer::Impl
@@ -488,26 +509,38 @@ struct WebUiServer::Impl
 
     void HandleGet(int clientFd, const HttpRequest& request)
     {
-        if (request.path == "/api/status")
+        const std::string path = request.path.substr(0, request.path.find('?'));
+        if (path == "/api/status")
         {
             const std::string body = MakeJsonStatus(config.statusProvider());
             SendAll(clientFd, BuildHttpResponse(200, "OK", "application/json; charset=utf-8", body));
             return;
         }
+        if (path == "/api/image/latest.jpg")
+        {
+            const std::vector<uint8_t> jpegBytes = config.latestImageJpegProvider ? config.latestImageJpegProvider() : std::vector<uint8_t>{};
+            if (jpegBytes.empty())
+            {
+                SendAll(clientFd, BuildHttpResponse(404, "Not Found", "text/plain; charset=utf-8", "image unavailable"));
+                return;
+            }
+            SendAll(clientFd, BuildBinaryHttpResponse(200, "OK", "image/jpeg", jpegBytes));
+            return;
+        }
 
         std::string assetName;
         std::string contentType;
-        if (request.path == "/" || request.path == "/index.html")
+        if (path == "/" || path == "/index.html")
         {
             assetName = "index.html";
             contentType = "text/html; charset=utf-8";
         }
-        else if (request.path == "/app.js")
+        else if (path == "/app.js")
         {
             assetName = "app.js";
             contentType = "application/javascript; charset=utf-8";
         }
-        else if (request.path == "/style.css")
+        else if (path == "/style.css")
         {
             assetName = "style.css";
             contentType = "text/css; charset=utf-8";
@@ -530,7 +563,11 @@ struct WebUiServer::Impl
     void HandlePost(int clientFd, const HttpRequest& request)
     {
         UiActionResult result;
-        if (request.path == "/api/control/start")
+        if (request.path == "/api/control/ack-startup")
+        {
+            result = config.acknowledgeStartupHandler();
+        }
+        else if (request.path == "/api/control/start")
         {
             result = config.startHandler();
         }
@@ -550,6 +587,10 @@ struct WebUiServer::Impl
         {
             result = config.clearFaultHandler();
         }
+        else if (request.path == "/api/control/quit")
+        {
+            result = config.quitHandler();
+        }
         else if (request.path == "/api/label/submit")
         {
             SegmentLabelInput input;
@@ -568,8 +609,6 @@ struct WebUiServer::Impl
             input.taskFamily = ExtractJsonStringField(request.body, "task_family").value_or("");
             input.targetType = ExtractJsonStringField(request.body, "target_type").value_or("");
             input.targetDescription = ExtractJsonStringField(request.body, "target_description").value_or("");
-            input.targetInstanceId = ExtractJsonStringField(request.body, "target_instance_id").value_or("");
-            input.taskTagsCsv = ExtractJsonStringField(request.body, "task_tags_csv").value_or("");
             input.collectorNotes = ExtractJsonStringField(request.body, "collector_notes").value_or("");
             input.cmdVxMax = ExtractJsonNumberField(request.body, "cmd_vx_max").value_or(0.0);
             input.cmdVyMax = ExtractJsonNumberField(request.body, "cmd_vy_max").value_or(0.0);
@@ -578,7 +617,19 @@ struct WebUiServer::Impl
         }
         else if (request.path == "/api/config/save-defaults")
         {
-            result = config.saveDefaultsHandler();
+            UiConfigUpdateInput input;
+            input.sceneId = ExtractJsonStringField(request.body, "scene_id").value_or("");
+            input.operatorId = ExtractJsonStringField(request.body, "operator_id").value_or("");
+            input.instruction = ExtractJsonStringField(request.body, "instruction").value_or("");
+            input.captureMode = ExtractJsonStringField(request.body, "capture_mode").value_or("");
+            input.taskFamily = ExtractJsonStringField(request.body, "task_family").value_or("");
+            input.targetType = ExtractJsonStringField(request.body, "target_type").value_or("");
+            input.targetDescription = ExtractJsonStringField(request.body, "target_description").value_or("");
+            input.collectorNotes = ExtractJsonStringField(request.body, "collector_notes").value_or("");
+            input.cmdVxMax = ExtractJsonNumberField(request.body, "cmd_vx_max").value_or(0.0);
+            input.cmdVyMax = ExtractJsonNumberField(request.body, "cmd_vy_max").value_or(0.0);
+            input.cmdWzMax = ExtractJsonNumberField(request.body, "cmd_wz_max").value_or(0.0);
+            result = config.saveDefaultsHandler(input);
         }
         else
         {

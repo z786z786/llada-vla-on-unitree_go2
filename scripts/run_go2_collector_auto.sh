@@ -28,31 +28,31 @@ EXTRA_ARGS=()
 
 usage() {
   cat <<'EOF'
-Usage:
+用法：
   ./scripts/run_go2_collector_auto.sh --scene-id SCENE --operator-id OP --instruction TEXT [options] [-- extra collector args]
 
-Required:
+必填参数：
   --scene-id TEXT
   --operator-id TEXT
   --instruction TEXT
 
-Optional:
-  --network-interface IFACE   Default: auto-detect preferred Go2 ethernet interface
-  --input-backend MODE        Default: evdev
-  --input-device PATH         Default: /dev/input/by-id/usb-Parallels_Virtual_Keyboard_KBD1.1-if01-event-kbd
-  --capture-mode MODE         Default: trajectory
-  --local-ipv4-cidr CIDR      Default: 192.168.123.222/24
+可选参数：
+  --network-interface IFACE   默认：自动检测首选 Go2 有线网卡
+  --input-backend MODE        默认：evdev
+  --input-device PATH         默认：/dev/input/by-id/usb-Parallels_Virtual_Keyboard_KBD1.1-if01-event-kbd
+  --capture-mode MODE         默认：trajectory
+  --local-ipv4-cidr CIDR      默认：192.168.123.222/24
   --task-family TEXT
   --target-type TEXT
   --target-description TEXT
   --target-instance-id TEXT
   --task-tags CSV
   --collector-notes TEXT
-  --no-auto-network           Do not bring up/configure the Go2 interface automatically
-  --no-auto-input-group       Do not re-exec through sg input automatically
+  --no-auto-network           不要自动拉起/配置 Go2 网卡
+  --no-auto-input-group       不要自动通过 sg input 重新执行
   -h, --help
 
-Examples:
+示例：
   ./scripts/run_go2_collector_auto.sh \
     --scene-id earth \
     --operator-id wxh \
@@ -282,7 +282,7 @@ build_collector_cmd() {
 }
 
 if [[ -z "${SCENE_ID}" || -z "${OPERATOR_ID}" || -z "${INSTRUCTION}" ]]; then
-  echo "--scene-id, --operator-id, and --instruction are required." >&2
+  echo "--scene-id、--operator-id 和 --instruction 为必填参数。" >&2
   usage >&2
   exit 1
 fi
@@ -309,7 +309,7 @@ if [[ "${AUTO_CONFIGURE_NETWORK}" -eq 1 ]]; then
   echo "IPv4 status for ${NETWORK_INTERFACE}:"
   ip -4 addr show dev "${NETWORK_INTERFACE}" | sed 's/^/  /'
 fi
-echo "Running collector:"
+echo "即将运行 collector："
 printf '  %q' "${CMD[@]}"
 printf '\n'
 

@@ -37,9 +37,9 @@ CONTROL_ACTION_LIMITS = {
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Validate Go2 collector sessions for training readiness")
-    parser.add_argument("--dataset-root", type=Path, required=True, help="Dataset root or parent directory containing session roots")
-    parser.add_argument("--report-path", type=Path, help="Optional path to write the validation report as JSON")
+    parser = argparse.ArgumentParser(description="验证 Go2 collector session 是否具备训练可用性")
+    parser.add_argument("--dataset-root", type=Path, required=True, help="数据集根目录，或包含多个 session 根目录的父目录")
+    parser.add_argument("--report-path", type=Path, help="可选：将验证报告写入 JSON 文件的路径")
     return parser
 
 
@@ -74,8 +74,6 @@ def _validate_episode(session_root: Path, episode_path: Path) -> Dict[str, Any]:
     task_family = str(task_metadata.get("task_family") or infer_task_family(instruction))
     target_type = str(task_metadata.get("target_type") or "")
     target_description = str(task_metadata.get("target_description") or "")
-    target_instance_id = str(task_metadata.get("target_instance_id") or "")
-    task_tags = list(task_metadata.get("task_tags") or [])
     frames = list(payload.get("frames") or [])
 
     issues = {"fatal": [], "warning": [], "info": []}
@@ -102,9 +100,6 @@ def _validate_episode(session_root: Path, episode_path: Path) -> Dict[str, Any]:
         _add_issue(issues, "warning", "visual_following_target_not_person")
     if task_family == "legacy_motion" and instruction not in CONTROLLED_INSTRUCTIONS:
         _add_issue(issues, "warning", "legacy_motion_instruction_unrecognized")
-    if task_tags:
-        _add_issue(issues, "info", "has_task_tags")
-
     previous_timestamp: Optional[float] = None
     max_state_action_delta = 0.0
     max_state_image_delta = 0.0
@@ -163,8 +158,6 @@ def _validate_episode(session_root: Path, episode_path: Path) -> Dict[str, Any]:
         "task_family": task_family,
         "target_type": target_type,
         "target_description": target_description,
-        "target_instance_id": target_instance_id,
-        "task_tags": task_tags,
         "scene_id": scene_id,
         "operator_id": operator_id,
         "num_frames": len(frames),

@@ -25,16 +25,16 @@ from llada_vla_common import (
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Convert Go2 collector sessions into train/val/test manifests")
-    parser.add_argument("--raw-root", type=Path, default=Path(__file__).resolve().parent.parent / "data", help="Root containing raw session directories")
-    parser.add_argument("--output-root", type=Path, required=True, help="Destination directory for converted manifests")
-    parser.add_argument("--action-horizon", type=int, default=4, help="Future action steps to include in each action chunk")
-    parser.add_argument("--min-episode-length", type=int, default=1, help="Drop episodes shorter than this many frames before conversion")
-    parser.add_argument("--split-mode", choices=["auto", "by_session", "by_trajectory"], default="auto", help="How to assign train/val/test splits")
-    parser.add_argument("--train-ratio", type=float, default=0.8, help="Training split ratio")
-    parser.add_argument("--val-ratio", type=float, default=0.1, help="Validation split ratio")
-    parser.add_argument("--test-ratio", type=float, default=0.1, help="Test split ratio")
-    parser.add_argument("--overwrite", action="store_true", help="Remove an existing output directory before writing")
+    parser = argparse.ArgumentParser(description="将 Go2 collector session 转换为 train/val/test 清单")
+    parser.add_argument("--raw-root", type=Path, default=Path(__file__).resolve().parent.parent / "data", help="包含原始 session 目录的根路径")
+    parser.add_argument("--output-root", type=Path, required=True, help="转换后清单的输出目录")
+    parser.add_argument("--action-horizon", type=int, default=4, help="每个 action chunk 中包含的未来动作步数")
+    parser.add_argument("--min-episode-length", type=int, default=1, help="转换前丢弃长度小于该值的 episode")
+    parser.add_argument("--split-mode", choices=["auto", "by_session", "by_trajectory"], default="auto", help="train/val/test 划分方式")
+    parser.add_argument("--train-ratio", type=float, default=0.8, help="训练集比例")
+    parser.add_argument("--val-ratio", type=float, default=0.1, help="验证集比例")
+    parser.add_argument("--test-ratio", type=float, default=0.1, help="测试集比例")
+    parser.add_argument("--overwrite", action="store_true", help="写入前删除已有输出目录")
     return parser
 
 
@@ -113,12 +113,12 @@ def main() -> None:
 
     if output_root.exists() and any(output_root.iterdir()):
         if not args.overwrite:
-            raise FileExistsError(f"output directory already exists and is not empty: {output_root}")
+            raise FileExistsError(f"输出目录已存在且非空：{output_root}")
         shutil.rmtree(output_root)
 
     discovered_session_roots = discover_session_roots(raw_root)
     if not discovered_session_roots:
-        raise FileNotFoundError(f"no session roots found under {raw_root}")
+        raise FileNotFoundError(f"在以下路径下没有找到 session 根目录：{raw_root}")
 
     samples: List[Sample] = []
     retained_session_roots: List[Path] = []
@@ -134,7 +134,7 @@ def main() -> None:
         retained_session_roots.append(session_root)
 
     if not samples:
-        raise RuntimeError(f"no samples found under {raw_root}")
+        raise RuntimeError(f"在以下路径下没有找到样本：{raw_root}")
 
     split_samples = assign_splits(
         samples,
@@ -164,22 +164,22 @@ def main() -> None:
         handle.write("\n")
 
     print(
-        f"Converted {stats['sample_count']} samples from {stats['session_count']} retained sessions "
+        f"已转换 {stats['sample_count']} 个样本，来自 {stats['session_count']} retained sessions "
         f"into {output_root}"
     )
-    print(f"Split counts: {stats['split_counts']}")
-    print(f"Instructions: {stats['instruction_counts']}")
+    print(f"数据划分统计：{stats['split_counts']}")
+    print(f"指令统计：{stats['instruction_counts']}")
     if stats["capture_mode_counts"]:
-        print(f"Capture modes: {stats['capture_mode_counts']}")
+        print(f"采集模式统计：{stats['capture_mode_counts']}")
     if stats["task_family_counts"]:
-        print(f"Task families: {stats['task_family_counts']}")
+        print(f"任务族统计：{stats['task_family_counts']}")
     print(
-        "Trajectory stats: "
-        f"avg_frames={stats['trajectory_metrics']['frame_count']['mean']:.2f} "
-        f"avg_duration_s={stats['trajectory_metrics']['duration_seconds']['mean']:.2f} "
-        f"avg_action_changes={stats['trajectory_metrics']['action_change_count']['mean']:.2f} "
-        f"avg_stop_ratio={stats['trajectory_metrics']['stop_ratio']['mean']:.1%} "
-        f"avg_turn_ratio={stats['trajectory_metrics']['turn_ratio']['mean']:.1%}"
+        "轨迹统计： "
+        f"平均帧数={stats['trajectory_metrics']['frame_count']['mean']:.2f} "
+        f"平均时长(秒)={stats['trajectory_metrics']['duration_seconds']['mean']:.2f} "
+        f"平均动作切换次数={stats['trajectory_metrics']['action_change_count']['mean']:.2f} "
+        f"平均停止占比={stats['trajectory_metrics']['stop_ratio']['mean']:.1%} "
+        f"平均转向占比={stats['trajectory_metrics']['turn_ratio']['mean']:.1%}"
     )
 
 

@@ -26,13 +26,13 @@ struct Config
 void PrintUsage(const char* program)
 {
     std::cout
-        << "Usage: " << program << " --network-interface IFACE [options]\n"
+        << "用法: " << program << " --network-interface IFACE [options]\n"
         << "Options:\n"
-        << "  --duration SEC          Probe duration in seconds (default: 20.0)\n"
-        << "  --poll-hz FLOAT         Poll frequency in Hz (default: 20.0)\n"
-        << "  --timeout SEC           SDK request timeout in seconds (default: 1.0)\n"
-        << "  --hash-bytes N          Bytes used for lightweight frame hash (default: 4096)\n"
-        << "  --help                  Show this help\n";
+        << "  --duration SEC          探测持续时间（秒） (default: 20.0)\n"
+        << "  --poll-hz FLOAT         轮询频率（Hz） (default: 20.0)\n"
+        << "  --timeout SEC           SDK 请求超时（秒） (default: 1.0)\n"
+        << "  --hash-bytes N          轻量帧哈希使用的字节数 (default: 4096)\n"
+        << "  --help                  显示帮助\n";
 }
 
 std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
@@ -50,7 +50,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --network-interface";
+                error = "参数缺少取值：--network-interface";
                 return std::nullopt;
             }
             config.networkInterface = argv[++index];
@@ -60,7 +60,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --duration";
+                error = "参数缺少取值：--duration";
                 return std::nullopt;
             }
             config.durationSeconds = std::stod(argv[++index]);
@@ -70,7 +70,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --poll-hz";
+                error = "参数缺少取值：--poll-hz";
                 return std::nullopt;
             }
             config.pollHz = std::stod(argv[++index]);
@@ -80,7 +80,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --timeout";
+                error = "参数缺少取值：--timeout";
                 return std::nullopt;
             }
             config.timeoutSeconds = std::stod(argv[++index]);
@@ -90,35 +90,35 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             if (index + 1 >= argc)
             {
-                error = "missing value for --hash-bytes";
+                error = "参数缺少取值：--hash-bytes";
                 return std::nullopt;
             }
             config.hashBytes = static_cast<size_t>(std::stoull(argv[++index]));
             continue;
         }
 
-        error = "unknown argument: " + arg;
+        error = "未知参数：" + arg;
         return std::nullopt;
     }
 
     if (config.networkInterface.empty())
     {
-        error = "--network-interface is required";
+        error = "--network-interface 为必填参数";
         return std::nullopt;
     }
     if (config.durationSeconds <= 0.0)
     {
-        error = "--duration must be positive";
+        error = "--duration 必须为正数";
         return std::nullopt;
     }
     if (config.pollHz <= 0.0)
     {
-        error = "--poll-hz must be positive";
+        error = "--poll-hz 必须为正数";
         return std::nullopt;
     }
     if (config.timeoutSeconds <= 0.0)
     {
-        error = "--timeout must be positive";
+        error = "--timeout 必须为正数";
         return std::nullopt;
     }
 
@@ -162,7 +162,7 @@ int main(int argc, char** argv)
         {
             if (!error.empty())
             {
-                std::cerr << "go2_video_probe argument error: " << error << std::endl;
+                std::cerr << "go2_video_probe 参数错误：" << error << std::endl;
                 return 2;
             }
             return 0;
@@ -305,11 +305,11 @@ int main(int argc, char** argv)
     }
     catch (const std::exception& ex)
     {
-        std::cerr << "go2_video_probe fatal error: " << ex.what() << std::endl;
+        std::cerr << "go2_video_probe 致命错误：" << ex.what() << std::endl;
     }
     catch (...)
     {
-        std::cerr << "go2_video_probe fatal error: unknown exception" << std::endl;
+        std::cerr << "go2_video_probe 致命错误：未知异常" << std::endl;
     }
 
     return 1;
