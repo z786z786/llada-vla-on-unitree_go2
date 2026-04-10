@@ -887,66 +887,6 @@ void ApplyCollectorDefaults(const fs::path& collectorRoot, Config& config)
     }
 }
 
-void SaveDefaultsFile(const fs::path& defaultsPath, const EditableCollectorConfig& config)
-{
-    const fs::path parentDir = defaultsPath.parent_path();
-    std::error_code error;
-    if (!parentDir.empty())
-    {
-        fs::create_directories(parentDir, error);
-        if (error)
-        {
-            throw std::runtime_error("创建 collector 默认配置目录失败: " + error.message());
-        }
-    }
-
-    const fs::path tempPath = defaultsPath.string() + ".tmp";
-    try
-    {
-        std::ofstream output(tempPath, std::ios::out | std::ios::trunc);
-        if (!output.is_open())
-        {
-            throw std::runtime_error("写入 collector 默认配置失败: 无法打开临时文件");
-        }
-
-        output << "{\n"
-               << "  \"scene_id\": " << JsonString(config.sceneId) << ",\n"
-               << "  \"operator_id\": " << JsonString(config.operatorId) << ",\n"
-               << "  \"instruction\": " << JsonString(config.instruction) << ",\n"
-               << "  \"capture_mode\": " << JsonString(CaptureModeName(config.captureMode)) << ",\n"
-               << "  \"task_family\": " << JsonString(config.taskFamily) << ",\n"
-               << "  \"target_type\": " << JsonString(config.targetType) << ",\n"
-               << "  \"target_description\": " << JsonString(config.targetDescription) << ",\n"
-               << "  \"collector_notes\": " << JsonString(config.collectorNotes) << ",\n"
-               << "  \"cmd_vx_max\": " << config.cmdVxMax << ",\n"
-               << "  \"cmd_vy_max\": " << config.cmdVyMax << ",\n"
-               << "  \"cmd_wz_max\": " << config.cmdWzMax << "\n"
-               << "}\n";
-        output.flush();
-        if (!output.good())
-        {
-            throw std::runtime_error("写入 collector 默认配置失败: 写入未完成");
-        }
-        output.close();
-        if (!output.good())
-        {
-            throw std::runtime_error("写入 collector 默认配置失败: 关闭文件时出错");
-        }
-
-        fs::rename(tempPath, defaultsPath, error);
-        if (error)
-        {
-            throw std::runtime_error("替换 collector 默认配置失败: " + error.message());
-        }
-    }
-    catch (...)
-    {
-        std::error_code removeError;
-        fs::remove(tempPath, removeError);
-        throw;
-    }
-}
-
 std::optional<Config::InputBackend> ParseInputBackend(const std::string& value)
 {
     if (value == "wireless" || value == "wireless_controller" || value == "controller" || value == "gamepad")
@@ -2063,142 +2003,6 @@ public:
         return editableConfig_;
     }
 
-    UiActionResult BuildEditableConfigFromInput(const UiConfigUpdateInput& input, EditableCollectorConfig* updatedOut) const
-    {
-        EditableCollectorConfig updated = GetEditableConfigSnapshot();
-        const auto loggerStatus = logger_.GetStatus();
-        CaptureState captureState;
-        {
-            std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            captureState = captureState_;
-        }
-        updated.sceneId = Trim(input.sceneId);
-        updated.operatorId = Trim(input.operatorId);
-        updated.instruction = Trim(input.instruction);
-        updated.taskFamily = Trim(input.taskFamily);
-        updated.targetType = Trim(input.targetType);
-        updated.targetDescription = Trim(input.targetDescription);
-        updated.collectorNotes = Trim(input.collectorNotes);
-        updated.cmdVxMax = input.cmdVxMax;
-        updated.cmdVyMax = input.cmdVyMax;
-        updated.cmdWzMax = input.cmdWzMax;
-
-        const auto captureMode = ParseCaptureMode(Trim(input.captureMode));
-        if (!captureMode.has_value())
-        {
-            return ActionError("validation_error", "capture_mode 非法");
-        }
-        updated.captureMode = captureMode.value();
-
-        const UiActionResult validation = ValidateEditableConfigForUse(updated, captureState, loggerStatus.pendingLabel);
-        if (!validation.ok)
-        {
-            return validation;
-        }
-
-        *updatedOut = updated;
-        return ActionOk("collector config valid");
-    }
-
-    UiActionResult CommitEditableConfig(const EditableCollectorConfig& updated, bool unlockStartupGate, bool emitUnlockLog)
-    {
-        {
-            std::lock_guard<std::mutex> lock(editableConfigMutex_);
-            editableConfig_ = updated;
-        }
-
-        bool unlocked = false;
-        if (unlockStartupGate)
-        {
-            std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            if (startupGateActive_)
-            {
-                startupGateActive_ = false;
-                lastStartupGateReminder_ = std::chrono::steady_clock::time_point{};
-                unlocked = true;
-            }
-        }
-
-        if (unlocked)
-        {
-            ResetActiveMotionKeys();
-            if (emitUnlockLog)
-            {
-                PrintLine("collector 参数已应用；已解锁移动与录制，可立即开始采集");
-            }
-            return ActionOk("collector 参数已应用；已解锁移动与录制");
-        }
-        return ActionOk("collector 参数已更新，将用于后续采集段");
-    }
-
-    UiActionResult UpdateEditableConfig(const UiConfigUpdateInput& input)
-    {
-        EditableCollectorConfig updated;
-        const UiActionResult validationResult = BuildEditableConfigFromInput(input, &updated);
-        if (!validationResult.ok)
-        {
-            return validationResult;
-        }
-        try
-        {
-            SaveDefaultsFile(CollectorDefaultsPath(config_.collectorRoot), updated);
-        }
-        catch (const std::exception& ex)
-        {
-            return ActionError("save_defaults_failed", ex.what());
-        }
-
-        const bool wasLocked = IsStartupGateActive();
-        const UiActionResult applyResult = CommitEditableConfig(updated, true, false);
-        if (!applyResult.ok)
-        {
-            return applyResult;
-        }
-
-        if (wasLocked)
-        {
-            PrintLine("collector 参数已应用并保存为默认值；已解锁移动与录制，可立即开始采集");
-            return ActionOk("collector 参数已应用并保存为默认值；已解锁移动与录制");
-        }
-        PrintLine("collector 参数已更新并保存为默认值，将用于后续采集段");
-        return ActionOk("collector 参数已更新并保存为默认值，将用于后续采集段");
-    }
-
-    UiActionResult SaveEditableConfigAsDefaults(const UiConfigUpdateInput& input)
-    {
-        EditableCollectorConfig updated;
-        const UiActionResult validationResult = BuildEditableConfigFromInput(input, &updated);
-        if (!validationResult.ok)
-        {
-            return validationResult;
-        }
-        try
-        {
-            SaveDefaultsFile(CollectorDefaultsPath(config_.collectorRoot), updated);
-            const UiActionResult applyResult = CommitEditableConfig(updated, false, false);
-            if (!applyResult.ok)
-            {
-                return applyResult;
-            }
-            return ActionOk("已保存为下次启动默认值");
-        }
-        catch (const std::exception& ex)
-        {
-            return ActionError("save_defaults_failed", ex.what());
-        }
-    }
-
-    bool IsStartupGateActive() const
-    {
-        std::lock_guard<std::mutex> lock(stateMachineMutex_);
-        return startupGateActive_;
-    }
-
-    UiActionResult RuntimeConfigReadOnlyResult() const
-    {
-        return ActionError("read_only", "collector 运行参数在启动时固定；请修改启动命令后重启 collector");
-    }
-
     void MaybePrintStartupGateReminder()
     {
         bool shouldPrint = false;
@@ -2265,50 +2069,6 @@ public:
         std::cout << "  当前模式：capture_mode=" << CaptureModeName(editable.captureMode)
                   << " input_backend=" << InputBackendName(config_.inputBackend) << std::endl;
         std::cout << "  " << StartupPromptText(config_.inputBackend) << std::endl;
-    }
-
-    UiActionResult ValidateEditableConfigForUse(
-        const EditableCollectorConfig& updated,
-        CaptureState captureState,
-        bool hasPendingLabel) const
-    {
-        if (updated.sceneId.empty())
-        {
-            return ActionError("validation_error", "scene_id 不能为空");
-        }
-        if (updated.operatorId.empty())
-        {
-            return ActionError("validation_error", "operator_id 不能为空");
-        }
-        if (updated.captureMode == Config::CaptureMode::Trajectory && updated.instruction.empty())
-        {
-            return ActionError("validation_error", "trajectory 模式下 instruction 不能为空");
-        }
-        if (updated.cmdVxMax <= 0.0 || updated.cmdVyMax <= 0.0 || updated.cmdWzMax <= 0.0)
-        {
-            return ActionError("validation_error", "速度上限必须为正数");
-        }
-        if (updated.captureMode != GetEditableConfigSnapshot().captureMode &&
-            (captureState == CaptureState::Capturing ||
-             captureState == CaptureState::Armed ||
-             captureState == CaptureState::DelayBeforeLog ||
-             hasPendingLabel))
-        {
-            return ActionError("invalid_state", "当前有活动区间时不能切换 capture_mode");
-        }
-        return ActionOk("collector config valid");
-    }
-
-    UiActionResult AcknowledgeStartupAndEnterReady(bool emitLog)
-    {
-        const UiActionResult result = config_.inputBackend == Config::InputBackend::WirelessController
-                                          ? ActionError("unsupported", StartupUnlockHint(config_.inputBackend))
-                                          : RuntimeConfigReadOnlyResult();
-        if (emitLog)
-        {
-            PrintLine(result.message);
-        }
-        return result;
     }
 
     void ResetTrajectoryStopFlowLocked()
@@ -2390,7 +2150,6 @@ public:
             webConfig.port = config_.webPort;
             webConfig.assetDir = (config_.collectorRoot / "native" / "web_ui_assets").string();
             webConfig.statusProvider = [this]() { return GetUiStatusSnapshot(); };
-            webConfig.acknowledgeStartupHandler = [this]() { return RequestAcknowledgeStartup(); };
             webConfig.startHandler = [this]() { return RequestBeginSegment(); };
             webConfig.stopHandler = [this]() { return RequestStopSegmentForLabel(); };
             webConfig.discardHandler = [this]() { return RequestDiscardSegment("discarded by web ui"); };
@@ -2400,14 +2159,6 @@ public:
             webConfig.submitLabelHandler = [this](const SegmentLabelInput& input)
             {
                 return SubmitPendingLabel(input);
-            };
-            webConfig.updateConfigHandler = [this](const UiConfigUpdateInput&)
-            {
-                return RuntimeConfigReadOnlyResult();
-            };
-            webConfig.saveDefaultsHandler = [this](const UiConfigUpdateInput&)
-            {
-                return RuntimeConfigReadOnlyResult();
             };
             webConfig.latestImageJpegProvider = [this]() { return GetLatestImageJpeg(); };
             webConfig.nextImageFrameProvider = [this](uint64_t lastSequence, int timeoutMs)
@@ -2595,15 +2346,6 @@ public:
     UiActionResult RequestBeginSegment()
     {
         return BeginSegmentInternal(true);
-    }
-
-    UiActionResult RequestAcknowledgeStartup()
-    {
-        if (config_.inputBackend == Config::InputBackend::WirelessController)
-        {
-            return ActionError("unsupported", "collector 不需要 Apply；请直接按原生手柄 Start，检测到后即可开始采集");
-        }
-        return RuntimeConfigReadOnlyResult();
     }
 
     UiActionResult RequestStopSegmentForLabel()

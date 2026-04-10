@@ -91,27 +91,11 @@ struct UiStatusSnapshot
     UiActionAvailability actions;
 };
 
-struct UiConfigUpdateInput
-{
-    std::string sceneId;
-    std::string operatorId;
-    std::string instruction;
-    std::string captureMode;
-    std::string taskFamily;
-    std::string targetType;
-    std::string targetDescription;
-    std::string collectorNotes;
-    double cmdVxMax = 0.0;
-    double cmdVyMax = 0.0;
-    double cmdWzMax = 0.0;
-};
-
 struct WebUiServerConfig
 {
     int port = 8080;
     std::string assetDir;
     std::function<UiStatusSnapshot()> statusProvider;
-    std::function<UiActionResult()> acknowledgeStartupHandler;
     std::function<UiActionResult()> startHandler;
     std::function<UiActionResult()> stopHandler;
     std::function<UiActionResult()> discardHandler;
@@ -119,8 +103,6 @@ struct WebUiServerConfig
     std::function<UiActionResult()> clearFaultHandler;
     std::function<UiActionResult()> quitHandler;
     std::function<UiActionResult(const SegmentLabelInput&)> submitLabelHandler;
-    std::function<UiActionResult(const UiConfigUpdateInput&)> updateConfigHandler;
-    std::function<UiActionResult(const UiConfigUpdateInput&)> saveDefaultsHandler;
     std::function<std::vector<uint8_t>()> latestImageJpegProvider;
     std::function<UiImageFrame(uint64_t, int)> nextImageFrameProvider;
 };

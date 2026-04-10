@@ -253,40 +253,6 @@ std::optional<std::string> ExtractJsonStringField(const std::string& body, const
     return std::nullopt;
 }
 
-std::optional<double> ExtractJsonNumberField(const std::string& body, const std::string& key)
-{
-    const std::string marker = "\"" + key + "\"";
-    const size_t keyPos = body.find(marker);
-    if (keyPos == std::string::npos)
-    {
-        return std::nullopt;
-    }
-    const size_t colonPos = body.find(':', keyPos + marker.size());
-    if (colonPos == std::string::npos)
-    {
-        return std::nullopt;
-    }
-    size_t begin = body.find_first_of("-0123456789", colonPos + 1);
-    if (begin == std::string::npos)
-    {
-        return std::nullopt;
-    }
-    size_t end = begin;
-    while (end < body.size() &&
-           (std::isdigit(static_cast<unsigned char>(body[end])) || body[end] == '.' || body[end] == '-'))
-    {
-        ++end;
-    }
-    try
-    {
-        return std::stod(body.substr(begin, end - begin));
-    }
-    catch (...)
-    {
-        return std::nullopt;
-    }
-}
-
 struct HttpRequest
 {
     std::string method;
@@ -635,11 +601,7 @@ struct WebUiServer::Impl
     void HandlePost(int clientFd, const HttpRequest& request)
     {
         UiActionResult result;
-        if (request.path == "/api/control/ack-startup")
-        {
-            result = config.acknowledgeStartupHandler();
-        }
-        else if (request.path == "/api/control/start")
+        if (request.path == "/api/control/start")
         {
             result = config.startHandler();
         }
@@ -670,38 +632,6 @@ struct WebUiServer::Impl
             input.success = ExtractJsonStringField(request.body, "success").value_or("");
             input.terminationReason = ExtractJsonStringField(request.body, "termination_reason").value_or("");
             result = config.submitLabelHandler(input);
-        }
-        else if (request.path == "/api/config/update")
-        {
-            UiConfigUpdateInput input;
-            input.sceneId = ExtractJsonStringField(request.body, "scene_id").value_or("");
-            input.operatorId = ExtractJsonStringField(request.body, "operator_id").value_or("");
-            input.instruction = ExtractJsonStringField(request.body, "instruction").value_or("");
-            input.captureMode = ExtractJsonStringField(request.body, "capture_mode").value_or("");
-            input.taskFamily = ExtractJsonStringField(request.body, "task_family").value_or("");
-            input.targetType = ExtractJsonStringField(request.body, "target_type").value_or("");
-            input.targetDescription = ExtractJsonStringField(request.body, "target_description").value_or("");
-            input.collectorNotes = ExtractJsonStringField(request.body, "collector_notes").value_or("");
-            input.cmdVxMax = ExtractJsonNumberField(request.body, "cmd_vx_max").value_or(0.0);
-            input.cmdVyMax = ExtractJsonNumberField(request.body, "cmd_vy_max").value_or(0.0);
-            input.cmdWzMax = ExtractJsonNumberField(request.body, "cmd_wz_max").value_or(0.0);
-            result = config.updateConfigHandler(input);
-        }
-        else if (request.path == "/api/config/save-defaults")
-        {
-            UiConfigUpdateInput input;
-            input.sceneId = ExtractJsonStringField(request.body, "scene_id").value_or("");
-            input.operatorId = ExtractJsonStringField(request.body, "operator_id").value_or("");
-            input.instruction = ExtractJsonStringField(request.body, "instruction").value_or("");
-            input.captureMode = ExtractJsonStringField(request.body, "capture_mode").value_or("");
-            input.taskFamily = ExtractJsonStringField(request.body, "task_family").value_or("");
-            input.targetType = ExtractJsonStringField(request.body, "target_type").value_or("");
-            input.targetDescription = ExtractJsonStringField(request.body, "target_description").value_or("");
-            input.collectorNotes = ExtractJsonStringField(request.body, "collector_notes").value_or("");
-            input.cmdVxMax = ExtractJsonNumberField(request.body, "cmd_vx_max").value_or(0.0);
-            input.cmdVyMax = ExtractJsonNumberField(request.body, "cmd_vy_max").value_or(0.0);
-            input.cmdWzMax = ExtractJsonNumberField(request.body, "cmd_wz_max").value_or(0.0);
-            result = config.saveDefaultsHandler(input);
         }
         else
         {
