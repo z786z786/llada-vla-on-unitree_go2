@@ -31,6 +31,7 @@
 #include <unitree/robot/channel/channel_subscriber.hpp>
 #include <unitree/robot/go2/sport/sport_client.hpp>
 #include <unitree/robot/go2/video/video_client.hpp>
+#include "wireless_gamepad.h"
 #include "web_ui_server.h"
 
 namespace
@@ -55,8 +56,6 @@ constexpr float kLinearAccelPerSecond = 3.0f;
 constexpr float kLinearDecelPerSecond = 4.5f;
 constexpr float kYawAccelPerSecond = 4.5f;
 constexpr float kYawDecelPerSecond = 6.0f;
-constexpr float kWirelessControllerDeadZone = 0.12f;
-constexpr float kWirelessControllerAxisSmoothing = 0.35f;
 constexpr float kWirelessControllerDiscreteThreshold = 0.35f;
 constexpr auto kCaptureStartDelay = std::chrono::milliseconds(500);
 constexpr auto kStartupGateReminderInterval = std::chrono::seconds(2);
@@ -195,105 +194,12 @@ struct VelocityCommand
     bool valid = false;
 };
 
-union WirelessControllerKeyBits
+struct WirelessControllerSnapshot
 {
-    struct
-    {
-        uint8_t R1 : 1;
-        uint8_t L1 : 1;
-        uint8_t start : 1;
-        uint8_t select : 1;
-        uint8_t R2 : 1;
-        uint8_t L2 : 1;
-        uint8_t F1 : 1;
-        uint8_t F2 : 1;
-        uint8_t A : 1;
-        uint8_t B : 1;
-        uint8_t X : 1;
-        uint8_t Y : 1;
-        uint8_t up : 1;
-        uint8_t right : 1;
-        uint8_t down : 1;
-        uint8_t left : 1;
-    } components;
-    uint16_t value = 0;
-};
-
-struct ControllerButtonState
-{
-    bool pressed = false;
-    bool onPress = false;
-    bool onRelease = false;
-
-    void Update(bool state)
-    {
-        onPress = state && !pressed;
-        onRelease = !state && pressed;
-        pressed = state;
-    }
-};
-
-struct WirelessControllerState
-{
+    collector::input::Gamepad gamepad;
     double timestamp = 0.0;
+    uint64_t sequence = 0;
     bool valid = false;
-    float lx = 0.0f;
-    float ly = 0.0f;
-    float rx = 0.0f;
-    float ry = 0.0f;
-
-    ControllerButtonState R1;
-    ControllerButtonState L1;
-    ControllerButtonState start;
-    ControllerButtonState select;
-    ControllerButtonState R2;
-    ControllerButtonState L2;
-    ControllerButtonState F1;
-    ControllerButtonState F2;
-    ControllerButtonState A;
-    ControllerButtonState B;
-    ControllerButtonState X;
-    ControllerButtonState Y;
-    ControllerButtonState up;
-    ControllerButtonState right;
-    ControllerButtonState down;
-    ControllerButtonState left;
-
-    void Update(const unitree_go::msg::dds_::WirelessController_& message, double messageTimestamp)
-    {
-        const auto filterAxis = [](float current, float raw)
-        {
-            const float target = std::fabs(raw) < kWirelessControllerDeadZone ? 0.0f : raw;
-            return current * (1.0f - kWirelessControllerAxisSmoothing) + target * kWirelessControllerAxisSmoothing;
-        };
-
-        lx = filterAxis(lx, message.lx());
-        ly = filterAxis(ly, message.ly());
-        rx = filterAxis(rx, message.rx());
-        ry = filterAxis(ry, message.ry());
-
-        WirelessControllerKeyBits keyBits;
-        keyBits.value = message.keys();
-        R1.Update(keyBits.components.R1);
-        L1.Update(keyBits.components.L1);
-        start.Update(keyBits.components.start);
-        select.Update(keyBits.components.select);
-        R2.Update(keyBits.components.R2);
-        L2.Update(keyBits.components.L2);
-        F1.Update(keyBits.components.F1);
-        F2.Update(keyBits.components.F2);
-        A.Update(keyBits.components.A);
-        B.Update(keyBits.components.B);
-        X.Update(keyBits.components.X);
-        Y.Update(keyBits.components.Y);
-        up.Update(keyBits.components.up);
-        right.Update(keyBits.components.right);
-        down.Update(keyBits.components.down);
-        left.Update(keyBits.components.left);
-
-        timestamp = messageTimestamp;
-        valid = true;
-    }
 };
 
 struct EffectiveControlAction
@@ -2476,6 +2382,7 @@ public:
         sportClient_ = std::make_unique<unitree::robot::go2::SportClient>();
         sportClient_->SetTimeout(10.0f);
         sportClient_->Init();
+        AcquireWirelessControllerOwnership();
 
         sportStateSubscriber_ = std::make_shared<unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::SportModeState_>>(kSportStateTopic);
         sportStateSubscriber_->InitChannel(std::bind(&CollectorApp::OnSportState, this, std::placeholders::_1), 1);
@@ -2583,6 +2490,7 @@ public:
         }
 
         StopMotion();
+        ReleaseWirelessControllerOwnership();
         unitree::robot::ChannelFactory::Instance()->Release();
         CloseEvdevInput();
         terminalGuard_.Disable();
@@ -2821,10 +2729,10 @@ private:
         bool yawRight = false;
     };
 
-    WirelessControllerState GetWirelessControllerStateSnapshot() const
+    WirelessControllerSnapshot GetWirelessControllerSnapshot() const
     {
         std::lock_guard<std::mutex> lock(controllerMutex_);
-        return wirelessControllerState_;
+        return wirelessControllerSnapshot_;
     }
 
     MotionStateSnapshot GetMotionStateSnapshot() const
@@ -2832,19 +2740,19 @@ private:
         MotionStateSnapshot motionState;
         if (config_.inputBackend == Config::InputBackend::WirelessController)
         {
-            const WirelessControllerState controllerState = GetWirelessControllerStateSnapshot();
+            const WirelessControllerSnapshot controllerState = GetWirelessControllerSnapshot();
             const double ageSeconds = AgeSeconds(controllerState.timestamp, NowSeconds());
             if (!controllerState.valid || ageSeconds < 0.0 || ageSeconds > kWirelessControllerTimeoutSeconds)
             {
                 return motionState;
             }
 
-            motionState.forward = controllerState.ly > kWirelessControllerDiscreteThreshold;
-            motionState.backward = controllerState.ly < -kWirelessControllerDiscreteThreshold;
-            motionState.left = controllerState.lx < -kWirelessControllerDiscreteThreshold;
-            motionState.right = controllerState.lx > kWirelessControllerDiscreteThreshold;
-            motionState.yawLeft = controllerState.rx < -kWirelessControllerDiscreteThreshold;
-            motionState.yawRight = controllerState.rx > kWirelessControllerDiscreteThreshold;
+            motionState.forward = controllerState.gamepad.rawLy > kWirelessControllerDiscreteThreshold;
+            motionState.backward = controllerState.gamepad.rawLy < -kWirelessControllerDiscreteThreshold;
+            motionState.left = controllerState.gamepad.rawLx < -kWirelessControllerDiscreteThreshold;
+            motionState.right = controllerState.gamepad.rawLx > kWirelessControllerDiscreteThreshold;
+            motionState.yawLeft = controllerState.gamepad.rawRx < -kWirelessControllerDiscreteThreshold;
+            motionState.yawRight = controllerState.gamepad.rawRx > kWirelessControllerDiscreteThreshold;
             return motionState;
         }
 
@@ -3148,9 +3056,9 @@ private:
         LatestImage image;
         VelocityCommand command;
         const MotionStateSnapshot motionState = GetMotionStateSnapshot();
-        const WirelessControllerState controllerState =
-            config_.inputBackend == Config::InputBackend::WirelessController ? GetWirelessControllerStateSnapshot()
-                                                                             : WirelessControllerState{};
+        const WirelessControllerSnapshot controllerState =
+            config_.inputBackend == Config::InputBackend::WirelessController ? GetWirelessControllerSnapshot()
+                                                                             : WirelessControllerSnapshot{};
         {
             std::lock_guard<std::mutex> lock(stateMutex_);
             state = latestState_;
@@ -3209,9 +3117,9 @@ private:
         if (config_.inputBackend == Config::InputBackend::WirelessController)
         {
             oss << " controller_axes=("
-                << "ly=" << controllerState.ly
-                << ",lx=" << controllerState.lx
-                << ",rx=" << controllerState.rx
+                << "ly=" << controllerState.gamepad.rawLy
+                << ",lx=" << controllerState.gamepad.rawLx
+                << ",rx=" << controllerState.gamepad.rawRx
                 << ")";
         }
         else
@@ -3761,6 +3669,88 @@ private:
         }
     }
 
+    void AcquireWirelessControllerOwnership()
+    {
+        if (config_.inputBackend != Config::InputBackend::WirelessController)
+        {
+            return;
+        }
+
+        std::string error;
+        {
+            std::lock_guard<std::mutex> lock(sportClientMutex_);
+            if (!sportClient_)
+            {
+                return;
+            }
+
+            try
+            {
+                const int32_t result = sportClient_->SwitchJoystick(false);
+                if (result == 0)
+                {
+                    nativeJoystickDisabled_ = true;
+                    // Keep startup fully gated by stopping any motion that was still
+                    // latched by the robot before collector took ownership.
+                    sportClient_->StopMove();
+                }
+                else
+                {
+                    error = "collector 未能接管原生手柄移动控制，SwitchJoystick(false) 返回码=" + std::to_string(result);
+                }
+            }
+            catch (...)
+            {
+                error = "collector 未能接管原生手柄移动控制，SwitchJoystick(false) 调用失败";
+            }
+        }
+
+        if (!error.empty())
+        {
+            PrintLine(error);
+            return;
+        }
+
+        PrintLine("collector 已接管原生手柄移动控制");
+    }
+
+    void ReleaseWirelessControllerOwnership()
+    {
+        if (!nativeJoystickDisabled_)
+        {
+            return;
+        }
+
+        std::string error;
+        {
+            std::lock_guard<std::mutex> lock(sportClientMutex_);
+            if (!sportClient_)
+            {
+                nativeJoystickDisabled_ = false;
+                return;
+            }
+
+            try
+            {
+                const int32_t result = sportClient_->SwitchJoystick(true);
+                if (result != 0)
+                {
+                    error = "collector 退出时恢复原生手柄控制失败，SwitchJoystick(true) 返回码=" + std::to_string(result);
+                }
+            }
+            catch (...)
+            {
+                error = "collector 退出时恢复原生手柄控制失败，SwitchJoystick(true) 调用失败";
+            }
+        }
+
+        nativeJoystickDisabled_ = false;
+        if (!error.empty())
+        {
+            PrintLine(error);
+        }
+    }
+
     void LockMotionInstruction(MotionInstruction instruction)
     {
         if (instruction == MotionInstruction::None || instruction == MotionInstruction::Mixed)
@@ -3976,14 +3966,13 @@ private:
         float targetWz = 0.0f;
         if (config_.inputBackend == Config::InputBackend::WirelessController)
         {
-            const WirelessControllerState controllerState = GetWirelessControllerStateSnapshot();
+            const WirelessControllerSnapshot controllerState = GetWirelessControllerSnapshot();
             const double ageSeconds = AgeSeconds(controllerState.timestamp, NowSeconds());
             if (!stopRequested && controllerState.valid && ageSeconds >= 0.0 && ageSeconds <= kWirelessControllerTimeoutSeconds)
             {
-                // Unitree SDK examples use ly / -lx / -rx as the normalized locomotion axes.
-                targetVx = controllerState.ly;
-                targetVy = -controllerState.lx;
-                targetWz = -controllerState.rx;
+                targetVx = controllerState.gamepad.rawLy;
+                targetVy = -controllerState.gamepad.rawLx;
+                targetWz = -controllerState.gamepad.rawRx;
             }
         }
         else
@@ -4007,9 +3996,18 @@ private:
             targetVy /= planarNorm;
         }
 
-        smoothedVx_ = SlewTowards(smoothedVx_, targetVx, kLinearAccelPerSecond, kLinearDecelPerSecond, deltaSeconds);
-        smoothedVy_ = SlewTowards(smoothedVy_, targetVy, kLinearAccelPerSecond, kLinearDecelPerSecond, deltaSeconds);
-        smoothedWz_ = SlewTowards(smoothedWz_, targetWz, kYawAccelPerSecond, kYawDecelPerSecond, deltaSeconds);
+        if (config_.inputBackend == Config::InputBackend::WirelessController)
+        {
+            smoothedVx_ = targetVx;
+            smoothedVy_ = targetVy;
+            smoothedWz_ = targetWz;
+        }
+        else
+        {
+            smoothedVx_ = SlewTowards(smoothedVx_, targetVx, kLinearAccelPerSecond, kLinearDecelPerSecond, deltaSeconds);
+            smoothedVy_ = SlewTowards(smoothedVy_, targetVy, kLinearAccelPerSecond, kLinearDecelPerSecond, deltaSeconds);
+            smoothedWz_ = SlewTowards(smoothedWz_, targetWz, kYawAccelPerSecond, kYawDecelPerSecond, deltaSeconds);
+        }
 
         VelocityCommand command;
         command.timestamp = NowSeconds();
@@ -4125,45 +4123,45 @@ private:
         }
     }
 
-    void HandleWirelessControllerActions(const WirelessControllerState& controllerState)
+    void HandleWirelessControllerActions(const collector::input::Gamepad& gamepad)
     {
-        if (controllerState.start.onPress)
+        if (gamepad.start.onPress)
         {
             ProcessTeleopChar(kStartupAcknowledgeKey, false);
         }
-        if (controllerState.A.onPress)
+        if (gamepad.A.onPress)
         {
             ProcessTeleopChar('r', false);
         }
-        if (controllerState.B.onPress)
+        if (gamepad.B.onPress)
         {
             ProcessTeleopChar('t', false);
         }
-        if (controllerState.X.onPress)
+        if (gamepad.X.onPress)
         {
             ProcessTeleopChar(kEscapeKey, false);
         }
-        if (controllerState.R2.onPress)
+        if (gamepad.R2.onPress)
         {
             ProcessTeleopChar(' ', false);
         }
-        if (controllerState.Y.onPress)
+        if (gamepad.Y.onPress)
         {
             ProcessTeleopChar('c', false);
         }
-        if (controllerState.up.onPress)
+        if (gamepad.up.onPress)
         {
             SubmitPresetLabelShortcut('1');
         }
-        if (controllerState.right.onPress)
+        if (gamepad.right.onPress)
         {
             SubmitPresetLabelShortcut('2');
         }
-        if (controllerState.down.onPress)
+        if (gamepad.down.onPress)
         {
             SubmitPresetLabelShortcut('3');
         }
-        if (controllerState.left.onPress)
+        if (gamepad.left.onPress)
         {
             SubmitPresetLabelShortcut('4');
         }
@@ -4202,20 +4200,14 @@ private:
 
     void WirelessControllerLoop()
     {
+        uint64_t lastHandledSequence = 0;
         while (running_.load())
         {
-            WirelessControllerState controllerState;
+            const WirelessControllerSnapshot controllerState = GetWirelessControllerSnapshot();
+            if (controllerState.valid && controllerState.sequence != lastHandledSequence)
             {
-                std::lock_guard<std::mutex> lock(controllerMutex_);
-                if (wirelessControllerMessageReceived_)
-                {
-                    wirelessControllerState_.Update(wirelessControllerMessage_, wirelessControllerMessageTimestamp_);
-                }
-                controllerState = wirelessControllerState_;
-            }
-            if (controllerState.valid)
-            {
-                HandleWirelessControllerActions(controllerState);
+                lastHandledSequence = controllerState.sequence;
+                HandleWirelessControllerActions(controllerState.gamepad);
             }
 
             if (terminalRawEnabled_ && !promptActive_.load())
@@ -4398,9 +4390,10 @@ private:
     {
         const auto* controller = static_cast<const unitree_go::msg::dds_::WirelessController_*>(message);
         std::lock_guard<std::mutex> lock(controllerMutex_);
-        wirelessControllerMessage_ = *controller;
-        wirelessControllerMessageTimestamp_ = NowSeconds();
-        wirelessControllerMessageReceived_ = true;
+        wirelessControllerSnapshot_.gamepad.Update(*controller);
+        wirelessControllerSnapshot_.timestamp = NowSeconds();
+        wirelessControllerSnapshot_.sequence += 1;
+        wirelessControllerSnapshot_.valid = true;
     }
 
     void ControlLoop()
@@ -4676,10 +4669,8 @@ private:
     float smoothedVx_ = 0.0f;
     float smoothedVy_ = 0.0f;
     float smoothedWz_ = 0.0f;
-    unitree_go::msg::dds_::WirelessController_ wirelessControllerMessage_{};
-    double wirelessControllerMessageTimestamp_ = 0.0;
-    bool wirelessControllerMessageReceived_ = false;
-    WirelessControllerState wirelessControllerState_{};
+    WirelessControllerSnapshot wirelessControllerSnapshot_{};
+    bool nativeJoystickDisabled_ = false;
     int evdevFd_ = -1;
     bool terminalRawEnabled_ = false;
 
