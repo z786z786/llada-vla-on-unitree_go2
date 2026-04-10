@@ -2079,6 +2079,20 @@ public:
         trajectoryStopForceFinalizeDeadline_ = std::chrono::steady_clock::time_point{};
     }
 
+    void ResetCaptureProgressLocked(const std::string& pendingLabelFallback = std::string())
+    {
+        activeMotionInstruction_ = MotionInstruction::None;
+        captureStartDeadline_ = std::chrono::steady_clock::time_point{};
+        pendingLabelFallbackInstruction_ = pendingLabelFallback;
+        ResetTrajectoryStopFlowLocked();
+    }
+
+    void EnterIdleOrFaultStateLocked(const std::string& pendingLabelFallback = std::string())
+    {
+        captureState_ = safetyState_ == SafetyState::SafeReady ? CaptureState::Idle : CaptureState::Fault;
+        ResetCaptureProgressLocked(pendingLabelFallback);
+    }
+
     void StartTrajectoryFinalizeGracePeriod(const std::string& reason, bool emitLog)
     {
         {
@@ -2247,22 +2261,7 @@ public:
 
     UiStatusSnapshot GetUiStatusSnapshot() const
     {
-        LatestState state;
-        LatestImage image;
-        VelocityCommand command;
-        {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            state = latestState_;
-        }
-        {
-            std::lock_guard<std::mutex> lock(imageMutex_);
-            image = latestImage_;
-        }
-        {
-            std::lock_guard<std::mutex> lock(commandMutex_);
-            command = latestCommand_;
-        }
-
+        const Snapshot latest = CollectLatestSnapshot();
         const auto loggerStatus = logger_.GetStatus();
         UiStatusSnapshot snapshot;
         CaptureState captureState;
@@ -2288,18 +2287,18 @@ public:
         snapshot.segmentDurationSeconds = loggerStatus.bufferedFrames >= 2
                                               ? std::max(0.0, loggerStatus.endTimestamp - loggerStatus.startTimestamp)
                                               : 0.0;
-        snapshot.stateValid = state.valid;
-        snapshot.imageValid = image.valid;
-        snapshot.stateAgeSeconds = AgeSeconds(state.timestamp, nowSeconds);
-        snapshot.imageAgeSeconds = AgeSeconds(image.timestamp, nowSeconds);
+        snapshot.stateValid = latest.state.valid;
+        snapshot.imageValid = latest.image.valid;
+        snapshot.stateAgeSeconds = AgeSeconds(latest.state.timestamp, nowSeconds);
+        snapshot.imageAgeSeconds = AgeSeconds(latest.image.timestamp, nowSeconds);
         snapshot.robotConnected = snapshot.stateValid && snapshot.stateAgeSeconds >= 0.0 && snapshot.stateAgeSeconds <= kStateTimeoutSeconds;
-        snapshot.bodyHeight = state.bodyHeight;
-        snapshot.roll = state.roll;
-        snapshot.pitch = state.pitch;
-        snapshot.yaw = state.yaw;
-        snapshot.commandVx = command.vx;
-        snapshot.commandVy = command.vy;
-        snapshot.commandWz = command.wz;
+        snapshot.bodyHeight = latest.state.bodyHeight;
+        snapshot.roll = latest.state.roll;
+        snapshot.pitch = latest.state.pitch;
+        snapshot.yaw = latest.state.yaw;
+        snapshot.commandVx = latest.action.vx;
+        snapshot.commandVy = latest.action.vy;
+        snapshot.commandWz = latest.action.wz;
         snapshot.sceneId = editable.sceneId;
         snapshot.operatorId = editable.operatorId;
         snapshot.instruction = editable.instruction;
@@ -2328,18 +2327,8 @@ public:
         snapshot.safetyState = SafetyStateName(safetyState);
         snapshot.faultReason = faultReason;
         snapshot.recording = captureState == CaptureState::Capturing;
-        snapshot.actions.canStartRecording = !snapshot.startupGateActive &&
-                                             safetyState == SafetyState::SafeReady &&
-                                             captureState == CaptureState::Idle &&
-                                             !loggerStatus.pendingLabel;
-        snapshot.actions.canStopRecording = captureState == CaptureState::Capturing;
-        snapshot.actions.canDiscardSegment = captureState == CaptureState::Armed ||
-                                             captureState == CaptureState::DelayBeforeLog ||
-                                             captureState == CaptureState::Capturing ||
-                                             loggerStatus.pendingLabel;
-        snapshot.actions.canSubmitLabel = loggerStatus.pendingLabel;
-        snapshot.actions.canEstop = safetyState != SafetyState::EstopLatched;
-        snapshot.actions.canClearFault = safetyState != SafetyState::SafeReady;
+        snapshot.actions =
+            BuildUiActionAvailability(loggerStatus, captureState, safetyState, snapshot.startupGateActive);
         return snapshot;
     }
 
@@ -2484,6 +2473,45 @@ private:
         LatestImage image;
         VelocityCommand action;
     };
+
+    Snapshot CollectLatestSnapshot() const
+    {
+        Snapshot snapshot;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            snapshot.state = latestState_;
+        }
+        {
+            std::lock_guard<std::mutex> lock(imageMutex_);
+            snapshot.image = latestImage_;
+        }
+        {
+            std::lock_guard<std::mutex> lock(commandMutex_);
+            snapshot.action = latestCommand_;
+        }
+        return snapshot;
+    }
+
+    static UiActionAvailability BuildUiActionAvailability(const TrajectoryLogger::Status& loggerStatus,
+                                                          CaptureState captureState,
+                                                          SafetyState safetyState,
+                                                          bool startupGateActive)
+    {
+        UiActionAvailability actions;
+        actions.canStartRecording = !startupGateActive &&
+                                    safetyState == SafetyState::SafeReady &&
+                                    captureState == CaptureState::Idle &&
+                                    !loggerStatus.pendingLabel;
+        actions.canStopRecording = captureState == CaptureState::Capturing;
+        actions.canDiscardSegment = captureState == CaptureState::Armed ||
+                                    captureState == CaptureState::DelayBeforeLog ||
+                                    captureState == CaptureState::Capturing ||
+                                    loggerStatus.pendingLabel;
+        actions.canSubmitLabel = loggerStatus.pendingLabel;
+        actions.canEstop = safetyState != SafetyState::EstopLatched;
+        actions.canClearFault = safetyState != SafetyState::SafeReady;
+        return actions;
+    }
 
     struct KeyActivity
     {
@@ -2824,25 +2852,11 @@ private:
     void PrintStatus() const
     {
         const EditableCollectorConfig editable = GetEditableConfigSnapshot();
-        LatestState state;
-        LatestImage image;
-        VelocityCommand command;
+        const Snapshot latest = CollectLatestSnapshot();
         const MotionStateSnapshot motionState = GetMotionStateSnapshot();
         const WirelessControllerSnapshot controllerState =
             config_.inputBackend == Config::InputBackend::WirelessController ? GetWirelessControllerSnapshot()
                                                                              : WirelessControllerSnapshot{};
-        {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            state = latestState_;
-        }
-        {
-            std::lock_guard<std::mutex> lock(imageMutex_);
-            image = latestImage_;
-        }
-        {
-            std::lock_guard<std::mutex> lock(commandMutex_);
-            command = latestCommand_;
-        }
 
         const auto loggerStatus = logger_.GetStatus();
         const double nowSeconds = NowSeconds();
@@ -2881,11 +2895,11 @@ private:
             << " target_type=" << (editable.targetType.empty() ? "-" : editable.targetType)
             << " target_description=" << (editable.targetDescription.empty() ? "-" : editable.targetDescription)
             << " buffered_frames=" << loggerStatus.bufferedFrames
-            << " state=" << state.valid
-            << " image=" << image.valid
-            << " state_age_s=" << std::fixed << std::setprecision(3) << AgeSeconds(state.timestamp, nowSeconds)
-            << " image_age_s=" << AgeSeconds(image.timestamp, nowSeconds)
-            << " command=(" << command.vx << "," << command.vy << "," << command.wz << ")";
+            << " state=" << latest.state.valid
+            << " image=" << latest.image.valid
+            << " state_age_s=" << std::fixed << std::setprecision(3) << AgeSeconds(latest.state.timestamp, nowSeconds)
+            << " image_age_s=" << AgeSeconds(latest.image.timestamp, nowSeconds)
+            << " command=(" << latest.action.vx << "," << latest.action.vy << "," << latest.action.wz << ")";
         if (config_.inputBackend == Config::InputBackend::WirelessController)
         {
             oss << " controller_axes=("
@@ -2958,19 +2972,7 @@ private:
 
     bool CanClearFault(std::string& reason) const
     {
-        Snapshot snapshot;
-        {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            snapshot.state = latestState_;
-        }
-        {
-            std::lock_guard<std::mutex> lock(imageMutex_);
-            snapshot.image = latestImage_;
-        }
-        {
-            std::lock_guard<std::mutex> lock(commandMutex_);
-            snapshot.action = latestCommand_;
-        }
+        const Snapshot snapshot = CollectLatestSnapshot();
         reason = EvaluateSafetyFault(snapshot, NowSeconds());
         return reason.empty();
     }
@@ -2993,9 +2995,7 @@ private:
             safetyState_ = state;
             latchedFaultReason_ = reason;
             captureState_ = CaptureState::Fault;
-            activeMotionInstruction_ = MotionInstruction::None;
-            captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-            ResetTrajectoryStopFlowLocked();
+            ResetCaptureProgressLocked();
         }
         logger_.DiscardPendingSegment();
         ResetActiveMotionKeys();
@@ -3146,10 +3146,7 @@ private:
             {
                 logger_.BeginSegment(editable.sceneId, editable.operatorId, configuredTaskMetadata, trajectoryGateConfig_);
                 captureState_ = CaptureState::Capturing;
-                activeMotionInstruction_ = MotionInstruction::None;
-                captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-                pendingLabelFallbackInstruction_.clear();
-                ResetTrajectoryStopFlowLocked();
+                ResetCaptureProgressLocked();
                 if (emitLog)
                 {
                     PrintLine("trajectory 已 armed；检测到连续有效动作后开始写入，使用停止键结束，使用丢弃键取消");
@@ -3158,10 +3155,7 @@ private:
             else
             {
                 captureState_ = CaptureState::Armed;
-                activeMotionInstruction_ = MotionInstruction::None;
-                captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-                pendingLabelFallbackInstruction_.clear();
-                ResetTrajectoryStopFlowLocked();
+                ResetCaptureProgressLocked();
                 if (emitLog)
                 {
                     PrintLine("采集段已 armed，等待单一有效动作输入");
@@ -3187,11 +3181,7 @@ private:
         {
             logger_.DiscardPendingSegment();
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
-            activeMotionInstruction_ = MotionInstruction::None;
-            captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-            pendingLabelFallbackInstruction_.clear();
-            ResetTrajectoryStopFlowLocked();
+            EnterIdleOrFaultStateLocked();
             if (emitLog)
             {
                 PrintLine("该段未记录到有效动作帧，已丢弃");
@@ -3201,11 +3191,7 @@ private:
 
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
-            activeMotionInstruction_ = MotionInstruction::None;
-            captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-            pendingLabelFallbackInstruction_ = MotionInstructionName(instruction);
-            ResetTrajectoryStopFlowLocked();
+            EnterIdleOrFaultStateLocked(MotionInstructionName(instruction));
         }
         if (emitLog)
         {
@@ -3327,11 +3313,7 @@ private:
             {
                 return ActionError("nothing_to_discard", "当前没有可丢弃区间");
             }
-            captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
-            activeMotionInstruction_ = MotionInstruction::None;
-            captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-            pendingLabelFallbackInstruction_.clear();
-            ResetTrajectoryStopFlowLocked();
+            EnterIdleOrFaultStateLocked();
         }
         logger_.DiscardPendingSegment();
         if (emitLog)
@@ -3374,10 +3356,7 @@ private:
             logger_.DiscardPendingSegment();
             {
                 std::lock_guard<std::mutex> lock(stateMachineMutex_);
-                captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
-                activeMotionInstruction_ = MotionInstruction::None;
-                captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-                pendingLabelFallbackInstruction_.clear();
+                EnterIdleOrFaultStateLocked();
             }
             if (emitLog)
             {
@@ -3528,9 +3507,7 @@ private:
         {
             PrintLine(std::string("准备采集段记录失败：") + ex.what());
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            captureState_ = SafetyState::SafeReady == safetyState_ ? CaptureState::Idle : CaptureState::Fault;
-            activeMotionInstruction_ = MotionInstruction::None;
-            captureStartDeadline_ = std::chrono::steady_clock::time_point{};
+            EnterIdleOrFaultStateLocked();
         }
     }
 
