@@ -22,6 +22,7 @@ from llada_vla_common import (
     episode_task_metadata,
     infer_task_family,
     instruction_matches_known_template,
+    load_episode_derived_labels,
     load_json,
     raw_action_from_frame,
     state_from_frame,
@@ -74,6 +75,7 @@ def _validate_episode(session_root: Path, episode_path: Path) -> Dict[str, Any]:
     task_family = str(task_metadata.get("task_family") or infer_task_family(instruction))
     target_type = str(task_metadata.get("target_type") or "")
     target_description = str(task_metadata.get("target_description") or "")
+    derived_labels = load_episode_derived_labels(session_root, episode_id)
     frames = list(payload.get("frames") or [])
 
     issues = {"fatal": [], "warning": [], "info": []}
@@ -91,13 +93,10 @@ def _validate_episode(session_root: Path, episode_path: Path) -> Dict[str, Any]:
         _add_issue(issues, "warning", "unknown_task_family")
     if target_type and target_type not in KNOWN_TARGET_TYPES:
         _add_issue(issues, "warning", "unknown_target_type")
-    if task_family in VISUAL_TASK_FAMILIES:
-        if not target_type:
-            _add_issue(issues, "warning", "missing_target_type")
-        if not target_description:
-            _add_issue(issues, "warning", "missing_target_description")
     if task_family == "visual_following" and target_type and target_type != "person":
         _add_issue(issues, "warning", "visual_following_target_not_person")
+    if task_family in VISUAL_TASK_FAMILIES and not derived_labels:
+        _add_issue(issues, "info", "derived_labels_missing")
     if task_family == "legacy_motion" and instruction not in CONTROLLED_INSTRUCTIONS:
         _add_issue(issues, "warning", "legacy_motion_instruction_unrecognized")
     previous_timestamp: Optional[float] = None
@@ -158,6 +157,7 @@ def _validate_episode(session_root: Path, episode_path: Path) -> Dict[str, Any]:
         "task_family": task_family,
         "target_type": target_type,
         "target_description": target_description,
+        "derived_labels": derived_labels,
         "scene_id": scene_id,
         "operator_id": operator_id,
         "num_frames": len(frames),
@@ -181,6 +181,8 @@ def main() -> None:
     task_family_counts: Counter[str] = Counter()
     target_type_counts: Counter[str] = Counter()
     target_description_counts: Counter[str] = Counter()
+    derived_target_side_counts: Counter[str] = Counter()
+    derived_target_distance_counts: Counter[str] = Counter()
     instruction_scenes: Dict[str, set] = {}
     instruction_targets: Dict[str, set] = {}
     instruction_sessions: Dict[str, set] = {}
@@ -203,11 +205,22 @@ def main() -> None:
                 target_type_counts[report["target_type"]] += 1
             if report["target_description"]:
                 target_description_counts[report["target_description"]] += 1
+            derived_labels = dict(report.get("derived_labels") or {})
+            side_band = str(derived_labels.get("target_side_band") or "")
+            distance_band = str(derived_labels.get("target_distance_band") or "")
+            if side_band:
+                derived_target_side_counts[side_band] += 1
+            if distance_band:
+                derived_target_distance_counts[distance_band] += 1
             instruction_scenes.setdefault(report["instruction"], set()).add(report["scene_id"])
             if report["target_description"]:
                 instruction_targets.setdefault(report["instruction"], set()).add(report["target_description"])
             elif report["target_type"]:
                 instruction_targets.setdefault(report["instruction"], set()).add(report["target_type"])
+            elif side_band or distance_band:
+                instruction_targets.setdefault(report["instruction"], set()).add(
+                    f"{side_band or 'unknown'}:{distance_band or 'unknown'}"
+                )
             instruction_sessions.setdefault(report["instruction"], set()).add(report["session_id"])
 
     global_issues: List[str] = []
@@ -256,11 +269,15 @@ def main() -> None:
         "task_family_counts": dict(sorted(task_family_counts.items())),
         "target_type_counts": dict(sorted(target_type_counts.items())),
         "target_description_counts": dict(sorted(target_description_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "derived_target_side_counts": dict(sorted(derived_target_side_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "derived_target_distance_counts": dict(sorted(derived_target_distance_counts.items(), key=lambda item: (-item[1], item[0]))),
         "visual_variation_summary": {
             "scene_count": len([scene for scene in scene_counts if scene]),
             "task_family_count": len(task_family_counts),
             "target_type_count": len(target_type_counts),
             "target_description_count": len(target_description_counts),
+            "derived_target_side_count": len(derived_target_side_counts),
+            "derived_target_distance_count": len(derived_target_distance_counts),
             "visually_necessary_episode_count": sum(
                 1 for item in episode_reports if str(item.get("task_family") or "") in VISUAL_TASK_FAMILIES
             ),

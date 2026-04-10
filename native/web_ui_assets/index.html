@@ -8,67 +8,40 @@
 </head>
 <body>
   <main class="shell">
-    <details class="panel summary-panel collapsible" open>
-      <summary class="summary-toggle">
-        <span>Collector Status & Runtime</span>
-        <span class="subtle">collapsed by default</span>
-      </summary>
+    <section class="panel summary-panel">
       <div class="title-row">
         <div>
           <h1>Go2 Collector</h1>
-          <p class="subtle">single-screen local control panel</p>
+          <p class="subtle">most important state only</p>
         </div>
       </div>
-      <section class="status-groups">
-        <div class="state-block collector-block">
-          <div class="state-block-head">
-            <h2>Collector State</h2>
-            <span class="subtle">capture + safety</span>
-          </div>
-          <div id="summary-grid" class="summary-grid"></div>
-        </div>
-        <div class="state-block robot-block">
-          <div class="state-block-head">
-            <h2>Robot State</h2>
-            <span class="subtle">pose + command</span>
-          </div>
-          <div id="robot-grid" class="mini-grid"></div>
-        </div>
-        <div class="state-block runtime-block">
-          <div class="state-block-head">
-            <h2>Runtime</h2>
-            <span class="subtle">network + defaults</span>
-          </div>
-          <div id="process-grid" class="mini-grid process-grid"></div>
-        </div>
-      </section>
-    </details>
+      <div id="summary-grid" class="summary-grid status-strip"></div>
+      <p id="summary-note" class="summary-note subtle"></p>
+    </section>
 
     <section class="columns">
       <section class="panel">
         <h2>Collector Config</h2>
-        <div class="actions actions-config">
-          <button id="apply-config-btn" class="accent" type="submit" form="config-form">Apply For Next Segment <span class="kbd">O</span></button>
-        </div>
+        <p class="subtle">配置在 collector 启动时固定；这里仅展示当前运行参数，修改请重启 collector。</p>
         <form id="config-form" class="compact-form">
           <div class="form-grid">
-            <label><span>Scene</span><input id="cfg-scene-id" type="text" placeholder="ex: corridor_a"></label>
-            <label><span>Operator</span><input id="cfg-operator-id" type="text" placeholder="ex: op_01"></label>
-            <label class="wide"><span>Instruction</span><input id="cfg-instruction" type="text" placeholder="ex: go to the red door"></label>
+            <label><span>Scene</span><input id="cfg-scene-id" type="text" placeholder="ex: corridor_a" readonly disabled></label>
+            <label><span>Operator</span><input id="cfg-operator-id" type="text" placeholder="ex: op_01" readonly disabled></label>
+            <label class="wide"><span>Instruction</span><input id="cfg-instruction" type="text" placeholder="ex: go to the red door" readonly disabled></label>
             <label><span>Capture Mode</span>
-              <select id="cfg-capture-mode">
+              <select id="cfg-capture-mode" disabled>
                 <option value="single_action">single_action</option>
                 <option value="trajectory">trajectory</option>
               </select>
             </label>
-            <label><span>Task Family</span><input id="cfg-task-family" type="text" placeholder="ex: goal_navigation"></label>
-            <label><span>Target Type</span><input id="cfg-target-type" type="text" placeholder="ex: door"></label>
-            <label class="wide"><span>Target Description</span><input id="cfg-target-description" type="text" placeholder="ex: red door on the left"></label>
-            <label class="wide"><span>Collector Notes</span><input id="cfg-collector-notes" type="text" placeholder="ex: start from hallway corner"></label>
+            <label><span>Task Family</span><input id="cfg-task-family" type="text" placeholder="ex: goal_navigation" readonly disabled></label>
+            <label><span>Target Type (optional)</span><input id="cfg-target-type" type="text" placeholder="ex: door" readonly disabled></label>
+            <label class="wide"><span>Target Description (optional)</span><input id="cfg-target-description" type="text" placeholder="leave blank and derive left/right/near/far offline" readonly disabled></label>
+            <label class="wide"><span>Collector Notes</span><input id="cfg-collector-notes" type="text" placeholder="ex: start from hallway corner" readonly disabled></label>
             <div class="wide triple-row">
-              <label><span>cmd_vx_max</span><input id="cfg-cmd-vx-max" type="number" step="0.01" placeholder="ex: 0.20"></label>
-              <label><span>cmd_vy_max</span><input id="cfg-cmd-vy-max" type="number" step="0.01" placeholder="ex: 0.20"></label>
-              <label><span>cmd_wz_max</span><input id="cfg-cmd-wz-max" type="number" step="0.01" placeholder="ex: 0.80"></label>
+              <label><span>cmd_vx_max</span><input id="cfg-cmd-vx-max" type="number" step="0.01" placeholder="ex: 0.20" readonly disabled></label>
+              <label><span>cmd_vy_max</span><input id="cfg-cmd-vy-max" type="number" step="0.01" placeholder="ex: 0.20" readonly disabled></label>
+              <label><span>cmd_wz_max</span><input id="cfg-cmd-wz-max" type="number" step="0.01" placeholder="ex: 0.80" readonly disabled></label>
             </div>
           </div>
         </form>
@@ -78,22 +51,25 @@
         <section class="stack-block controls-block">
           <div class="section-head">
             <h2>Controls</h2>
-            <span class="subtle">keyboard + web buttons</span>
+            <span id="controls-hint" class="subtle">keyboard + web buttons</span>
           </div>
           <div class="actions actions-keys controls-grid">
-            <button id="start-btn">Start <span class="kbd">R</span></button>
-            <button id="stop-btn">Stop <span class="kbd">T</span></button>
-            <button id="discard-btn">Discard <span class="kbd">ESC</span></button>
-            <button id="estop-btn" class="danger">E-Stop <span class="kbd">Space</span></button>
-            <button id="clear-fault-btn">Clear Fault <span class="kbd">C</span></button>
-            <button id="quit-btn">Quit <span class="kbd">X</span></button>
+            <button id="start-btn"><span class="btn-label">Start</span><span class="kbd">R</span></button>
+            <button id="stop-btn"><span class="btn-label">Stop</span><span class="kbd">T</span></button>
+            <button id="discard-btn"><span class="btn-label">Discard</span><span class="kbd">ESC</span></button>
+            <button id="estop-btn" class="danger"><span class="btn-label">E-Stop</span><span class="kbd">Space</span></button>
+            <button id="clear-fault-btn"><span class="btn-label">Clear Fault</span><span class="kbd">C</span></button>
+            <button id="quit-btn"><span class="btn-label">Quit</span><span class="kbd">X</span></button>
           </div>
         </section>
 
         <section class="stack-block camera-block">
           <div class="section-head">
             <h2>Camera</h2>
-            <div id="camera-meta" class="camera-meta">waiting for image...</div>
+            <div class="camera-head-actions">
+              <button id="camera-focus-btn" class="ghost-btn" type="button" aria-pressed="false">Focus View</button>
+              <div id="camera-meta" class="camera-meta">waiting for image...</div>
+            </div>
           </div>
           <img id="camera-thumb" class="camera-thumb" alt="collector thumbnail">
         </section>
@@ -101,7 +77,7 @@
         <section class="stack-block rating-block">
           <div class="section-head">
             <h2>Data Rating</h2>
-            <span class="subtle">1-4 shortcuts</span>
+            <span id="rating-hint" class="subtle">1-4 shortcuts</span>
           </div>
           <p class="subtle">用 1-4 直接给当前数据打分，自动映射到内部标签组合。</p>
           <div id="rating-grid" class="rating-grid">
@@ -128,13 +104,6 @@
           </div>
         </section>
 
-        <section class="stack-block console-block">
-          <div class="section-head">
-            <h2>Console</h2>
-            <span class="subtle">latest collector feedback</span>
-          </div>
-          <pre id="action-result" class="log"></pre>
-        </section>
       </section>
     </section>
   </main>

@@ -84,6 +84,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-ratio", type=float, default=0.8, help="原始 session 划分训练集比例")
     parser.add_argument("--val-ratio", type=float, default=0.1, help="原始 session 划分验证集比例")
     parser.add_argument("--test-ratio", type=float, default=0.1, help="原始 session 划分测试集比例")
+    parser.add_argument("--split-seed", type=int, help="可选：划分前随机打散 session/episode 分组的随机种子")
     parser.add_argument("--min-episode-length", type=int, default=1, help="丢弃短于该长度的原始 episode")
     parser.add_argument("--checkpoint-path", type=Path, help="用于恢复训练或仅评估的 checkpoint")
     parser.add_argument("--eval-only", action="store_true", help="跳过训练，直接评估 checkpoint")
@@ -168,12 +169,16 @@ def _load_split_records(dataset_root: Path, manifest_root: Path, args: argparse.
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
+        split_seed=args.split_seed,
     )
     split_records = {name: _records_from_samples(items, dataset_root) for name, items in split_samples.items()}
     resolved_strategy = strategy if strategy != "use_manifest" else ("by_episode" if mapped == "by_trajectory" else mapped)
     if strategy == "auto":
         resolved_strategy = "by_session" if len({sample.session_id for sample in samples}) >= 2 else "by_episode"
-    return split_records, {"source": "raw_sessions", "strategy": resolved_strategy}
+    split_info = {"source": "raw_sessions", "strategy": resolved_strategy}
+    if args.split_seed is not None:
+        split_info["seed"] = int(args.split_seed)
+    return split_records, split_info
 
 
 def _effective_modalities(ablation_mode: str, use_state: bool) -> Dict[str, bool]:

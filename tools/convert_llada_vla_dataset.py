@@ -22,6 +22,7 @@ from llada_vla_common import (
     summarize_trajectory_actions,
     summarize_trajectory_metric_series,
 )
+from derive_distribution_labels import generate_distribution_labels
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -31,9 +32,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--action-horizon", type=int, default=4, help="每个 action chunk 中包含的未来动作步数")
     parser.add_argument("--min-episode-length", type=int, default=1, help="转换前丢弃长度小于该值的 episode")
     parser.add_argument("--split-mode", choices=["auto", "by_session", "by_trajectory"], default="auto", help="train/val/test 划分方式")
+    parser.add_argument("--split-seed", type=int, help="可选：划分前随机打散 session/trajectory 分组的随机种子")
     parser.add_argument("--train-ratio", type=float, default=0.8, help="训练集比例")
     parser.add_argument("--val-ratio", type=float, default=0.1, help="验证集比例")
     parser.add_argument("--test-ratio", type=float, default=0.1, help="测试集比例")
+    parser.add_argument(
+        "--derive-labels",
+        choices=["none", "distribution"],
+        default="none",
+        help="转换前是否自动生成 derived_labels",
+    )
+    parser.add_argument(
+        "--derive-side-metric",
+        choices=["lateral_displacement", "heading_change"],
+        default="lateral_displacement",
+        help="自动生成分布标签时使用的左右属性",
+    )
+    parser.add_argument(
+        "--derive-distance-metric",
+        choices=["integrated_planar_distance", "forward_displacement"],
+        default="integrated_planar_distance",
+        help="自动生成分布标签时使用的远近属性",
+    )
+    parser.add_argument(
+        "--derive-invert-side-sign",
+        action="store_true",
+        help="自动生成分布标签时翻转左右方向",
+    )
+    parser.add_argument(
+        "--derive-summary-path",
+        type=Path,
+        help="自动生成分布标签时输出汇总 JSON 的路径",
+    )
     parser.add_argument("--overwrite", action="store_true", help="写入前删除已有输出目录")
     return parser
 
@@ -56,6 +86,16 @@ def _stats_payload(output_root: Path, raw_root: Path, session_roots: Sequence[Pa
     capture_mode_counter = Counter(str(record.get("capture_mode") or "") for record in all_records if str(record.get("capture_mode") or ""))
     task_family_counter = Counter(str(record.get("task_family") or "") for record in all_records if str(record.get("task_family") or ""))
     target_type_counter = Counter(str(record.get("target_type") or "") for record in all_records if str(record.get("target_type") or ""))
+    derived_target_side_counter = Counter(
+        str((record.get("derived_labels") or {}).get("target_side_band") or "")
+        for record in all_records
+        if str((record.get("derived_labels") or {}).get("target_side_band") or "")
+    )
+    derived_target_distance_counter = Counter(
+        str((record.get("derived_labels") or {}).get("target_distance_band") or "")
+        for record in all_records
+        if str((record.get("derived_labels") or {}).get("target_distance_band") or "")
+    )
 
     trajectory_groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for record in all_records:
@@ -88,6 +128,8 @@ def _stats_payload(output_root: Path, raw_root: Path, session_roots: Sequence[Pa
         "capture_mode_counts": dict(sorted(capture_mode_counter.items(), key=lambda item: (-item[1], item[0]))),
         "task_family_counts": dict(sorted(task_family_counter.items(), key=lambda item: (-item[1], item[0]))),
         "target_type_counts": dict(sorted(target_type_counter.items(), key=lambda item: (-item[1], item[0]))),
+        "derived_target_side_counts": dict(sorted(derived_target_side_counter.items(), key=lambda item: (-item[1], item[0]))),
+        "derived_target_distance_counts": dict(sorted(derived_target_distance_counter.items(), key=lambda item: (-item[1], item[0]))),
         "trajectory_metrics": {
             "frame_count": summarize_trajectory_metric_series([float(item["frame_count"]) for item in trajectory_metrics_rows]),
             "duration_seconds": summarize_trajectory_metric_series([float(item["duration_seconds"]) for item in trajectory_metrics_rows]),
@@ -120,6 +162,18 @@ def main() -> None:
     if not discovered_session_roots:
         raise FileNotFoundError(f"在以下路径下没有找到 session 根目录：{raw_root}")
 
+    derived_label_summary: Dict[str, Any] = {}
+    if args.derive_labels == "distribution":
+        derived_label_summary = generate_distribution_labels(
+            raw_root,
+            output_dirname="derived_labels",
+            overwrite=True,
+            side_metric=args.derive_side_metric,
+            distance_metric=args.derive_distance_metric,
+            invert_side_sign=args.derive_invert_side_sign,
+            summary_path=args.derive_summary_path,
+        )
+
     samples: List[Sample] = []
     retained_session_roots: List[Path] = []
     for session_root in discovered_session_roots:
@@ -142,6 +196,7 @@ def main() -> None:
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
+        split_seed=args.split_seed,
     )
 
     output_root.mkdir(parents=True, exist_ok=True)
@@ -159,6 +214,11 @@ def main() -> None:
 
     stats = _stats_payload(output_root, raw_root, retained_session_roots, all_records)
     stats["min_episode_length"] = args.min_episode_length
+    stats["split_mode"] = args.split_mode
+    if args.split_seed is not None:
+        stats["split_seed"] = args.split_seed
+    if derived_label_summary:
+        stats["derived_labels_generation"] = derived_label_summary
     with (output_root / "stats.json").open("w", encoding="utf-8") as handle:
         json.dump(stats, handle, ensure_ascii=True, indent=2, sort_keys=True)
         handle.write("\n")
@@ -173,6 +233,16 @@ def main() -> None:
         print(f"采集模式统计：{stats['capture_mode_counts']}")
     if stats["task_family_counts"]:
         print(f"任务族统计：{stats['task_family_counts']}")
+    if stats["derived_target_side_counts"]:
+        print(f"派生左右标签统计：{stats['derived_target_side_counts']}")
+    if stats["derived_target_distance_counts"]:
+        print(f"派生远近标签统计：{stats['derived_target_distance_counts']}")
+    if derived_label_summary:
+        print(
+            "自动生成标签： "
+            f"side={derived_label_summary['side_band_counts']} "
+            f"distance={derived_label_summary['distance_band_counts']}"
+        )
     print(
         "轨迹统计： "
         f"平均帧数={stats['trajectory_metrics']['frame_count']['mean']:.2f} "

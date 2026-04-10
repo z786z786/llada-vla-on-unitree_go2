@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -29,6 +30,14 @@ struct UiActionAvailability
     bool canSubmitLabel = false;
     bool canEstop = false;
     bool canClearFault = false;
+};
+
+struct UiImageFrame
+{
+    double timestamp = 0.0;
+    uint64_t sequence = 0;
+    std::vector<uint8_t> jpegBytes;
+    bool valid = false;
 };
 
 struct UiStatusSnapshot
@@ -113,6 +122,7 @@ struct WebUiServerConfig
     std::function<UiActionResult(const UiConfigUpdateInput&)> updateConfigHandler;
     std::function<UiActionResult(const UiConfigUpdateInput&)> saveDefaultsHandler;
     std::function<std::vector<uint8_t>()> latestImageJpegProvider;
+    std::function<UiImageFrame(uint64_t, int)> nextImageFrameProvider;
 };
 
 class WebUiServer

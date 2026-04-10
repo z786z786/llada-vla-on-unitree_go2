@@ -12,9 +12,11 @@
 - `native/build/go2_collector`：主采集程序，支持传统短动作采集与 `trajectory` 长轨迹语义任务
 - `scripts/sanity_check_dataset.py`：生成 HTML 回放与数据体检报告
 - `tools/validate_bc_dataset.py`：离线可训练性验证工具
+- `tools/derive_distribution_labels.py`：按轨迹属性分布生成左右/远近标签
 - `tools/convert_llada_vla_dataset.py`：原始 session 转训练清单工具
 - `tools/llada_vla_baseline.py`：轻量行为克隆基线
 - `tools/llada_vla_baseline_v2.py`：多模态诊断基线
+- `tools/summarize_baseline_v2_runs.py`：汇总多个 baseline_v2 实验目录的关键指标
 
 ## 仓库结构
 
@@ -185,6 +187,23 @@ python3 tools/validate_bc_dataset.py --dataset-root data --report-path outputs/v
 - 同一句指令跨场景 / 跨目标覆盖不足
 - 是否缺少真正的视觉必需任务族
 
+按当前数据分布生成 `左/中/右` 和 `近/中/远` 标签：
+
+```bash
+cd /home/xiaohui/unitree_go2/go2_vla_collector
+python3 tools/derive_distribution_labels.py \
+  --dataset-root data \
+  --output-dirname derived_labels \
+  --summary-path outputs/distribution_label_summary.json
+```
+
+说明：
+
+- 默认按全体 episode 的三分位数切分
+- 左右默认使用 `lateral_displacement`
+- 远近默认使用 `integrated_planar_distance`
+- 若本地坐标方向和你的语义相反，可加 `--invert-side-sign`
+
 ## 转换与训练
 
 把原始 session 转成训练清单：
@@ -192,6 +211,18 @@ python3 tools/validate_bc_dataset.py --dataset-root data --report-path outputs/v
 ```bash
 cd /home/xiaohui/unitree_go2/go2_vla_collector
 python3 tools/convert_llada_vla_dataset.py --raw-root data --output-root data/llada_vla_converted --overwrite
+```
+
+如果希望转换前自动生成这批 `derived_labels`：
+
+```bash
+cd /home/xiaohui/unitree_go2/go2_vla_collector
+python3 tools/convert_llada_vla_dataset.py \
+  --raw-root data \
+  --output-root data/llada_vla_converted \
+  --derive-labels distribution \
+  --derive-summary-path outputs/distribution_label_summary.json \
+  --overwrite
 ```
 
 运行轻量基线：
@@ -208,12 +239,21 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
 python3 tools/llada_vla_baseline_v2.py   --dataset-root data/llada_vla_converted   --output-dir outputs/baseline_v2_goal_nav   --ablation-mode image_plus_instruction
 ```
 
+汇总多个 baseline_v2 实验目录：
+
+```bash
+cd /home/xiaohui/unitree_go2/go2_vla_collector
+python3 tools/summarize_baseline_v2_runs.py \
+  --outputs-root outputs \
+  --output-path outputs/baseline_v2_summary.md
+```
+
 ## 推荐检查命令
 
 Python 工具链静态检查：
 
 ```bash
-python3 -m py_compile tools/llada_vla_common.py   tools/convert_llada_vla_dataset.py   tools/validate_bc_dataset.py   tools/llada_vla_baseline.py   scripts/sanity_check_dataset.py
+python3 -m py_compile tools/llada_vla_common.py   tools/derive_distribution_labels.py   tools/convert_llada_vla_dataset.py   tools/validate_bc_dataset.py   tools/llada_vla_baseline.py   scripts/sanity_check_dataset.py
 ```
 
 检查原生 collector 参数：
@@ -227,4 +267,5 @@ python3 -m py_compile tools/llada_vla_common.py   tools/convert_llada_vla_datase
 - `RUNBOOK_CN.md`
 - `docs/pilot_collection_plan.md`
 - `docs/visually_necessary_collection_plan.md`
+- `docs/seed5_visual_followup_plan.md`
 - `docs/llada_vla_dataset_spec.md`

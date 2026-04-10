@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 import re
 import shutil
 import statistics
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = "go2_local_dataset_v1"
+DERIVED_LABELS_DIRNAME = "derived_labels"
 STATE_FIELDS = ["vx", "vy", "wz", "yaw"]
 ACTION_FIELDS = ["vx", "vy", "wz"]
 RAW_ACTION_FIELDS = ["vx", "vy", "wz", "camera_pitch", "keys"]
@@ -132,6 +134,9 @@ class Sample:
             record["image_path"] = self.image_path
         if self.source_image_path is not None:
             record["source_image_path"] = self.source_image_path
+        derived_labels = self.raw_record.get("derived_labels")
+        if isinstance(derived_labels, dict) and derived_labels:
+            record["derived_labels"] = derived_labels
         return record
 
 
@@ -162,6 +167,22 @@ def dump_jsonl(path: Path, records: Iterable[Dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+
+def derived_labels_path(session_root: Path, episode_id: str) -> Path:
+    return session_root / DERIVED_LABELS_DIRNAME / f"{episode_id}.json"
+
+
+def load_episode_derived_labels(session_root: Path, episode_id: str) -> Dict[str, Any]:
+    if not episode_id:
+        return {}
+    path = derived_labels_path(session_root, episode_id)
+    if not path.exists():
+        return {}
+    payload = load_json(path)
+    if not isinstance(payload, dict):
+        return {}
+    return payload
 
 
 def discover_session_roots(raw_root: Path) -> List[Path]:
@@ -446,6 +467,7 @@ def load_session_samples(session_root: Path, action_horizon: int = 1, min_trajec
         scene_id = str(payload.get("scene_id") or episode_meta.get("scene_id") or "")
         operator_id = str(payload.get("operator_id") or episode_meta.get("operator_id") or "")
         task_metadata = episode_task_metadata(payload, episode_meta)
+        derived_labels = load_episode_derived_labels(session_root, episode_id)
         schema_version = str(payload.get("schema_version") or payload.get("meta", {}).get("schema_version") or "")
         frames = list(payload.get("frames") or [])
         trajectory_length = len(frames)
@@ -471,6 +493,8 @@ def load_session_samples(session_root: Path, action_horizon: int = 1, min_trajec
                 "operator_id": operator_id,
             }
             raw_record.update(task_metadata)
+            if derived_labels:
+                raw_record["derived_labels"] = derived_labels
 
             samples.append(
                 Sample(
@@ -536,6 +560,7 @@ def assign_splits(
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
+    split_seed: Optional[int] = None,
 ) -> Dict[str, List[Sample]]:
     if not samples:
         return {"train": [], "val": [], "test": []}
@@ -560,6 +585,10 @@ def assign_splits(
         grouped_items = [session_groups[key] for key in sorted(session_groups, key=_session_sort_key)]
     else:
         grouped_items = [trajectory_groups[key] for key in sorted(trajectory_groups)]
+
+    if split_seed is not None and len(grouped_items) > 1:
+        rng = random.Random(int(split_seed))
+        rng.shuffle(grouped_items)
 
     counts = _ratio_counts(len(grouped_items), train_ratio, val_ratio, test_ratio)
     split_names: List[str] = []

@@ -1,5 +1,6 @@
 #include "web_ui_server.h"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <atomic>
 #include <cctype>
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <poll.h>
 #include <sstream>
@@ -91,6 +93,26 @@ bool SendAll(int fd, const std::string& data)
         sent += static_cast<size_t>(result);
     }
     return true;
+}
+
+bool SendAllBytes(int fd, const uint8_t* data, size_t size)
+{
+    size_t sent = 0;
+    while (sent < size)
+    {
+        const ssize_t result = ::send(fd, data + sent, size - sent, 0);
+        if (result <= 0)
+        {
+            return false;
+        }
+        sent += static_cast<size_t>(result);
+    }
+    return true;
+}
+
+bool SendAll(int fd, const std::vector<uint8_t>& data)
+{
+    return SendAllBytes(fd, data.data(), data.size());
 }
 
 std::string MakeJsonActionResult(const UiActionResult& result)
@@ -456,10 +478,12 @@ struct WebUiServer::Impl
             ::close(serverFd);
             serverFd = -1;
         }
+        ShutdownClientConnections();
         if (thread.joinable())
         {
             thread.join();
         }
+        JoinClientThreads();
     }
 
     void ServeLoop()
@@ -480,8 +504,23 @@ struct WebUiServer::Impl
             {
                 continue;
             }
-            HandleConnection(clientFd);
-            ::close(clientFd);
+            {
+                std::lock_guard<std::mutex> lock(clientMutex);
+                clientFds.push_back(clientFd);
+            }
+            std::lock_guard<std::mutex> lock(clientThreadMutex);
+            clientThreads.emplace_back(&Impl::HandleClientLoop, this, clientFd);
+        }
+    }
+
+    void HandleClientLoop(int clientFd)
+    {
+        HandleConnection(clientFd);
+        ::shutdown(clientFd, SHUT_RDWR);
+        ::close(clientFd);
+        {
+            std::lock_guard<std::mutex> lock(clientMutex);
+            clientFds.erase(std::remove(clientFds.begin(), clientFds.end(), clientFd), clientFds.end());
         }
     }
 
@@ -525,6 +564,11 @@ struct WebUiServer::Impl
                 return;
             }
             SendAll(clientFd, BuildBinaryHttpResponse(200, "OK", "image/jpeg", jpegBytes));
+            return;
+        }
+        if (path == "/api/image/stream.mjpeg")
+        {
+            HandleMjpegStream(clientFd);
             return;
         }
 
@@ -641,10 +685,91 @@ struct WebUiServer::Impl
         SendAll(clientFd, BuildHttpResponse(statusCode, result.ok ? "OK" : "Conflict", "application/json; charset=utf-8", MakeJsonActionResult(result)));
     }
 
+    void HandleMjpegStream(int clientFd)
+    {
+        if (!config.nextImageFrameProvider)
+        {
+            SendAll(clientFd, BuildHttpResponse(404, "Not Found", "text/plain; charset=utf-8", "stream unavailable"));
+            return;
+        }
+
+        static const std::string kBoundary = "frame";
+        std::ostringstream header;
+        header << "HTTP/1.1 200 OK\r\n"
+               << "Content-Type: multipart/x-mixed-replace; boundary=" << kBoundary << "\r\n"
+               << "Cache-Control: no-store\r\n"
+               << "Connection: close\r\n"
+               << "Access-Control-Allow-Origin: *\r\n\r\n";
+        if (!SendAll(clientFd, header.str()))
+        {
+            return;
+        }
+
+        uint64_t lastSequence = 0;
+        while (running.load())
+        {
+            const UiImageFrame frame = config.nextImageFrameProvider(lastSequence, 1000);
+            if (!running.load())
+            {
+                return;
+            }
+            if (!frame.valid || frame.jpegBytes.empty() || frame.sequence <= lastSequence)
+            {
+                continue;
+            }
+
+            std::ostringstream partHeader;
+            partHeader << "--" << kBoundary << "\r\n"
+                       << "Content-Type: image/jpeg\r\n"
+                       << "Content-Length: " << frame.jpegBytes.size() << "\r\n"
+                       << "X-Sequence: " << frame.sequence << "\r\n\r\n";
+            if (!SendAll(clientFd, partHeader.str()) ||
+                !SendAll(clientFd, frame.jpegBytes) ||
+                !SendAll(clientFd, std::string("\r\n")))
+            {
+                return;
+            }
+            lastSequence = frame.sequence;
+        }
+    }
+
+    void ShutdownClientConnections()
+    {
+        std::vector<int> clientFdsSnapshot;
+        {
+            std::lock_guard<std::mutex> lock(clientMutex);
+            clientFdsSnapshot = clientFds;
+        }
+        for (const int clientFd : clientFdsSnapshot)
+        {
+            ::shutdown(clientFd, SHUT_RDWR);
+        }
+    }
+
+    void JoinClientThreads()
+    {
+        std::vector<std::thread> threads;
+        {
+            std::lock_guard<std::mutex> lock(clientThreadMutex);
+            threads.swap(clientThreads);
+        }
+        for (std::thread& worker : threads)
+        {
+            if (worker.joinable())
+            {
+                worker.join();
+            }
+        }
+    }
+
     WebUiServerConfig config;
     std::atomic<bool> running{false};
     int serverFd = -1;
     std::thread thread;
+    std::mutex clientMutex;
+    std::vector<int> clientFds;
+    std::mutex clientThreadMutex;
+    std::vector<std::thread> clientThreads;
 };
 
 WebUiServer::WebUiServer(const WebUiServerConfig& config)

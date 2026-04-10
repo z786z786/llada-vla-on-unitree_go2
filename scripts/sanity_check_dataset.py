@@ -26,6 +26,7 @@ from llada_vla_common import (
     discover_session_roots,
     episode_task_metadata,
     infer_task_family,
+    load_episode_derived_labels,
     load_json,
     summarize_trajectory_actions,
     summarize_trajectory_metric_series,
@@ -50,6 +51,9 @@ class EpisodeRecord:
     task_family: str
     target_type: str
     target_description: str
+    derived_target_side: str
+    derived_target_distance: str
+    derived_label_source: str
     collector_notes: str
     scene_id: str
     operator_id: str
@@ -110,8 +114,6 @@ def _warn_for_episode(payload: Dict[str, Any], frames: Sequence[FrameRecord]) ->
         issues.append("missing_operator_id")
     if len(frames) < 2:
         issues.append("too_few_frames")
-    if task_family in VISUAL_TASK_FAMILIES and not str(task_metadata.get("target_description") or ""):
-        issues.append("missing_target_description")
     return sorted(set(issues))
 
 
@@ -141,6 +143,7 @@ def load_episodes(data_root: Path, max_episodes: Optional[int]) -> List[EpisodeR
                 continue
             payload = load_json(session_root / "episodes" / f"{episode_id}.json")
             task_metadata = episode_task_metadata(payload, episode_meta)
+            derived_labels = load_episode_derived_labels(session_root, episode_id)
             frames: List[FrameRecord] = []
             for frame in payload.get("frames") or []:
                 image_rel = str(frame.get("image") or "")
@@ -166,6 +169,9 @@ def load_episodes(data_root: Path, max_episodes: Optional[int]) -> List[EpisodeR
                 task_family=str(task_metadata.get("task_family") or ""),
                 target_type=str(task_metadata.get("target_type") or ""),
                 target_description=str(task_metadata.get("target_description") or ""),
+                derived_target_side=str(derived_labels.get("target_side_band") or ""),
+                derived_target_distance=str(derived_labels.get("target_distance_band") or ""),
+                derived_label_source=str(derived_labels.get("label_source") or ""),
                 collector_notes=str(task_metadata.get("collector_notes") or ""),
                 scene_id=str(payload.get("scene_id") or episode_meta.get("scene_id") or ""),
                 operator_id=str(payload.get("operator_id") or episode_meta.get("operator_id") or ""),
@@ -297,7 +303,7 @@ def _episode_page(episode: EpisodeRecord, page_path: Path, index_path: Path, rng
   <p><a href=\"{escape(index_rel)}\">Back to summary</a></p>
   <div class=\"card\">
     <h1>{escape(episode.session_id)} / {escape(episode.episode_id)}</h1>
-    <p class=\"meta\">instruction=<code>{escape(episode.instruction)}</code> capture_mode=<code>{escape(episode.capture_mode or '-')}</code> task_family=<code>{escape(episode.task_family or '-')}</code> target_type=<code>{escape(episode.target_type or '-')}</code> target=<code>{escape(episode.target_description or '-')}</code> scene=<code>{escape(episode.scene_id or '-')}</code> operator=<code>{escape(episode.operator_id or '-')}</code> warnings=<code>{escape(warnings)}</code> info=<code>{escape(info)}</code></p>
+    <p class=\"meta\">instruction=<code>{escape(episode.instruction)}</code> capture_mode=<code>{escape(episode.capture_mode or '-')}</code> task_family=<code>{escape(episode.task_family or '-')}</code> target_type=<code>{escape(episode.target_type or '-')}</code> target=<code>{escape(episode.target_description or '-')}</code> derived_side=<code>{escape(episode.derived_target_side or '-')}</code> derived_distance=<code>{escape(episode.derived_target_distance or '-')}</code> derived_source=<code>{escape(episode.derived_label_source or '-')}</code> scene=<code>{escape(episode.scene_id or '-')}</code> operator=<code>{escape(episode.operator_id or '-')}</code> warnings=<code>{escape(warnings)}</code> info=<code>{escape(info)}</code></p>
     <p class=\"meta\">duration_s=<code>{episode.trajectory_metrics.get('duration_seconds', 0.0):.3f}</code> action_changes=<code>{episode.trajectory_metrics.get('action_change_count', 0)}</code> stop_ratio=<code>{episode.trajectory_metrics.get('stop_ratio', 0.0):.1%}</code> turn_ratio=<code>{episode.trajectory_metrics.get('turn_ratio', 0.0):.1%}</code> buckets=<code>{escape(', '.join(episode.trajectory_metrics.get('action_buckets') or []) or '-')}</code></p>
   </div>
   <div class=\"card\">
@@ -389,7 +395,7 @@ def write_reports(episodes: Sequence[EpisodeRecord], output_dir: Path, data_root
         page_path.write_text(_episode_page(episode, page_path, index_path, rng, num_samples), encoding="utf-8")
         rows.append(
             f"<tr><td><a href=\"episodes/{escape(page_name)}\">{escape(episode.session_id)} / {escape(episode.episode_id)}</a></td>"
-            f"<td>{escape(episode.instruction)}</td><td>{escape(episode.capture_mode or '-')}</td><td>{escape(episode.task_family or '-')}</td><td>{escape(episode.target_description or episode.target_type or '-')}</td><td>{len(episode.frames)}</td>"
+            f"<td>{escape(episode.instruction)}</td><td>{escape(episode.capture_mode or '-')}</td><td>{escape(episode.task_family or '-')}</td><td>{escape(episode.target_description or episode.target_type or '-')}</td><td>{escape(episode.derived_target_side or '-')}</td><td>{escape(episode.derived_target_distance or '-')}</td><td>{len(episode.frames)}</td>"
             f"<td>{episode.trajectory_metrics.get('duration_seconds', 0.0):.2f}</td><td>{int(episode.trajectory_metrics.get('action_change_count', 0))}</td><td>{episode.trajectory_metrics.get('stop_ratio', 0.0):.1%}</td><td>{episode.trajectory_metrics.get('turn_ratio', 0.0):.1%}</td>"
             f"<td>{escape(episode.scene_id or '-')}</td><td>{escape(episode.operator_id or '-')}</td>"
             f"<td>{escape(', '.join(episode.warnings) or '无')}</td>"
@@ -404,6 +410,8 @@ def write_reports(episodes: Sequence[EpisodeRecord], output_dir: Path, data_root
     task_family_counts: Dict[str, int] = {}
     target_type_counts: Dict[str, int] = {}
     target_description_counts: Dict[str, int] = {}
+    derived_target_side_counts: Dict[str, int] = {}
+    derived_target_distance_counts: Dict[str, int] = {}
     instruction_scene_sets: Dict[str, set] = {}
     instruction_target_sets: Dict[str, set] = {}
     zero_action_frame_count = 0
@@ -425,11 +433,22 @@ def write_reports(episodes: Sequence[EpisodeRecord], output_dir: Path, data_root
         task_family_key = episode.task_family or "-"
         target_type_key = episode.target_type or "-"
         target_description_key = episode.target_description or "-"
+        derived_target_side_key = episode.derived_target_side or "-"
+        derived_target_distance_key = episode.derived_target_distance or "-"
         task_family_counts[task_family_key] = task_family_counts.get(task_family_key, 0) + 1
         target_type_counts[target_type_key] = target_type_counts.get(target_type_key, 0) + 1
         target_description_counts[target_description_key] = target_description_counts.get(target_description_key, 0) + 1
+        derived_target_side_counts[derived_target_side_key] = derived_target_side_counts.get(derived_target_side_key, 0) + 1
+        derived_target_distance_counts[derived_target_distance_key] = derived_target_distance_counts.get(derived_target_distance_key, 0) + 1
         instruction_scene_sets.setdefault(episode.instruction, set()).add(scene_key)
-        instruction_target_sets.setdefault(episode.instruction, set()).add(episode.target_description or episode.target_type or "-")
+        derived_target_key = (
+            f"{episode.derived_target_side or 'unknown'}:{episode.derived_target_distance or 'unknown'}"
+            if (episode.derived_target_side or episode.derived_target_distance)
+            else "-"
+        )
+        instruction_target_sets.setdefault(episode.instruction, set()).add(
+            episode.target_description or episode.target_type or derived_target_key
+        )
         frame_lengths.append(len(episode.frames))
         duration_values.append(float(episode.trajectory_metrics.get("duration_seconds", 0.0)))
         action_change_values.append(float(episode.trajectory_metrics.get("action_change_count", 0.0)))
@@ -464,6 +483,8 @@ def write_reports(episodes: Sequence[EpisodeRecord], output_dir: Path, data_root
         "task_family_episode_counts": dict(sorted(task_family_counts.items())),
         "target_type_episode_counts": dict(sorted(target_type_counts.items())),
         "target_description_episode_counts": dict(sorted(target_description_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "derived_target_side_episode_counts": dict(sorted(derived_target_side_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "derived_target_distance_episode_counts": dict(sorted(derived_target_distance_counts.items(), key=lambda item: (-item[1], item[0]))),
         "instructions_with_multiple_scenes": {
             instruction: sorted(scene_set)
             for instruction, scene_set in sorted(instruction_scene_sets.items())
@@ -536,6 +557,14 @@ def write_reports(episodes: Sequence[EpisodeRecord], output_dir: Path, data_root
     target_type_rows = "".join(
         f"<tr><td><code>{escape(name)}</code></td><td>{count}</td></tr>"
         for name, count in summary["target_type_episode_counts"].items()
+    )
+    derived_target_side_rows = "".join(
+        f"<tr><td><code>{escape(name)}</code></td><td>{count}</td></tr>"
+        for name, count in summary["derived_target_side_episode_counts"].items()
+    )
+    derived_target_distance_rows = "".join(
+        f"<tr><td><code>{escape(name)}</code></td><td>{count}</td></tr>"
+        for name, count in summary["derived_target_distance_episode_counts"].items()
     )
     session_rows = "".join(
         f"<tr><td><code>{escape(name)}</code></td><td>{count}</td></tr>"
@@ -632,6 +661,20 @@ def write_reports(episodes: Sequence[EpisodeRecord], output_dir: Path, data_root
         <tbody>{target_type_rows or '<tr><td colspan="2">没有可用的目标元数据。</td></tr>'}</tbody>
       </table>
     </div>
+    <div class=\"card\">
+      <h2>派生左右标签统计</h2>
+      <table>
+        <thead><tr><th>target_side_band</th><th>Episode 数</th></tr></thead>
+        <tbody>{derived_target_side_rows or '<tr><td colspan="2">还没有派生左右标签。</td></tr>'}</tbody>
+      </table>
+    </div>
+    <div class=\"card\">
+      <h2>派生远近标签统计</h2>
+      <table>
+        <thead><tr><th>target_distance_band</th><th>Episode 数</th></tr></thead>
+        <tbody>{derived_target_distance_rows or '<tr><td colspan="2">还没有派生远近标签。</td></tr>'}</tbody>
+      </table>
+    </div>
   </div>
   <div class=\"grid\">
     <div class=\"card\">
@@ -675,7 +718,7 @@ def write_reports(episodes: Sequence[EpisodeRecord], output_dir: Path, data_root
   </div>
   <div class=\"card\">
     <table>
-      <thead><tr><th>Episode</th><th>指令</th><th>采集模式</th><th>任务族</th><th>目标</th><th>帧数</th><th>Duration(s)</th><th>Action Changes</th><th>Stop Ratio</th><th>Turn Ratio</th><th>场景</th><th>操作员</th><th>警告</th><th>信息</th></tr></thead>
+      <thead><tr><th>Episode</th><th>指令</th><th>采集模式</th><th>任务族</th><th>目标</th><th>左右</th><th>远近</th><th>帧数</th><th>Duration(s)</th><th>Action Changes</th><th>Stop Ratio</th><th>Turn Ratio</th><th>场景</th><th>操作员</th><th>警告</th><th>信息</th></tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table>
   </div>

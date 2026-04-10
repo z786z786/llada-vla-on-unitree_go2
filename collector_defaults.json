@@ -1,6 +1,6 @@
 {
-  "scene_id": "earth",
-  "operator_id": "wxh",
+  "scene_id": "test",
+  "operator_id": "test",
   "instruction": "go to the door",
   "capture_mode": "trajectory",
   "task_family": "goal_navigation",

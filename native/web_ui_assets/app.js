@@ -1,10 +1,11 @@
 const summaryGrid = document.getElementById("summary-grid");
-const robotGrid = document.getElementById("robot-grid");
-const processGrid = document.getElementById("process-grid");
+const summaryNote = document.getElementById("summary-note");
 const actionResult = document.getElementById("action-result");
-const configForm = document.getElementById("config-form");
 const cameraThumb = document.getElementById("camera-thumb");
 const cameraMeta = document.getElementById("camera-meta");
+const cameraFocusButton = document.getElementById("camera-focus-btn");
+const controlsHint = document.getElementById("controls-hint");
+const ratingHint = document.getElementById("rating-hint");
 
 const controls = {
   start: document.getElementById("start-btn"),
@@ -13,7 +14,6 @@ const controls = {
   estop: document.getElementById("estop-btn"),
   clearFault: document.getElementById("clear-fault-btn"),
   quit: document.getElementById("quit-btn"),
-  applyConfig: document.getElementById("apply-config-btn"),
 };
 
 const ratingButtons = {
@@ -61,12 +61,115 @@ const configFields = {
 };
 
 let statusCache = null;
-let lastImageRefreshAt = 0;
-let configDirty = false;
-let applyInFlight = false;
+let cameraStreamUrl = "";
+let cameraReconnectTimer = null;
+let cameraFocusMode = false;
+
+const STATUS_POLL_INTERVAL_MS = 250;
+const CAMERA_RECONNECT_DELAY_MS = 1000;
+
+const inputHints = {
+  wireless_controller: {
+    controlsHint: "wireless controller + web buttons",
+    ratingHint: "D-pad or 1-4",
+    buttons: {
+      start: ["Start", "A"],
+      stop: ["Stop", "B"],
+      discard: ["Discard", "X"],
+      estop: ["E-Stop", "R2"],
+      clearFault: ["Clear Fault", "Y"],
+      quit: ["Quit", "UI"],
+    },
+  },
+  evdev: {
+    controlsHint: "keyboard + web buttons",
+    ratingHint: "1-4 shortcuts",
+    buttons: {
+      start: ["Start", "R"],
+      stop: ["Stop", "T"],
+      discard: ["Discard", "ESC"],
+      estop: ["E-Stop", "Space"],
+      clearFault: ["Clear Fault", "C"],
+      quit: ["Quit", "X"],
+    },
+  },
+  tty: {
+    controlsHint: "keyboard + web buttons",
+    ratingHint: "1-4 shortcuts",
+    buttons: {
+      start: ["Start", "R"],
+      stop: ["Stop", "T"],
+      discard: ["Discard", "ESC"],
+      estop: ["E-Stop", "Space"],
+      clearFault: ["Clear Fault", "C"],
+      quit: ["Quit", "X"],
+    },
+  },
+};
 
 function setLog(value) {
-  actionResult.textContent = value;
+  if (actionResult) {
+    actionResult.textContent = value;
+  }
+}
+
+function setCameraFocusMode(enabled) {
+  cameraFocusMode = enabled;
+  document.body.classList.toggle("camera-focus-mode", enabled);
+  cameraFocusButton.textContent = enabled ? "Exit Focus" : "Focus View";
+  cameraFocusButton.setAttribute("aria-pressed", enabled ? "true" : "false");
+}
+
+function clearCameraReconnectTimer() {
+  if (cameraReconnectTimer !== null) {
+    window.clearTimeout(cameraReconnectTimer);
+    cameraReconnectTimer = null;
+  }
+}
+
+function stopCameraStream() {
+  clearCameraReconnectTimer();
+  cameraThumb.removeAttribute("src");
+  cameraThumb.hidden = true;
+  cameraStreamUrl = "";
+}
+
+function scheduleCameraReconnect() {
+  if (cameraReconnectTimer !== null || !statusCache || !statusCache.robot.image_valid) {
+    return;
+  }
+  cameraReconnectTimer = window.setTimeout(() => {
+    cameraReconnectTimer = null;
+    ensureCameraStream();
+  }, CAMERA_RECONNECT_DELAY_MS);
+}
+
+function ensureCameraStream() {
+  if (!statusCache || !statusCache.robot.image_valid) {
+    stopCameraStream();
+    return;
+  }
+
+  if (cameraStreamUrl) {
+    return;
+  }
+
+  clearCameraReconnectTimer();
+  const nextUrl = `/api/image/stream.mjpeg?t=${Date.now()}`;
+  cameraStreamUrl = nextUrl;
+  cameraThumb.src = nextUrl;
+  cameraThumb.hidden = false;
+}
+
+function setButtonHint(button, label, shortcut) {
+  const labelNode = button.querySelector(".btn-label");
+  const shortcutNode = button.querySelector(".kbd");
+  if (labelNode) {
+    labelNode.textContent = label;
+  }
+  if (shortcutNode) {
+    shortcutNode.textContent = shortcut;
+  }
 }
 
 function renderItems(target, items) {
@@ -84,41 +187,14 @@ async function postJson(url, body = {}) {
   return response.json();
 }
 
-function currentConfigPayload() {
-  return {
-    scene_id: configFields.sceneId.value,
-    operator_id: configFields.operatorId.value,
-    instruction: configFields.instruction.value,
-    capture_mode: configFields.captureMode.value,
-    task_family: configFields.taskFamily.value,
-    target_type: configFields.targetType.value,
-    target_description: configFields.targetDescription.value,
-    collector_notes: configFields.collectorNotes.value,
-    cmd_vx_max: Number(configFields.cmdVxMax.value),
-    cmd_vy_max: Number(configFields.cmdVyMax.value),
-    cmd_wz_max: Number(configFields.cmdWzMax.value),
-  };
-}
-
-async function applyConfigFromForm() {
-  applyInFlight = true;
-  try {
-    const result = await postJson("/api/config/update", currentConfigPayload());
-    if (result.ok) {
-      configDirty = false;
-    }
-    setLog(JSON.stringify(result, null, 2));
-    await refreshStatus();
-    return result;
-  } finally {
-    applyInFlight = false;
-  }
+async function postAction(url, body = {}) {
+  const result = await postJson(url, body);
+  setLog(JSON.stringify(result, null, 2));
+  await refreshStatus();
+  return result;
 }
 
 function syncConfigForm(status) {
-  if (configDirty || applyInFlight || configForm.contains(document.activeElement)) {
-    return;
-  }
   const cfg = status.run_context;
   configFields.sceneId.value = cfg.scene_id || "";
   configFields.operatorId.value = cfg.operator_id || "";
@@ -152,6 +228,25 @@ function describeStopPhase(stopPhase) {
   }
 }
 
+function describeRecordingGate(status) {
+  if (!status.startup_gate.active) {
+    return "ready";
+  }
+  if (status.process_config.input_backend === "wireless_controller") {
+    return "waiting_native_start";
+  }
+  return "waiting";
+}
+
+function applyInputHints(inputBackend) {
+  const hints = inputHints[inputBackend] || inputHints.tty;
+  controlsHint.textContent = hints.controlsHint;
+  ratingHint.textContent = hints.ratingHint;
+  Object.entries(hints.buttons).forEach(([name, [label, shortcut]]) => {
+    setButtonHint(controls[name], label, shortcut);
+  });
+}
+
 async function submitRatingPreset(key) {
   if (!statusCache || !statusCache.actions.can_submit_label) {
     return;
@@ -160,44 +255,42 @@ async function submitRatingPreset(key) {
   if (!preset) {
     return;
   }
-  const result = await postJson("/api/label/submit", preset);
-  setLog(JSON.stringify(result, null, 2));
-  refreshStatus();
+  await postAction("/api/label/submit", preset);
 }
 
 function renderStatus(status) {
   statusCache = status;
+  applyInputHints(status.process_config.input_backend);
+  const robotState = status.robot.connected ? "online" : "offline";
+  const cameraState = status.robot.image_valid
+    ? `${Number(status.robot.image_age_s).toFixed(2)}s`
+    : "waiting";
   renderItems(summaryGrid, [
     ["capture_state", status.collector.capture_state],
-    ["startup_gate", status.startup_gate.active ? "locked / apply config first" : "ready"],
-    ["label_flow", describeStopPhase(status.collector.stop_phase)],
     ["safety_state", status.collector.safety_state],
-    ["recording", String(status.collector.recording)],
-    ["seg_s", String(status.collector.segment_duration_s)],
-    ["fault_reason", status.collector.fault_reason || "-"],
+    ["robot", robotState],
+    ["camera", cameraState],
+    ["recording", status.collector.recording ? "on" : "off"],
+    ["cmd", `vx ${Number(status.command.vx).toFixed(2)} vy ${Number(status.command.vy).toFixed(2)} wz ${Number(status.command.wz).toFixed(2)}`],
   ]);
-
-  renderItems(robotGrid, [
-    ["robot_connected", String(status.robot.connected)],
-    ["state_valid", String(status.robot.state_valid)],
-    ["cmd", `vx ${Number(status.command.vx).toFixed(2)}  vy ${Number(status.command.vy).toFixed(2)}  wz ${Number(status.command.wz).toFixed(2)}`],
-    ["body_height", String(status.robot.body_height)],
-    ["roll", String(status.robot.roll)],
-    ["pitch", String(status.robot.pitch)],
-    ["yaw", String(status.robot.yaw)],
-  ]);
-
-  renderItems(processGrid, [
-    ["network_interface", status.process_config.network_interface],
-    ["input_backend", status.process_config.input_backend],
-    ["capture_mode", status.run_context.capture_mode],
-    ["output_dir", status.process_config.output_dir],
-    ["defaults_path", status.process_config.defaults_path || "-"],
-  ]);
+  const summaryHints = [];
+  if (status.collector.fault_reason) {
+    summaryHints.push(`fault: ${status.collector.fault_reason}`);
+  }
+  if (status.startup_gate.active && status.startup_gate.prompt) {
+    summaryHints.push(status.startup_gate.prompt);
+  } else if (status.collector.stop_phase && status.collector.stop_phase !== "idle") {
+    summaryHints.push(`label flow: ${describeStopPhase(status.collector.stop_phase)}`);
+  } else {
+    summaryHints.push(
+      `${status.process_config.input_backend} / ${status.run_context.capture_mode} / video ${String(status.process_config.video_poll_hz)}Hz`
+    );
+  }
+  summaryNote.textContent = summaryHints.join("  |  ");
 
   syncConfigForm(status);
 
-  controls.start.disabled = status.startup_gate.active || !status.actions.can_start_recording;
+  controls.start.disabled = !status.actions.can_start_recording;
   controls.stop.disabled = !status.actions.can_stop_recording;
   controls.discard.disabled = !status.actions.can_discard_segment;
   controls.estop.disabled = !status.actions.can_estop;
@@ -205,15 +298,20 @@ function renderStatus(status) {
   setRatingButtonsDisabled(!status.actions.can_submit_label);
 
   if (status.robot.image_valid) {
-    const now = Date.now();
-    if (now - lastImageRefreshAt > 700) {
-      cameraThumb.src = `/api/image/latest.jpg?t=${now}`;
-      lastImageRefreshAt = now;
+    if (cameraReconnectTimer !== null) {
+      cameraThumb.hidden = true;
+      cameraMeta.textContent = "stream reconnecting...";
+    } else if (Number(status.robot.image_age_s) > 1.5) {
+      stopCameraStream();
+      cameraMeta.textContent = "stream stalled, reconnecting...";
+      scheduleCameraReconnect();
+    } else {
+      ensureCameraStream();
+      cameraThumb.hidden = false;
+      cameraMeta.textContent = `image age ${Number(status.robot.image_age_s).toFixed(2)}s / live stream`;
     }
-    cameraThumb.hidden = false;
-    cameraMeta.textContent = `image age ${Number(status.robot.image_age_s).toFixed(2)}s`;
   } else {
-    cameraThumb.hidden = true;
+    stopCameraStream();
     cameraMeta.textContent = "waiting for image...";
   }
 }
@@ -228,41 +326,34 @@ async function refreshStatus() {
   }
 }
 
-document.getElementById("config-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  await applyConfigFromForm();
+cameraThumb.addEventListener("load", () => {
+  clearCameraReconnectTimer();
 });
 
-Object.values(configFields).forEach((field) => {
-  const markDirty = () => {
-    configDirty = true;
-  };
-  field.addEventListener("input", markDirty);
-  field.addEventListener("change", markDirty);
+cameraThumb.addEventListener("error", () => {
+  cameraMeta.textContent = "stream reconnecting...";
+  cameraStreamUrl = "";
+  scheduleCameraReconnect();
 });
 
 controls.start.addEventListener("click", async () => {
-  setLog(JSON.stringify(await postJson("/api/control/start"), null, 2));
-  refreshStatus();
+  await postAction("/api/control/start");
 });
 controls.stop.addEventListener("click", async () => {
-  setLog(JSON.stringify(await postJson("/api/control/stop"), null, 2));
-  refreshStatus();
+  await postAction("/api/control/stop");
 });
 controls.discard.addEventListener("click", async () => {
-  setLog(JSON.stringify(await postJson("/api/control/discard"), null, 2));
-  refreshStatus();
+  await postAction("/api/control/discard");
 });
 controls.estop.addEventListener("click", async () => {
-  setLog(JSON.stringify(await postJson("/api/control/estop"), null, 2));
-  refreshStatus();
+  await postAction("/api/control/estop");
 });
 controls.clearFault.addEventListener("click", async () => {
-  setLog(JSON.stringify(await postJson("/api/control/clear-fault"), null, 2));
-  refreshStatus();
+  await postAction("/api/control/clear-fault");
 });
 controls.quit.addEventListener("click", async () => {
-  setLog(JSON.stringify(await postJson("/api/control/quit"), null, 2));
+  const result = await postJson("/api/control/quit");
+  setLog(JSON.stringify(result, null, 2));
 });
 
 Object.entries(ratingButtons).forEach(([key, button]) => {
@@ -275,14 +366,15 @@ document.addEventListener("keydown", async (event) => {
   if (event.repeat) {
     return;
   }
-  const activeTag = document.activeElement ? document.activeElement.tagName : "";
-  if (activeTag === "INPUT" || activeTag === "TEXTAREA" || activeTag === "SELECT") {
+
+  if (event.key === "Escape" && cameraFocusMode) {
+    event.preventDefault();
+    setCameraFocusMode(false);
     return;
   }
 
-  if (event.key === "o" || event.key === "O") {
-    event.preventDefault();
-    await applyConfigFromForm();
+  const activeTag = document.activeElement ? document.activeElement.tagName : "";
+  if (activeTag === "INPUT" || activeTag === "TEXTAREA" || activeTag === "SELECT") {
     return;
   }
 
@@ -292,5 +384,13 @@ document.addEventListener("keydown", async (event) => {
   }
 });
 
-setInterval(refreshStatus, 500);
+cameraFocusButton.addEventListener("click", () => {
+  setCameraFocusMode(!cameraFocusMode);
+});
+
+cameraThumb.addEventListener("dblclick", () => {
+  setCameraFocusMode(!cameraFocusMode);
+});
+
+setInterval(refreshStatus, STATUS_POLL_INTERVAL_MS);
 refreshStatus();
