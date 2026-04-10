@@ -356,7 +356,14 @@ std::optional<HttpRequest> ReadHttpRequest(int fd)
             request.headers[key] = value;
             if (key == "Content-Length")
             {
-                contentLength = static_cast<size_t>(std::stoul(value));
+                try
+                {
+                    contentLength = static_cast<size_t>(std::stoul(value));
+                }
+                catch (...)
+                {
+                    return std::nullopt;
+                }
             }
         }
     }
@@ -417,6 +424,13 @@ std::string BuildBinaryHttpResponse(
 
 struct WebUiServer::Impl
 {
+    struct ClientThreadEntry
+    {
+        int clientFd = -1;
+        std::shared_ptr<std::atomic<bool>> done;
+        std::thread thread;
+    };
+
     explicit Impl(const WebUiServerConfig& cfg)
         : config(cfg)
     {
@@ -483,13 +497,14 @@ struct WebUiServer::Impl
         {
             thread.join();
         }
-        JoinClientThreads();
+        ReapFinishedClientThreads(true);
     }
 
     void ServeLoop()
     {
         while (running)
         {
+            ReapFinishedClientThreads(false);
             pollfd pfd{serverFd, POLLIN, 0};
             const int pollResult = ::poll(&pfd, 1, 100);
             if (pollResult <= 0)
@@ -509,19 +524,32 @@ struct WebUiServer::Impl
                 clientFds.push_back(clientFd);
             }
             std::lock_guard<std::mutex> lock(clientThreadMutex);
-            clientThreads.emplace_back(&Impl::HandleClientLoop, this, clientFd);
+            ClientThreadEntry entry;
+            entry.clientFd = clientFd;
+            entry.done = std::make_shared<std::atomic<bool>>(false);
+            entry.thread = std::thread(&Impl::HandleClientLoop, this, clientFd, entry.done);
+            clientThreads.emplace_back(std::move(entry));
         }
     }
 
-    void HandleClientLoop(int clientFd)
+    void HandleClientLoop(int clientFd, const std::shared_ptr<std::atomic<bool>>& done)
     {
-        HandleConnection(clientFd);
-        ::shutdown(clientFd, SHUT_RDWR);
-        ::close(clientFd);
+        try
+        {
+            HandleConnection(clientFd);
+        }
+        catch (...)
+        {
+            SendAll(clientFd, BuildHttpResponse(500, "Internal Server Error", "text/plain; charset=utf-8", "internal server error"));
+        }
+
         {
             std::lock_guard<std::mutex> lock(clientMutex);
             clientFds.erase(std::remove(clientFds.begin(), clientFds.end(), clientFd), clientFds.end());
         }
+        ::shutdown(clientFd, SHUT_RDWR);
+        ::close(clientFd);
+        done->store(true);
     }
 
     void HandleConnection(int clientFd)
@@ -746,19 +774,21 @@ struct WebUiServer::Impl
         }
     }
 
-    void JoinClientThreads()
+    void ReapFinishedClientThreads(bool joinAll)
     {
-        std::vector<std::thread> threads;
+        std::lock_guard<std::mutex> lock(clientThreadMutex);
+        for (auto it = clientThreads.begin(); it != clientThreads.end();)
         {
-            std::lock_guard<std::mutex> lock(clientThreadMutex);
-            threads.swap(clientThreads);
-        }
-        for (std::thread& worker : threads)
-        {
-            if (worker.joinable())
+            if (!joinAll && (!it->done || !it->done->load()))
             {
-                worker.join();
+                ++it;
+                continue;
             }
+            if (it->thread.joinable())
+            {
+                it->thread.join();
+            }
+            it = clientThreads.erase(it);
         }
     }
 
@@ -769,7 +799,7 @@ struct WebUiServer::Impl
     std::mutex clientMutex;
     std::vector<int> clientFds;
     std::mutex clientThreadMutex;
-    std::vector<std::thread> clientThreads;
+    std::vector<ClientThreadEntry> clientThreads;
 };
 
 WebUiServer::WebUiServer(const WebUiServerConfig& config)
