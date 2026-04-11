@@ -2079,6 +2079,25 @@ public:
         trajectoryStopForceFinalizeDeadline_ = std::chrono::steady_clock::time_point{};
     }
 
+    enum class TrajectoryStopFlowAction
+    {
+        None,
+        StartGracePeriod,
+        StartGracePeriodAfterTimeout,
+        Finalize,
+    };
+
+    static bool HasSteadyDeadline(const std::chrono::steady_clock::time_point& deadline)
+    {
+        return deadline.time_since_epoch().count() != 0;
+    }
+
+    static const char* TrajectoryStopStatusMessage(bool waitingForRelease)
+    {
+        return waitingForRelease ? "Stopping segment... waiting for input release"
+                                 : "Finalizing segment... submit a score";
+    }
+
     void ResetCaptureProgressLocked(const std::string& pendingLabelFallback = std::string())
     {
         activeMotionInstruction_ = MotionInstruction::None;
@@ -2091,6 +2110,16 @@ public:
     {
         captureState_ = safetyState_ == SafetyState::SafeReady ? CaptureState::Idle : CaptureState::Fault;
         ResetCaptureProgressLocked(pendingLabelFallback);
+    }
+
+    void BeginTrajectoryStopLocked(bool motionInputActive)
+    {
+        trajectoryStopRequested_ = true;
+        trajectoryStopWaitingForRelease_ = motionInputActive;
+        trajectoryStopFinalizeDeadline_ =
+            motionInputActive ? std::chrono::steady_clock::time_point{}
+                              : std::chrono::steady_clock::now() + kTrajectoryFinalizeGracePeriod;
+        trajectoryStopForceFinalizeDeadline_ = std::chrono::steady_clock::now() + kTrajectoryStopReleaseTimeout;
     }
 
     void StartTrajectoryFinalizeGracePeriod(const std::string& reason, bool emitLog)
@@ -2612,52 +2641,53 @@ private:
                motionState.right || motionState.yawLeft || motionState.yawRight;
     }
 
+    TrajectoryStopFlowAction EvaluateTrajectoryStopFlowLocked(const MotionStateSnapshot& motionState) const
+    {
+        if (captureState_ != CaptureState::Capturing || !trajectoryStopRequested_)
+        {
+            return TrajectoryStopFlowAction::None;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (trajectoryStopWaitingForRelease_)
+        {
+            if (!IsMotionInputActive(motionState))
+            {
+                return TrajectoryStopFlowAction::StartGracePeriod;
+            }
+            if (HasSteadyDeadline(trajectoryStopForceFinalizeDeadline_) && now >= trajectoryStopForceFinalizeDeadline_)
+            {
+                return TrajectoryStopFlowAction::StartGracePeriodAfterTimeout;
+            }
+            return TrajectoryStopFlowAction::None;
+        }
+
+        if (HasSteadyDeadline(trajectoryStopFinalizeDeadline_) && now >= trajectoryStopFinalizeDeadline_)
+        {
+            return TrajectoryStopFlowAction::Finalize;
+        }
+        return TrajectoryStopFlowAction::None;
+    }
+
     void UpdateTrajectoryStopFlow(const MotionStateSnapshot& motionState)
     {
-        bool shouldStartGrace = false;
-        bool timedOut = false;
-        bool shouldFinalize = false;
+        TrajectoryStopFlowAction action = TrajectoryStopFlowAction::None;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            if (captureState_ != CaptureState::Capturing || !trajectoryStopRequested_)
-            {
-                return;
-            }
-
-            const auto now = std::chrono::steady_clock::now();
-            if (trajectoryStopWaitingForRelease_)
-            {
-                if (!IsMotionInputActive(motionState))
-                {
-                    shouldStartGrace = true;
-                }
-                else if (trajectoryStopForceFinalizeDeadline_.time_since_epoch().count() != 0 &&
-                         now >= trajectoryStopForceFinalizeDeadline_)
-                {
-                    shouldStartGrace = true;
-                    timedOut = true;
-                }
-            }
-            else if (trajectoryStopFinalizeDeadline_.time_since_epoch().count() != 0 &&
-                     now >= trajectoryStopFinalizeDeadline_)
-            {
-                shouldFinalize = true;
-            }
+            action = EvaluateTrajectoryStopFlowLocked(motionState);
         }
 
-        if (shouldStartGrace)
+        if (action == TrajectoryStopFlowAction::StartGracePeriodAfterTimeout)
         {
-            if (timedOut)
-            {
-                StartTrajectoryFinalizeGracePeriod("Stopping segment timed out; finalizing segment... submit a score", true);
-            }
-            else
-            {
-                StartTrajectoryFinalizeGracePeriod("Finalizing segment... submit a score", true);
-            }
+            StartTrajectoryFinalizeGracePeriod("Stopping segment timed out; finalizing segment... submit a score", true);
             return;
         }
-        if (shouldFinalize)
+        if (action == TrajectoryStopFlowAction::StartGracePeriod)
+        {
+            StartTrajectoryFinalizeGracePeriod("Finalizing segment... submit a score", true);
+            return;
+        }
+        if (action == TrajectoryStopFlowAction::Finalize)
         {
             CompleteTrajectoryStopIfReady(true);
         }
@@ -3200,15 +3230,39 @@ private:
         return ActionOk("segment stopped for labeling");
     }
 
+    UiActionResult RequestTrajectoryStopInternal(MotionInstruction instruction, bool emitLog)
+    {
+        if (!logger_.HasEffectiveMotion())
+        {
+            return FinalizeCaptureForLabelInternal(instruction, emitLog);
+        }
+
+        const bool waitingForRelease = IsMotionInputActive(GetMotionStateSnapshot());
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            if (captureState_ != CaptureState::Capturing)
+            {
+                return ActionError("not_capturing", "当前没有可结束的采集段");
+            }
+            if (trajectoryStopRequested_)
+            {
+                return ActionError("already_stopping", "trajectory 已收到结束请求，正在等待动作回落");
+            }
+            BeginTrajectoryStopLocked(waitingForRelease);
+        }
+
+        if (emitLog)
+        {
+            PrintLine(TrajectoryStopStatusMessage(waitingForRelease));
+        }
+        return ActionOk("trajectory stop requested");
+    }
+
     UiActionResult StopSegmentForLabelInternal(bool emitLog)
     {
         const bool hasPendingLabel = logger_.GetStatus().pendingLabel;
-        const Config::CaptureMode captureModeSnapshot = GetEditableConfigSnapshot().captureMode;
+        const Config::CaptureMode captureMode = GetEditableConfigSnapshot().captureMode;
         MotionInstruction instruction = MotionInstruction::None;
-        Config::CaptureMode captureMode = captureModeSnapshot;
-        bool requestTrajectoryStop = false;
-        bool finalizeImmediately = false;
-        bool waitingForRelease = false;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
             if (captureState_ != CaptureState::Capturing)
@@ -3224,55 +3278,11 @@ private:
                 return ActionError("not_capturing", "当前没有可结束的采集段");
             }
             instruction = activeMotionInstruction_;
-            if (captureMode == Config::CaptureMode::Trajectory)
-            {
-                if (trajectoryStopRequested_)
-                {
-                    return ActionError("already_stopping", "trajectory 已收到结束请求，正在等待动作回落");
-                }
-                requestTrajectoryStop = true;
-            }
         }
 
         if (captureMode == Config::CaptureMode::Trajectory)
         {
-            if (!logger_.HasEffectiveMotion())
-            {
-                finalizeImmediately = true;
-            }
-            else
-            {
-                const bool motionInputActive = IsMotionInputActive(GetMotionStateSnapshot());
-                std::lock_guard<std::mutex> lock(stateMachineMutex_);
-                trajectoryStopRequested_ = true;
-                trajectoryStopWaitingForRelease_ = motionInputActive;
-                trajectoryStopFinalizeDeadline_ = motionInputActive
-                                                      ? std::chrono::steady_clock::time_point{}
-                                                      : std::chrono::steady_clock::now() + kTrajectoryFinalizeGracePeriod;
-                trajectoryStopForceFinalizeDeadline_ = std::chrono::steady_clock::now() + kTrajectoryStopReleaseTimeout;
-                waitingForRelease = motionInputActive;
-            }
-        }
-
-        if (finalizeImmediately)
-        {
-            return FinalizeCaptureForLabelInternal(instruction, emitLog);
-        }
-
-        if (requestTrajectoryStop)
-        {
-            if (emitLog)
-            {
-                if (waitingForRelease)
-                {
-                    PrintLine("Stopping segment... waiting for input release");
-                }
-                else
-                {
-                    PrintLine("Finalizing segment... submit a score");
-                }
-            }
-            return ActionOk("trajectory stop requested");
+            return RequestTrajectoryStopInternal(instruction, emitLog);
         }
         return FinalizeCaptureForLabelInternal(instruction, emitLog);
     }
