@@ -35,21 +35,16 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
   - `vy <= 0.3`
   - `wz <= 0.8`
 
-现在 collector 有两种采集模式：
+现在 collector 仅保留 `--capture-mode trajectory`：
 
-- `--capture-mode single_action`
-  - 旧模式，默认值
-  - 按 `R` 后进入 arm
-  - 检测到第一个单一运动键后，等待 0.5 秒再开始录制
-  - 中途换向、混合按键会丢弃该段
-  - 松键自动结束
-- `--capture-mode trajectory`
-  - 新模式，适合视觉必需任务
-  - 按 `R` 立即开始录制
-  - episode 内允许前进、转向、横移、停顿、多阶段变化
-  - 按 `T` 结束并保存
-  - 按 `ESC` 丢弃
-  - 该模式下必须传 `--instruction`
+- 适合视觉必需任务
+- 按 `R` 立即进入采集流程
+- episode 内允许前进、转向、横移、停顿、多阶段变化
+- 按 `T` 请求结束，等待动作回落后进入标注
+- 按 `ESC` 丢弃
+- 该模式下必须传 `--instruction`
+
+状态机说明见 `docs/collector_state_machine.md`。
 
 如果你在采集“视觉必需”任务，建议每次启动 collector 固定一个任务配置，例如：
 
@@ -62,9 +57,7 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
   --instruction "go to the door" \
   --task-family goal_navigation \
   --target-type door \
-  --target-description "corridor end glass door" \
-  --target-instance-id corridor_a_door_01 \
-  --task-tags indoor,daylight
+  --target-description "corridor end glass door"
 ```
 
 其他两个典型例子：
@@ -120,12 +113,12 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
 
 手柄控制：
 
-- `Start`：应用当前配置并解锁
+- `Start`：保持 Go2 原生行为，并在首次按下后解除 collector 启动门控
 - 左摇杆 `ly/lx`：前进 / 后退、左移 / 右移
 - 右摇杆 `rx`：左转 / 右转
-- `A`：按当前 `capture_mode` 启动采集
-- `B`：如果当前正在记录，则结束并保存当前区间
-- `X`：取消当前已 arm 或正在进行的区间
+- `A`：启动 trajectory 采集
+- `B`：如果当前正在记录，则请求结束并进入标注
+- `X`：丢弃当前区间
 - `R2`：急停，并 latch safety fault
 - `Y`：清除已恢复的 safety fault，或切换 stand up / down
 - 方向键 `上/右/下/左`：待标注时提交 `1/2/3/4`
@@ -140,9 +133,9 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
 
 采集控制：
 
-- `R`：按当前 `capture_mode` 启动采集
-- `T`：如果当前正在记录，则结束并保存当前区间
-- `ESC`：取消当前已 arm 或正在进行的区间
+- `R`：启动 trajectory 采集
+- `T`：如果当前正在记录，则请求结束并进入标注
+- `ESC`：丢弃当前区间
 
 安全与辅助：
 
@@ -178,8 +171,7 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
 
 推荐操作流程：
 
-- 如果是旧的单动作短片段数据，继续用 `single_action`
-- 如果是视觉必需任务，优先改用 `trajectory`
+- 统一使用 `trajectory`
 - 在 `trajectory` 模式下，一条 episode 可以包含：
   - 起步
   - 轻微对准

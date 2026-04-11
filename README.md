@@ -9,7 +9,7 @@
 
 当前工作区提供：
 
-- `native/build/go2_collector`：主采集程序，支持传统短动作采集与 `trajectory` 长轨迹语义任务
+- `native/build/go2_collector`：主采集程序，仅支持 `trajectory` 长轨迹语义任务
 - `scripts/sanity_check_dataset.py`：生成 HTML 回放与数据体检报告
 - `tools/validate_bc_dataset.py`：离线可训练性验证工具
 - `tools/derive_distribution_labels.py`：按轨迹属性分布生成左右/远近标签
@@ -82,23 +82,13 @@ cmake --build native/build -j
 
 ## 采集流程
 
-当前 collector 同时保留：
-
-- 传统 `single_action` 短动作采集
-- 面向视觉任务的 `trajectory` 长轨迹采集
-
-传统短动作示例：
-
-```bash
-cd /home/xiaohui/unitree_go2/go2_vla_collector
-./native/build/go2_collector   --network-interface eno1   --scene-id corridor_a   --operator-id op_01   --instruction "go forward"
-```
+当前 collector 仅保留面向视觉任务的 `trajectory` 长轨迹采集。
 
 长轨迹语义任务示例：
 
 ```bash
 cd /home/xiaohui/unitree_go2/go2_vla_collector
-./native/build/go2_collector   --network-interface eno1   --capture-mode trajectory   --scene-id corridor_a   --operator-id op_01   --instruction "go to the door"   --task-family goal_navigation   --target-type door   --target-description "glass door at corridor end"   --target-instance-id corridor_a_door_01   --task-tags indoor,bright_light
+./native/build/go2_collector   --network-interface eno1   --capture-mode trajectory   --scene-id corridor_a   --operator-id op_01   --instruction "go to the door"   --task-family goal_navigation   --target-type door   --target-description "glass door at corridor end"
 ```
 
 其他语义任务示例：
@@ -114,24 +104,19 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
 采集注意事项：
 
 - `scene_id` 与 `operator_id` 始终必填
+- `--instruction` 现在始终必填
 - 同一轮语义任务采集应保持任务配置稳定
-- 若不传 `--instruction`，collector 会回退为动作标签模式
-- `task_tags` 可用于后续筛选与分析
 
 ### 采集模式
 
-- `single_action`
-  - 按 `R` 进入 armed
-  - 第一个单一动作键会锁定本段动作标签
-  - 延迟 0.5 秒开始录制
-  - 中途混合按键或换向会丢弃该段
-  - 松键自动结束并保存
 - `trajectory`
   - 按 `R` 立即开始录制
   - 允许多阶段动作变化
-  - 按 `T` 结束并保存
+  - 按 `T` 请求结束，等待动作回落后进入标注
   - 按 `ESC` 丢弃
   - 必须提供 `--instruction`
+
+状态机说明见 `docs/collector_state_machine.md`。
 
 ## 操作设备
 
@@ -139,12 +124,12 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
 
 手柄映射：
 
-- `Start`：应用当前配置并解锁
+- `Start`：保持 Go2 原生行为，并在首次按下后解除 collector 启动门控
 - 左摇杆 `ly/lx`：前进后退 / 左右平移
 - 右摇杆 `rx`：左转 / 右转
-- `A`：按当前采集模式启动采集
-- `B`：结束当前采集段并保存
-- `X`：取消当前 armed 或 active 段
+- `A`：启动 trajectory 采集
+- `B`：请求结束当前采集段并进入标注
+- `X`：丢弃当前区间
 - `R2`：急停
 - `Y`：清除故障或切换站立 / 趴下
 - 方向键 `上/右/下/左`：待标注时提交 `1/2/3/4`
@@ -154,9 +139,9 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
 - `W/S`：前进 / 后退
 - `A/D`：左移 / 右移
 - `Q/E`：左转 / 右转
-- `R`：按当前采集模式启动采集
-- `T`：结束当前采集段并保存
-- `ESC`：取消当前 armed 或 active 段
+- `R`：启动 trajectory 采集
+- `T`：请求结束当前采集段并进入标注
+- `ESC`：丢弃当前区间
 - `Space`：急停
 - `C`：清除故障或切换站立 / 趴下
 - `P`：打印状态

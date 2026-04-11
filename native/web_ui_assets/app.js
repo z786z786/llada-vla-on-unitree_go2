@@ -199,7 +199,7 @@ function syncConfigForm(status) {
   configFields.sceneId.value = cfg.scene_id || "";
   configFields.operatorId.value = cfg.operator_id || "";
   configFields.instruction.value = cfg.instruction || "";
-  configFields.captureMode.value = cfg.capture_mode || "single_action";
+  configFields.captureMode.value = cfg.capture_mode || "trajectory";
   configFields.taskFamily.value = cfg.task_family || "";
   configFields.targetType.value = cfg.target_type || "";
   configFields.targetDescription.value = cfg.target_description || "";

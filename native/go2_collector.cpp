@@ -57,7 +57,6 @@ constexpr float kLinearDecelPerSecond = 4.5f;
 constexpr float kYawAccelPerSecond = 4.5f;
 constexpr float kYawDecelPerSecond = 6.0f;
 constexpr float kWirelessControllerDiscreteThreshold = 0.35f;
-constexpr auto kCaptureStartDelay = std::chrono::milliseconds(500);
 constexpr auto kStartupGateReminderInterval = std::chrono::seconds(2);
 constexpr auto kTrajectoryFinalizeGracePeriod = std::chrono::milliseconds(400);
 constexpr auto kTrajectoryStopReleaseTimeout = std::chrono::milliseconds(1200);
@@ -102,7 +101,6 @@ struct Config
 
     enum class CaptureMode
     {
-        SingleAction,
         Trajectory,
     };
 
@@ -112,7 +110,7 @@ struct Config
     double loopHz = 50.0;
     double videoPollHz = 20.0;
     InputBackend inputBackend = InputBackend::WirelessController;
-    CaptureMode captureMode = CaptureMode::SingleAction;
+    CaptureMode captureMode = CaptureMode::Trajectory;
     fs::path inputDevice;
     std::string sceneId;
     std::string operatorId;
@@ -130,7 +128,7 @@ struct Config
 
 struct EditableCollectorConfig
 {
-    Config::CaptureMode captureMode = Config::CaptureMode::SingleAction;
+    Config::CaptureMode captureMode = Config::CaptureMode::Trajectory;
     std::string sceneId;
     std::string operatorId;
     std::string instruction;
@@ -285,22 +283,8 @@ enum class SafetyState
 enum class CaptureState
 {
     Idle,
-    Armed,
-    DelayBeforeLog,
     Capturing,
     Fault,
-};
-
-enum class MotionInstruction
-{
-    None,
-    GoForward,
-    MoveBackward,
-    StrafeLeft,
-    StrafeRight,
-    TurnLeft,
-    TurnRight,
-    Mixed,
 };
 
 double NowSeconds()
@@ -557,10 +541,6 @@ std::string CaptureStateName(CaptureState state)
     {
     case CaptureState::Idle:
         return "idle";
-    case CaptureState::Armed:
-        return "armed";
-    case CaptureState::DelayBeforeLog:
-        return "delay_before_log";
     case CaptureState::Capturing:
         return "capturing";
     case CaptureState::Fault:
@@ -586,30 +566,6 @@ std::string TrajectoryStopPhaseName(bool pendingLabel, bool stopRequested, bool 
     return "finalizing";
 }
 
-std::string MotionInstructionName(MotionInstruction motion)
-{
-    switch (motion)
-    {
-    case MotionInstruction::None:
-        return "";
-    case MotionInstruction::GoForward:
-        return "go forward";
-    case MotionInstruction::MoveBackward:
-        return "move backward";
-    case MotionInstruction::StrafeLeft:
-        return "strafe left";
-    case MotionInstruction::StrafeRight:
-        return "strafe right";
-    case MotionInstruction::TurnLeft:
-        return "turn left";
-    case MotionInstruction::TurnRight:
-        return "turn right";
-    case MotionInstruction::Mixed:
-        return "mixed";
-    }
-    return "";
-}
-
 std::string InputBackendName(Config::InputBackend backend)
 {
     switch (backend)
@@ -628,8 +584,6 @@ std::string CaptureModeName(Config::CaptureMode mode)
 {
     switch (mode)
     {
-    case Config::CaptureMode::SingleAction:
-        return "single_action";
     case Config::CaptureMode::Trajectory:
         return "trajectory";
     }
@@ -906,10 +860,6 @@ std::optional<Config::InputBackend> ParseInputBackend(const std::string& value)
 
 std::optional<Config::CaptureMode> ParseCaptureMode(const std::string& value)
 {
-    if (value == "single_action")
-    {
-        return Config::CaptureMode::SingleAction;
-    }
     if (value == "trajectory")
     {
         return Config::CaptureMode::Trajectory;
@@ -1026,11 +976,11 @@ void PrintUsage(const char* program)
         << "  --loop-hz FLOAT          Control 和 logging loop frequency (default: 50.0)\n"
         << "  --video-poll-hz FLOAT    Camera polling frequency (default: 20.0)\n"
         << "  --input-backend MODE     Input backend: wireless_controller, evdev, or tty (default: wireless_controller)\n"
-        << "  --capture-mode MODE      Capture mode: single_action or trajectory (default: single_action)\n"
+        << "  --capture-mode MODE      Capture mode: trajectory (default: trajectory)\n"
         << "  --input-device PATH      evdev device path (default: auto-detect keyboard)\n"
         << "  --scene-id TEXT          Required scene identifier\n"
         << "  --operator-id TEXT       Required operator identifier\n"
-        << "  --instruction TEXT       Optional semantic instruction for all collected episodes in this run\n"
+        << "  --instruction TEXT       Required semantic instruction for all collected episodes in this run\n"
         << "  --task-family TEXT       Optional task family, e.g. goal_navigation / visual_following / obstacle_aware_navigation\n"
         << "  --target-type TEXT       Optional coarse target type, e.g. door / person / obstacle\n"
         << "  --target-description TEXT  Optional free-text target description; left/right/near/far can be derived offline\n"
@@ -1056,9 +1006,8 @@ void PrintUsage(const char* program)
         << "  wireless_controller subscribes Go2 native controller topic rt/wirelesscontroller\n"
         << "  evdev supports true multi-key press/release 和 smoother diagonal motion\n"
         << "  tty is a fallback mode 和 may feel less stable for combined keys\n"
-        << "Capture modes:\n"
-        << "  single_action arms on R, locks one motion key, waits 0.5s, records until key release, 然后进入标注\n"
-        << "  trajectory arms on R, auto-detects effective motion before logging, 和 on T waits for motion settle before labeling\n";
+        << "Capture mode:\n"
+        << "  trajectory starts on R, auto-detects effective motion before logging, and on T waits for motion settle before labeling\n";
 }
 
 std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
@@ -1138,7 +1087,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
             const auto captureMode = ParseCaptureMode(argv[++index]);
             if (!captureMode.has_value())
             {
-                error = "采集模式必须是 single_action 或 trajectory";
+                error = "采集模式当前仅支持 trajectory";
                 return std::nullopt;
             }
             config.captureMode = captureMode.value();
@@ -1299,9 +1248,9 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         error = "--operator-id 为必填参数";
         return std::nullopt;
     }
-    if (config.captureMode == Config::CaptureMode::Trajectory && config.instruction.empty())
+    if (config.instruction.empty())
     {
-        error = "使用 --capture-mode trajectory 时必须提供 --instruction";
+        error = "trajectory collector 必须提供 --instruction";
         return std::nullopt;
     }
     if (config.loopHz <= 0.0 || config.videoPollHz <= 0.0)
@@ -2098,18 +2047,15 @@ public:
                                  : "Finalizing segment... submit a score";
     }
 
-    void ResetCaptureProgressLocked(const std::string& pendingLabelFallback = std::string())
+    void ResetCaptureProgressLocked()
     {
-        activeMotionInstruction_ = MotionInstruction::None;
-        captureStartDeadline_ = std::chrono::steady_clock::time_point{};
-        pendingLabelFallbackInstruction_ = pendingLabelFallback;
         ResetTrajectoryStopFlowLocked();
     }
 
-    void EnterIdleOrFaultStateLocked(const std::string& pendingLabelFallback = std::string())
+    void EnterIdleOrFaultStateLocked()
     {
         captureState_ = safetyState_ == SafetyState::SafeReady ? CaptureState::Idle : CaptureState::Fault;
-        ResetCaptureProgressLocked(pendingLabelFallback);
+        ResetCaptureProgressLocked();
     }
 
     void BeginTrajectoryStopLocked(bool motionInputActive)
@@ -2532,9 +2478,7 @@ private:
                                     captureState == CaptureState::Idle &&
                                     !loggerStatus.pendingLabel;
         actions.canStopRecording = captureState == CaptureState::Capturing;
-        actions.canDiscardSegment = captureState == CaptureState::Armed ||
-                                    captureState == CaptureState::DelayBeforeLog ||
-                                    captureState == CaptureState::Capturing ||
+        actions.canDiscardSegment = captureState == CaptureState::Capturing ||
                                     loggerStatus.pendingLabel;
         actions.canSubmitLabel = loggerStatus.pendingLabel;
         actions.canEstop = safetyState != SafetyState::EstopLatched;
@@ -2594,45 +2538,6 @@ private:
         motionState.yawLeft = keyQ_.pressed || keyQ_.deadline > now;
         motionState.yawRight = keyE_.pressed || keyE_.deadline > now;
         return motionState;
-    }
-
-    static MotionInstruction MotionInstructionFromSnapshot(const MotionStateSnapshot& motionState)
-    {
-        const int activeCount = static_cast<int>(motionState.forward) +
-                                static_cast<int>(motionState.backward) +
-                                static_cast<int>(motionState.left) +
-                                static_cast<int>(motionState.right) +
-                                static_cast<int>(motionState.yawLeft) +
-                                static_cast<int>(motionState.yawRight);
-        if (activeCount == 0)
-        {
-            return MotionInstruction::None;
-        }
-        if (activeCount != 1)
-        {
-            return MotionInstruction::Mixed;
-        }
-        if (motionState.forward)
-        {
-            return MotionInstruction::GoForward;
-        }
-        if (motionState.backward)
-        {
-            return MotionInstruction::MoveBackward;
-        }
-        if (motionState.left)
-        {
-            return MotionInstruction::StrafeLeft;
-        }
-        if (motionState.right)
-        {
-            return MotionInstruction::StrafeRight;
-        }
-        if (motionState.yawLeft)
-        {
-            return MotionInstruction::TurnLeft;
-        }
-        return MotionInstruction::TurnRight;
     }
 
     static bool IsMotionInputActive(const MotionStateSnapshot& motionState)
@@ -2861,20 +2766,12 @@ private:
         else
         {
             std::cout << "  W/S forward/backward  A/D strafe  Q/E yaw" << std::endl;
-            std::cout << "  R start capture flow  ESC cancel current armed/capture segment" << std::endl;
+            std::cout << "  R start capture flow  T stop capture  ESC discard current segment" << std::endl;
             std::cout << "  Space emergency stop  C clear fault or toggle stand up/down  P status  H help  X quit" << std::endl;
             std::cout << "  pending label: 1 good demo  2 usable imperfect  3 failed but valuable  4 discard" << std::endl;
         }
-        if (editable.captureMode == Config::CaptureMode::SingleAction)
-        {
-            std::cout << "  single_action 模式：检测到第一个有效单动作输入后，等待 0.5 秒开始录制，松键自动结束" << std::endl;
-            std::cout << "  若设置 --instruction，则使用该语义指令；否则回退为动作标签" << std::endl;
-        }
-        else
-        {
-            std::cout << "  trajectory 模式：按 R 进入 armed，连续有效动作后开始写入，按 T 请求结束并等待动作回落后标注" << std::endl;
-            std::cout << "  该模式下必须提供 --instruction，并作为轨迹级语义标签保存" << std::endl;
-        }
+        std::cout << "  trajectory 模式：按 R 启动采集流程，连续有效动作后开始写入，按 T 请求结束并等待动作回落后标注" << std::endl;
+        std::cout << "  该模式下必须提供 --instruction，并作为轨迹级语义标签保存" << std::endl;
         std::cout << "  input_backend=" << InputBackendName(config_.inputBackend)
                   << " capture_mode=" << CaptureModeName(editable.captureMode) << std::endl;
     }
@@ -2893,22 +2790,13 @@ private:
         SafetyState safetyState;
         std::string faultReason;
         CaptureState captureState;
-        std::string activeInstruction;
-        double armDelayRemaining = 0.0;
         bool startupGateActive = false;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
             safetyState = safetyState_;
             faultReason = latchedFaultReason_;
             captureState = captureState_;
-            activeInstruction = MotionInstructionName(activeMotionInstruction_);
             startupGateActive = startupGateActive_;
-            if (captureState_ == CaptureState::DelayBeforeLog)
-            {
-                armDelayRemaining = std::max(
-                    0.0,
-                    std::chrono::duration<double>(captureStartDeadline_ - std::chrono::steady_clock::now()).count());
-            }
         }
 
         std::ostringstream oss;
@@ -2950,9 +2838,6 @@ private:
                 << (motionState.yawRight ? "E" : "")
                 << ")";
         }
-        oss
-            << " active_instruction=" << (activeInstruction.empty() ? "-" : activeInstruction)
-            << " capture_delay_s=" << std::fixed << std::setprecision(3) << armDelayRemaining;
         PrintLine(oss.str());
     }
 
@@ -3046,9 +2931,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
             hasFault = safetyState_ != SafetyState::SafeReady;
-            segmentActive = captureState_ == CaptureState::Armed ||
-                            captureState_ == CaptureState::DelayBeforeLog ||
-                            captureState_ == CaptureState::Capturing;
+            segmentActive = captureState_ == CaptureState::Capturing;
         }
 
         if (hasFault)
@@ -3119,7 +3002,7 @@ private:
         metadata.targetType = editable.targetType;
         metadata.targetDescription = editable.targetDescription;
         metadata.collectorNotes = editable.collectorNotes;
-        metadata.instructionSource = metadata.instruction.empty() ? "motion_label" : "semantic_text";
+        metadata.instructionSource = "semantic_text";
         return metadata;
     }
 
@@ -3149,14 +3032,6 @@ private:
             }
             return ActionError("already_capturing", "当前已有采集段正在进行");
         }
-        if (captureState_ == CaptureState::Armed || captureState_ == CaptureState::DelayBeforeLog)
-        {
-            if (emitLog)
-            {
-                PrintLine("当前已有采集段处于 armed 状态");
-            }
-            return ActionError("already_armed", "当前已有采集段处于 armed 状态");
-        }
         if (hasPendingLabel)
         {
             if (emitLog)
@@ -3168,17 +3043,15 @@ private:
         return std::nullopt;
     }
 
-    void EnterPreparedSegmentStateLocked(Config::CaptureMode captureMode)
+    void EnterPreparedSegmentStateLocked()
     {
-        captureState_ = captureMode == Config::CaptureMode::Trajectory ? CaptureState::Capturing : CaptureState::Armed;
+        captureState_ = CaptureState::Capturing;
         ResetCaptureProgressLocked();
     }
 
-    static const char* BeginSegmentReadyMessage(Config::CaptureMode captureMode)
+    static const char* BeginSegmentReadyMessage()
     {
-        return captureMode == Config::CaptureMode::Trajectory
-                   ? "trajectory 已 armed；检测到连续有效动作后开始写入，使用停止键结束，使用丢弃键取消"
-                   : "采集段已 armed，等待单一有效动作输入";
+        return "trajectory 采集已启动；检测到连续有效动作后开始写入，使用停止键结束，使用丢弃键取消";
     }
 
     void MaybePromptPendingLabelAfterStop()
@@ -3216,14 +3089,11 @@ private:
 
         try
         {
-            if (editable.captureMode == Config::CaptureMode::Trajectory)
-            {
-                logger_.BeginSegment(editable.sceneId, editable.operatorId, configuredTaskMetadata, trajectoryGateConfig_);
-            }
-            EnterPreparedSegmentStateLocked(editable.captureMode);
+            logger_.BeginSegment(editable.sceneId, editable.operatorId, configuredTaskMetadata, trajectoryGateConfig_);
+            EnterPreparedSegmentStateLocked();
             if (emitLog)
             {
-                PrintLine(BeginSegmentReadyMessage(editable.captureMode));
+                PrintLine(BeginSegmentReadyMessage());
             }
         }
         catch (const std::exception& ex)
@@ -3238,7 +3108,7 @@ private:
         return ActionOk("segment started");
     }
 
-    UiActionResult FinalizeCaptureForLabelInternal(MotionInstruction instruction, bool emitLog)
+    UiActionResult FinalizeCaptureForLabelInternal(bool emitLog)
     {
         const size_t frameCount = logger_.EndSegmentForLabel();
         if (frameCount == 0)
@@ -3255,7 +3125,7 @@ private:
 
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            EnterIdleOrFaultStateLocked(MotionInstructionName(instruction));
+            EnterIdleOrFaultStateLocked();
         }
         if (emitLog)
         {
@@ -3264,11 +3134,11 @@ private:
         return ActionOk("segment stopped for labeling");
     }
 
-    UiActionResult RequestTrajectoryStopInternal(MotionInstruction instruction, bool emitLog)
+    UiActionResult RequestTrajectoryStopInternal(bool emitLog)
     {
         if (!logger_.HasEffectiveMotion())
         {
-            return FinalizeCaptureForLabelInternal(instruction, emitLog);
+            return FinalizeCaptureForLabelInternal(emitLog);
         }
 
         const bool waitingForRelease = IsMotionInputActive(GetMotionStateSnapshot());
@@ -3295,8 +3165,6 @@ private:
     UiActionResult StopSegmentForLabelInternal(bool emitLog)
     {
         const bool hasPendingLabel = logger_.GetStatus().pendingLabel;
-        const Config::CaptureMode captureMode = GetEditableConfigSnapshot().captureMode;
-        MotionInstruction instruction = MotionInstruction::None;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
             if (captureState_ != CaptureState::Capturing)
@@ -3311,28 +3179,20 @@ private:
                 }
                 return ActionError("not_capturing", "当前没有可结束的采集段");
             }
-            instruction = activeMotionInstruction_;
         }
-
-        if (captureMode == Config::CaptureMode::Trajectory)
-        {
-            return RequestTrajectoryStopInternal(instruction, emitLog);
-        }
-        return FinalizeCaptureForLabelInternal(instruction, emitLog);
+        return RequestTrajectoryStopInternal(emitLog);
     }
 
     void CompleteTrajectoryStopIfReady(bool emitLog)
     {
-        MotionInstruction instruction = MotionInstruction::None;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
             if (captureState_ != CaptureState::Capturing || !trajectoryStopRequested_)
             {
                 return;
             }
-            instruction = activeMotionInstruction_;
         }
-        const UiActionResult result = FinalizeCaptureForLabelInternal(instruction, emitLog);
+        const UiActionResult result = FinalizeCaptureForLabelInternal(emitLog);
         if (!result.ok)
         {
             return;
@@ -3346,9 +3206,7 @@ private:
         bool hasActiveOrPending = false;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            hasActiveOrPending = captureState_ == CaptureState::Capturing ||
-                                 captureState_ == CaptureState::Armed ||
-                                 captureState_ == CaptureState::DelayBeforeLog;
+            hasActiveOrPending = captureState_ == CaptureState::Capturing;
             if (!hasActiveOrPending)
             {
                 hasActiveOrPending = hasPendingLabel;
@@ -3369,25 +3227,14 @@ private:
 
     UiActionResult FinalizePendingLabelInternal(const TaskMetadata& labelMetadata, bool emitLog)
     {
-        std::string fallbackInstruction;
-        {
-            std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            fallbackInstruction = pendingLabelFallbackInstruction_;
-        }
         const EditableCollectorConfig editable = GetEditableConfigSnapshot();
-        const std::string savedInstruction = editable.instruction.empty()
-                                                 ? fallbackInstruction
-                                                 : editable.instruction;
+        const std::string savedInstruction = editable.instruction;
         try
         {
-            const auto episodeId = logger_.FinalizePendingSegment(fallbackInstruction, labelMetadata);
+            const auto episodeId = logger_.FinalizePendingSegment(savedInstruction, labelMetadata);
             if (!episodeId.has_value())
             {
                 return ActionError("no_pending_label", "当前没有待保存的采集段");
-            }
-            {
-                std::lock_guard<std::mutex> lock(stateMachineMutex_);
-                pendingLabelFallbackInstruction_.clear();
             }
             if (emitLog)
             {
@@ -3523,115 +3370,6 @@ private:
         }
 
         PrintLine(std::string("原生手柄直通已") + (enabled ? "启用" : "禁用") + "：" + reason);
-    }
-
-    void LockMotionInstruction(MotionInstruction instruction)
-    {
-        if (instruction == MotionInstruction::None || instruction == MotionInstruction::Mixed)
-        {
-            return;
-        }
-        try
-        {
-            const EditableCollectorConfig editable = GetEditableConfigSnapshot();
-            logger_.BeginSegment(editable.sceneId, editable.operatorId, ConfiguredTaskMetadata());
-            bool transitionAccepted = false;
-            {
-                std::lock_guard<std::mutex> lock(stateMachineMutex_);
-                if (safetyState_ == SafetyState::SafeReady && captureState_ == CaptureState::Armed)
-                {
-                    activeMotionInstruction_ = instruction;
-                    captureStartDeadline_ = std::chrono::steady_clock::now() + kCaptureStartDelay;
-                    captureState_ = CaptureState::DelayBeforeLog;
-                    transitionAccepted = true;
-                }
-            }
-            if (!transitionAccepted)
-            {
-                logger_.DiscardPendingSegment();
-                return;
-            }
-            const std::string label = editable.instruction.empty() ? MotionInstructionName(instruction) : editable.instruction;
-            PrintLine("已锁定采集段标签=" + label + "，将在 0.5 秒后开始记录");
-        }
-        catch (const std::exception& ex)
-        {
-            PrintLine(std::string("准备采集段记录失败：") + ex.what());
-            std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            EnterIdleOrFaultStateLocked();
-        }
-    }
-
-    void UpdateCaptureStateFromMotion(const MotionStateSnapshot& motionState)
-    {
-        if (GetEditableConfigSnapshot().captureMode == Config::CaptureMode::Trajectory)
-        {
-            return;
-        }
-
-        MotionInstruction motionInstruction = MotionInstructionFromSnapshot(motionState);
-        CaptureState captureState;
-        SafetyState safetyState;
-        MotionInstruction activeInstruction;
-        std::chrono::steady_clock::time_point captureStartDeadline;
-        {
-            std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            captureState = captureState_;
-            safetyState = safetyState_;
-            activeInstruction = activeMotionInstruction_;
-            captureStartDeadline = captureStartDeadline_;
-        }
-
-        if (safetyState != SafetyState::SafeReady)
-        {
-            return;
-        }
-
-        if (captureState == CaptureState::Armed)
-        {
-            if (motionInstruction != MotionInstruction::None && motionInstruction != MotionInstruction::Mixed)
-            {
-                LockMotionInstruction(motionInstruction);
-            }
-            return;
-        }
-
-        if (captureState == CaptureState::DelayBeforeLog)
-        {
-            if (motionInstruction == MotionInstruction::None)
-            {
-                CancelCurrentSegment("首次动作在录制延迟结束前就已结束");
-                return;
-            }
-            if (motionInstruction == MotionInstruction::Mixed || motionInstruction != activeInstruction)
-            {
-                CancelCurrentSegment("录制开始前检测到混合输入，已丢弃");
-                return;
-            }
-            if (std::chrono::steady_clock::now() >= captureStartDeadline)
-            {
-                std::lock_guard<std::mutex> lock(stateMachineMutex_);
-                if (captureState_ == CaptureState::DelayBeforeLog)
-                {
-                    captureState_ = CaptureState::Capturing;
-                    PrintLine("segment capture started 指令=" + MotionInstructionName(activeMotionInstruction_));
-                }
-            }
-            return;
-        }
-
-        if (captureState == CaptureState::Capturing)
-        {
-            if (motionInstruction == MotionInstruction::Mixed || (motionInstruction != MotionInstruction::None && motionInstruction != activeInstruction))
-            {
-                CancelCurrentSegment("检测到混合输入，已丢弃");
-                return;
-            }
-            if (motionInstruction == MotionInstruction::None)
-            {
-                EndSegment();
-            }
-        }
     }
 
     void ResetActiveMotionKeys()
@@ -4183,7 +3921,6 @@ private:
             const auto cycleStart = std::chrono::steady_clock::now();
 
             const MotionStateSnapshot motionState = GetMotionStateSnapshot();
-            UpdateCaptureStateFromMotion(motionState);
             UpdateTrajectoryStopFlow(motionState);
             VelocityCommand command = ComputeInputCommand();
             CaptureState captureState;
@@ -4430,9 +4167,6 @@ private:
     CaptureState captureState_ = CaptureState::Idle;
     bool startupGateActive_ = false;
     std::chrono::steady_clock::time_point lastStartupGateReminder_{};
-    MotionInstruction activeMotionInstruction_ = MotionInstruction::None;
-    std::chrono::steady_clock::time_point captureStartDeadline_{};
-    std::string pendingLabelFallbackInstruction_;
     bool trajectoryStopRequested_ = false;
     bool trajectoryStopWaitingForRelease_ = false;
     std::chrono::steady_clock::time_point trajectoryStopFinalizeDeadline_{};
