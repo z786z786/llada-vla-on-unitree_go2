@@ -3123,12 +3123,8 @@ private:
         return metadata;
     }
 
-    UiActionResult BeginSegmentInternal(bool emitLog)
+    std::optional<UiActionResult> ValidateBeginSegmentLocked(bool hasPendingLabel, bool emitLog) const
     {
-        const bool hasPendingLabel = logger_.GetStatus().pendingLabel;
-        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
-        const TaskMetadata configuredTaskMetadata = ConfiguredTaskMetadata();
-        std::lock_guard<std::mutex> lock(stateMachineMutex_);
         if (startupGateActive_)
         {
             if (emitLog)
@@ -3169,27 +3165,52 @@ private:
             }
             return ActionError("pending_label", "当前有待标注区间");
         }
+        return std::nullopt;
+    }
+
+    void EnterPreparedSegmentStateLocked(Config::CaptureMode captureMode)
+    {
+        captureState_ = captureMode == Config::CaptureMode::Trajectory ? CaptureState::Capturing : CaptureState::Armed;
+        ResetCaptureProgressLocked();
+    }
+
+    static const char* BeginSegmentReadyMessage(Config::CaptureMode captureMode)
+    {
+        return captureMode == Config::CaptureMode::Trajectory
+                   ? "trajectory 已 armed；检测到连续有效动作后开始写入，使用停止键结束，使用丢弃键取消"
+                   : "采集段已 armed，等待单一有效动作输入";
+    }
+
+    void MaybePromptPendingLabelAfterStop()
+    {
+        if (config_.webUiEnabled || !logger_.GetStatus().pendingLabel)
+        {
+            return;
+        }
+        PromptAndFinalizePendingSegment();
+    }
+
+    UiActionResult BeginSegmentInternal(bool emitLog)
+    {
+        const bool hasPendingLabel = logger_.GetStatus().pendingLabel;
+        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
+        const TaskMetadata configuredTaskMetadata = ConfiguredTaskMetadata();
+        std::lock_guard<std::mutex> lock(stateMachineMutex_);
+        if (const auto validationResult = ValidateBeginSegmentLocked(hasPendingLabel, emitLog))
+        {
+            return *validationResult;
+        }
 
         try
         {
             if (editable.captureMode == Config::CaptureMode::Trajectory)
             {
                 logger_.BeginSegment(editable.sceneId, editable.operatorId, configuredTaskMetadata, trajectoryGateConfig_);
-                captureState_ = CaptureState::Capturing;
-                ResetCaptureProgressLocked();
-                if (emitLog)
-                {
-                    PrintLine("trajectory 已 armed；检测到连续有效动作后开始写入，使用停止键结束，使用丢弃键取消");
-                }
             }
-            else
+            EnterPreparedSegmentStateLocked(editable.captureMode);
+            if (emitLog)
             {
-                captureState_ = CaptureState::Armed;
-                ResetCaptureProgressLocked();
-                if (emitLog)
-                {
-                    PrintLine("采集段已 armed，等待单一有效动作输入");
-                }
+                PrintLine(BeginSegmentReadyMessage(editable.captureMode));
             }
         }
         catch (const std::exception& ex)
@@ -3299,11 +3320,11 @@ private:
             instruction = activeMotionInstruction_;
         }
         const UiActionResult result = FinalizeCaptureForLabelInternal(instruction, emitLog);
-        if (!result.ok || config_.webUiEnabled)
+        if (!result.ok)
         {
             return;
         }
-        PromptAndFinalizePendingSegment();
+        MaybePromptPendingLabelAfterStop();
     }
 
     UiActionResult DiscardSegmentInternal(const std::string& reason, bool emitLog)
@@ -3404,15 +3425,7 @@ private:
         {
             return;
         }
-        if (!logger_.GetStatus().pendingLabel)
-        {
-            return;
-        }
-        if (config_.webUiEnabled)
-        {
-            return;
-        }
-        PromptAndFinalizePendingSegment();
+        MaybePromptPendingLabelAfterStop();
     }
 
     void CancelCurrentSegment(const std::string& reason)
