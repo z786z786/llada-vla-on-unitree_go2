@@ -3187,6 +3187,19 @@ private:
         {
             return;
         }
+        pendingTerminalLabelPrompt_.store(true);
+    }
+
+    void MaybeRunPendingTerminalLabelPrompt()
+    {
+        if (!pendingTerminalLabelPrompt_.exchange(false))
+        {
+            return;
+        }
+        if (!running_.load() || config_.webUiEnabled || !logger_.GetStatus().pendingLabel)
+        {
+            return;
+        }
         PromptAndFinalizePendingSegment();
     }
 
@@ -3356,13 +3369,18 @@ private:
 
     UiActionResult FinalizePendingLabelInternal(const TaskMetadata& labelMetadata, bool emitLog)
     {
+        std::string fallbackInstruction;
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            fallbackInstruction = pendingLabelFallbackInstruction_;
+        }
         const EditableCollectorConfig editable = GetEditableConfigSnapshot();
         const std::string savedInstruction = editable.instruction.empty()
-                                                 ? pendingLabelFallbackInstruction_
+                                                 ? fallbackInstruction
                                                  : editable.instruction;
         try
         {
-            const auto episodeId = logger_.FinalizePendingSegment(pendingLabelFallbackInstruction_, labelMetadata);
+            const auto episodeId = logger_.FinalizePendingSegment(fallbackInstruction, labelMetadata);
             if (!episodeId.has_value())
             {
                 return ActionError("no_pending_label", "当前没有待保存的采集段");
@@ -3517,11 +3535,21 @@ private:
         {
             const EditableCollectorConfig editable = GetEditableConfigSnapshot();
             logger_.BeginSegment(editable.sceneId, editable.operatorId, ConfiguredTaskMetadata());
+            bool transitionAccepted = false;
             {
                 std::lock_guard<std::mutex> lock(stateMachineMutex_);
-                activeMotionInstruction_ = instruction;
-                captureStartDeadline_ = std::chrono::steady_clock::now() + kCaptureStartDelay;
-                captureState_ = CaptureState::DelayBeforeLog;
+                if (safetyState_ == SafetyState::SafeReady && captureState_ == CaptureState::Armed)
+                {
+                    activeMotionInstruction_ = instruction;
+                    captureStartDeadline_ = std::chrono::steady_clock::now() + kCaptureStartDelay;
+                    captureState_ = CaptureState::DelayBeforeLog;
+                    transitionAccepted = true;
+                }
+            }
+            if (!transitionAccepted)
+            {
+                logger_.DiscardPendingSegment();
+                return;
             }
             const std::string label = editable.instruction.empty() ? MotionInstructionName(instruction) : editable.instruction;
             PrintLine("已锁定采集段标签=" + label + "，将在 0.5 秒后开始记录");
@@ -3699,57 +3727,74 @@ private:
             stopRequested = trajectoryStopRequested_;
         }
         const auto now = std::chrono::steady_clock::now();
-        const float deltaSeconds = lastCommandUpdate_.time_since_epoch().count() == 0
-                                       ? 0.0f
-                                       : std::chrono::duration<float>(now - lastCommandUpdate_).count();
-        lastCommandUpdate_ = now;
-
         float targetVx = 0.0f;
         float targetVy = 0.0f;
         float targetWz = 0.0f;
+        WirelessControllerSnapshot controllerState;
         if (config_.inputBackend == Config::InputBackend::WirelessController)
         {
-            const WirelessControllerSnapshot controllerState = GetWirelessControllerSnapshot();
-            const double ageSeconds = AgeSeconds(controllerState.timestamp, NowSeconds());
-            if (!stopRequested && controllerState.valid && ageSeconds >= 0.0 && ageSeconds <= kWirelessControllerTimeoutSeconds)
-            {
-                targetVx = controllerState.gamepad.rawLy;
-                targetVy = -controllerState.gamepad.rawLx;
-                targetWz = -controllerState.gamepad.rawRx;
-            }
+            controllerState = GetWirelessControllerSnapshot();
         }
-        else
+        float commandVx = 0.0f;
+        float commandVy = 0.0f;
+        float commandWz = 0.0f;
         {
             std::lock_guard<std::mutex> lock(keyMutex_);
-            const float forward = stopRequested ? 0.0f : ((keyW_.pressed || keyW_.deadline > now) ? 1.0f : 0.0f);
-            const float backward = stopRequested ? 0.0f : ((keyS_.pressed || keyS_.deadline > now) ? 1.0f : 0.0f);
-            const float left = stopRequested ? 0.0f : ((keyA_.pressed || keyA_.deadline > now) ? 1.0f : 0.0f);
-            const float right = stopRequested ? 0.0f : ((keyD_.pressed || keyD_.deadline > now) ? 1.0f : 0.0f);
-            const float yawLeft = stopRequested ? 0.0f : ((keyQ_.pressed || keyQ_.deadline > now) ? 1.0f : 0.0f);
-            const float yawRight = stopRequested ? 0.0f : ((keyE_.pressed || keyE_.deadline > now) ? 1.0f : 0.0f);
-            targetVx = forward - backward;
-            targetVy = left - right;
-            targetWz = yawLeft - yawRight;
-        }
+            const float deltaSeconds = lastCommandUpdate_.time_since_epoch().count() == 0
+                                           ? 0.0f
+                                           : std::chrono::duration<float>(now - lastCommandUpdate_).count();
+            lastCommandUpdate_ = now;
 
-        const float planarNorm = std::sqrt(targetVx * targetVx + targetVy * targetVy);
-        if (planarNorm > 1.0f)
-        {
-            targetVx /= planarNorm;
-            targetVy /= planarNorm;
-        }
+            if (config_.inputBackend == Config::InputBackend::WirelessController)
+            {
+                const double ageSeconds = AgeSeconds(controllerState.timestamp, NowSeconds());
+                if (!stopRequested && controllerState.valid && ageSeconds >= 0.0 &&
+                    ageSeconds <= kWirelessControllerTimeoutSeconds)
+                {
+                    targetVx = controllerState.gamepad.rawLy;
+                    targetVy = -controllerState.gamepad.rawLx;
+                    targetWz = -controllerState.gamepad.rawRx;
+                }
+            }
+            else
+            {
+                const float forward = stopRequested ? 0.0f : ((keyW_.pressed || keyW_.deadline > now) ? 1.0f : 0.0f);
+                const float backward = stopRequested ? 0.0f : ((keyS_.pressed || keyS_.deadline > now) ? 1.0f : 0.0f);
+                const float left = stopRequested ? 0.0f : ((keyA_.pressed || keyA_.deadline > now) ? 1.0f : 0.0f);
+                const float right = stopRequested ? 0.0f : ((keyD_.pressed || keyD_.deadline > now) ? 1.0f : 0.0f);
+                const float yawLeft = stopRequested ? 0.0f : ((keyQ_.pressed || keyQ_.deadline > now) ? 1.0f : 0.0f);
+                const float yawRight = stopRequested ? 0.0f : ((keyE_.pressed || keyE_.deadline > now) ? 1.0f : 0.0f);
+                targetVx = forward - backward;
+                targetVy = left - right;
+                targetWz = yawLeft - yawRight;
+            }
 
-        if (config_.inputBackend == Config::InputBackend::WirelessController)
-        {
-            smoothedVx_ = targetVx;
-            smoothedVy_ = targetVy;
-            smoothedWz_ = targetWz;
-        }
-        else
-        {
-            smoothedVx_ = SlewTowards(smoothedVx_, targetVx, kLinearAccelPerSecond, kLinearDecelPerSecond, deltaSeconds);
-            smoothedVy_ = SlewTowards(smoothedVy_, targetVy, kLinearAccelPerSecond, kLinearDecelPerSecond, deltaSeconds);
-            smoothedWz_ = SlewTowards(smoothedWz_, targetWz, kYawAccelPerSecond, kYawDecelPerSecond, deltaSeconds);
+            const float planarNorm = std::sqrt(targetVx * targetVx + targetVy * targetVy);
+            if (planarNorm > 1.0f)
+            {
+                targetVx /= planarNorm;
+                targetVy /= planarNorm;
+            }
+
+            if (config_.inputBackend == Config::InputBackend::WirelessController)
+            {
+                smoothedVx_ = targetVx;
+                smoothedVy_ = targetVy;
+                smoothedWz_ = targetWz;
+            }
+            else
+            {
+                smoothedVx_ =
+                    SlewTowards(smoothedVx_, targetVx, kLinearAccelPerSecond, kLinearDecelPerSecond, deltaSeconds);
+                smoothedVy_ =
+                    SlewTowards(smoothedVy_, targetVy, kLinearAccelPerSecond, kLinearDecelPerSecond, deltaSeconds);
+                smoothedWz_ =
+                    SlewTowards(smoothedWz_, targetWz, kYawAccelPerSecond, kYawDecelPerSecond, deltaSeconds);
+            }
+
+            commandVx = smoothedVx_;
+            commandVy = smoothedVy_;
+            commandWz = smoothedWz_;
         }
 
         VelocityCommand command;
@@ -3759,16 +3804,16 @@ private:
             // Native passthrough uses the robot's own joystick motion path; the
             // collector records normalized operator intent instead of issuing
             // another scaled Move() command.
-            command.vx = smoothedVx_;
-            command.vy = smoothedVy_;
-            command.wz = smoothedWz_;
+            command.vx = commandVx;
+            command.vy = commandVy;
+            command.wz = commandWz;
         }
         else
         {
             const EditableCollectorConfig editable = GetEditableConfigSnapshot();
-            command.vx = smoothedVx_ * static_cast<float>(editable.cmdVxMax);
-            command.vy = smoothedVy_ * static_cast<float>(editable.cmdVyMax);
-            command.wz = smoothedWz_ * static_cast<float>(editable.cmdWzMax);
+            command.vx = commandVx * static_cast<float>(editable.cmdVxMax);
+            command.vy = commandVy * static_cast<float>(editable.cmdVyMax);
+            command.wz = commandWz * static_cast<float>(editable.cmdWzMax);
         }
         command.valid = true;
         return command;
@@ -3917,6 +3962,7 @@ private:
 
         while (running_.load())
         {
+            MaybeRunPendingTerminalLabelPrompt();
             if (promptActive_.load())
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -3937,6 +3983,7 @@ private:
         uint64_t lastHandledSequence = 0;
         while (running_.load())
         {
+            MaybeRunPendingTerminalLabelPrompt();
             const WirelessControllerSnapshot controllerState = GetWirelessControllerSnapshot();
             if (controllerState.valid && controllerState.sequence != lastHandledSequence)
             {
@@ -3973,6 +4020,7 @@ private:
         }
         while (running_.load())
         {
+            MaybeRunPendingTerminalLabelPrompt();
             const int pollResult = ::poll(pfds.data(), static_cast<nfds_t>(pfds.size()), 100);
             if (pollResult <= 0)
             {
@@ -4418,6 +4466,7 @@ private:
     std::thread loggingThread_;
     std::atomic<bool> promptActive_{false};
     std::atomic<bool> promptCancelRequested_{false};
+    std::atomic<bool> pendingTerminalLabelPrompt_{false};
     std::unique_ptr<WebUiServer> webUiServer_;
 };
 
