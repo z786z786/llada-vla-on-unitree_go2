@@ -5,7 +5,7 @@
 This document describes the current native collector state machine in
 `native/go2_collector.cpp`.
 
-The collector now supports only `trajectory` capture mode.
+The collector now supports only the `trajectory` capture flow.
 
 ## Top-Level States
 
@@ -37,6 +37,10 @@ On `wireless_controller`, the collector starts with a startup gate:
 The startup gate does not create a capture state on its own; it only blocks
 `Idle -> Capturing`.
 
+In `--preview-ui` mode, the startup gate is disabled and the collector seeds
+mock state/image data so the Web UI can be exercised without a Go2
+connection.
+
 ### Normal Capture Flow
 
 Trajectory capture uses the following path:
@@ -44,7 +48,7 @@ Trajectory capture uses the following path:
 1. `Idle` + `SafeReady`
 2. operator presses `R` / `A`
 3. `BeginSegmentInternal()`
-4. logger enters capture mode with trajectory motion gate
+4. logger starts a trajectory-gated segment
 5. `CaptureState` becomes `Capturing`
 6. video/state/control samples are buffered only after effective motion starts
 7. operator presses `T` / `B`

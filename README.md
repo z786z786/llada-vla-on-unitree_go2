@@ -64,7 +64,7 @@ data/<session_id>/
 
 - `schema_version`
 - `instruction`、`scene_id`、`operator_id`
-- 可选任务元数据：`task_family`、`target_type`、`target_description`、`target_instance_id`、`task_tags`、`collector_notes`、`instruction_source`
+- 可选任务元数据：`task_family`、`target_type`、`target_description`、`collector_notes`、`instruction_source`
 - `frames[]`
 - 每帧的 `state`、`raw_action`、`control_action`、`image` 与时间戳
 
@@ -88,7 +88,7 @@ cmake --build native/build -j
 
 ```bash
 cd /home/xiaohui/unitree_go2/go2_vla_collector
-./native/build/go2_collector   --network-interface eno1   --capture-mode trajectory   --scene-id corridor_a   --operator-id op_01   --instruction "go to the door"   --task-family goal_navigation   --target-type door   --target-description "glass door at corridor end"
+./native/build/go2_collector   --network-interface eno1   --scene-id corridor_a   --operator-id op_01   --instruction "go to the door"   --task-family goal_navigation   --target-type door   --target-description "glass door at corridor end"
 ```
 
 其他语义任务示例：
@@ -106,6 +106,7 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
 - `scene_id` 与 `operator_id` 始终必填
 - `--instruction` 现在始终必填
 - 同一轮语义任务采集应保持任务配置稳定
+- `--capture-mode trajectory` 仍可传入做兼容校验，但已经不是必需项
 
 ### 采集模式
 
@@ -117,6 +118,23 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
   - 必须提供 `--instruction`
 
 状态机说明见 `docs/collector_state_machine.md`。
+
+### 离线预览 Web UI
+
+没有连接 Go2 时，可以直接启动离线预览模式查看界面布局和交互：
+
+```bash
+cd /home/xiaohui/unitree_go2/go2_vla_collector
+./native/build/go2_collector --preview-ui --web-ui
+```
+
+说明：
+
+- `--preview-ui` 会自动启用 Web UI，并跳过 Unitree DDS / SportClient / VideoClient 初始化
+- 默认会切到 `tty` 输入后端，方便直接用键盘预览 `R/T/ESC/1-4`
+- 若仓库里能找到本地 `.jpg` 样例，Camera 区域会显示预览流；否则会显示等待图像
+- 预览模式下不需要 `--network-interface`
+- 如需覆盖展示内容，仍可额外传入 `--scene-id`、`--instruction`、`--task-family` 等参数
 
 ## 操作设备
 
@@ -157,11 +175,35 @@ cd /home/xiaohui/unitree_go2/go2_vla_collector
 python3 scripts/sanity_check_dataset.py --data-root data --output-dir outputs/sanity_check
 ```
 
+如果你希望在页面里改分后直接写回源文件，推荐改用本地服务模式：
+
+```bash
+cd /home/xiaohui/unitree_go2/go2_vla_collector
+python3 scripts/sanity_check_dataset.py --data-root data --output-dir outputs/sanity_check --serve
+```
+
+回放报告现在内置录制分数回调：
+
+- `1` 好样本
+- `2` 可用但不完美
+- `3` 失败但保留 / 质量差，后续处理排除
+
+在 `--serve` 模式下，页面修改会直接写回 `data/quality_review.json`；如果只是静态打开 `outputs/sanity_check/index.html`，也可以点击“绑定回调文件”后再写回。顶部还支持“指定分数”筛选，方便后期集中筛出 `3` 分样本再回调成 `2`。
+
 验证数据是否适合训练：
 
 ```bash
 cd /home/xiaohui/unitree_go2/go2_vla_collector
 python3 tools/validate_bc_dataset.py --dataset-root data --report-path outputs/validate_report.json
+```
+
+如果筛检结果不在默认位置，也可以显式传入：
+
+```bash
+python3 tools/validate_bc_dataset.py \
+  --dataset-root data \
+  --report-path outputs/validate_report.json \
+  --quality-review-path data/quality_review.json
 ```
 
 验证器会关注例如：
@@ -196,6 +238,17 @@ python3 tools/derive_distribution_labels.py \
 ```bash
 cd /home/xiaohui/unitree_go2/go2_vla_collector
 python3 tools/convert_llada_vla_dataset.py --raw-root data --output-root data/llada_vla_converted --overwrite
+```
+
+当 `data/quality_review.json` 存在时，`quality_label=3` 的 episode 会在标签派生、验证、转换，以及从 raw session 直接训练 baseline 时被跳过。也可以手动指定：
+
+```bash
+cd /home/xiaohui/unitree_go2/go2_vla_collector
+python3 tools/convert_llada_vla_dataset.py \
+  --raw-root data \
+  --output-root data/llada_vla_converted \
+  --quality-review-path data/quality_review.json \
+  --overwrite
 ```
 
 如果希望转换前自动生成这批 `derived_labels`：

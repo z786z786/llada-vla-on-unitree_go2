@@ -50,7 +50,6 @@ const configFields = {
   sceneId: document.getElementById("cfg-scene-id"),
   operatorId: document.getElementById("cfg-operator-id"),
   instruction: document.getElementById("cfg-instruction"),
-  captureMode: document.getElementById("cfg-capture-mode"),
   taskFamily: document.getElementById("cfg-task-family"),
   targetType: document.getElementById("cfg-target-type"),
   targetDescription: document.getElementById("cfg-target-description"),
@@ -199,7 +198,6 @@ function syncConfigForm(status) {
   configFields.sceneId.value = cfg.scene_id || "";
   configFields.operatorId.value = cfg.operator_id || "";
   configFields.instruction.value = cfg.instruction || "";
-  configFields.captureMode.value = cfg.capture_mode || "trajectory";
   configFields.taskFamily.value = cfg.task_family || "";
   configFields.targetType.value = cfg.target_type || "";
   configFields.targetDescription.value = cfg.target_description || "";
@@ -226,16 +224,6 @@ function describeStopPhase(stopPhase) {
     default:
       return stopPhase || "idle";
   }
-}
-
-function describeRecordingGate(status) {
-  if (!status.startup_gate.active) {
-    return "ready";
-  }
-  if (status.process_config.input_backend === "wireless_controller") {
-    return "waiting_native_start";
-  }
-  return "waiting";
 }
 
 function applyInputHints(inputBackend) {
@@ -276,15 +264,11 @@ function renderStatus(status) {
   const summaryHints = [];
   if (status.collector.fault_reason) {
     summaryHints.push(`fault: ${status.collector.fault_reason}`);
-  }
-  if (status.startup_gate.active && status.startup_gate.prompt) {
-    summaryHints.push(status.startup_gate.prompt);
   } else if (status.collector.stop_phase && status.collector.stop_phase !== "idle") {
     summaryHints.push(`label flow: ${describeStopPhase(status.collector.stop_phase)}`);
   } else {
-    summaryHints.push(
-      `${status.process_config.input_backend} / ${status.run_context.capture_mode} / video ${String(status.process_config.video_poll_hz)}Hz`
-    );
+    const previewTag = status.process_config.preview_mode ? " / preview" : "";
+    summaryHints.push(`${status.process_config.input_backend}${previewTag} / video ${String(status.process_config.video_poll_hz)}Hz`);
   }
   summaryNote.textContent = summaryHints.join("  |  ");
 
@@ -308,7 +292,9 @@ function renderStatus(status) {
     } else {
       ensureCameraStream();
       cameraThumb.hidden = false;
-      cameraMeta.textContent = `image age ${Number(status.robot.image_age_s).toFixed(2)}s / live stream`;
+      cameraMeta.textContent = status.process_config.preview_mode
+        ? `image age ${Number(status.robot.image_age_s).toFixed(2)}s / preview stream`
+        : `image age ${Number(status.robot.image_age_s).toFixed(2)}s / live stream`;
     }
   } else {
     stopCameraStream();

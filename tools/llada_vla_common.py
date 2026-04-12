@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = "go2_local_dataset_v1"
+QUALITY_REVIEW_SCHEMA_VERSION = "go2_quality_review_v1"
+QUALITY_REVIEW_FILENAME = "quality_review.json"
+QUALITY_LABEL_EXCLUDED = 3
 DERIVED_LABELS_DIRNAME = "derived_labels"
+FALLBACK_DERIVED_LABELS_DIRNAMES = ["distribution_labels"]
 STATE_FIELDS = ["vx", "vy", "wz", "yaw"]
 ACTION_FIELDS = ["vx", "vy", "wz"]
 RAW_ACTION_FIELDS = ["vx", "vy", "wz", "camera_pitch", "keys"]
@@ -52,12 +56,20 @@ TASK_METADATA_FIELDS = [
     "capture_mode",
     "task_family",
     "target_type",
+    "target_label",
     "target_description",
     "collector_notes",
     "instruction_source",
     "segment_status",
     "success",
     "termination_reason",
+]
+QUALITY_REVIEW_FIELDS = [
+    "quality_label",
+    "original_quality_label",
+    "quality_overridden",
+    "quality_notes",
+    "exclude_from_processing",
 ]
 ACTION_ACTIVITY_EPS = 0.05
 TEXT_TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -77,6 +89,19 @@ INSTRUCTION_TEMPLATE_PATTERNS = {
         re.compile(r"^go around [a-z0-9 ]+$"),
         re.compile(r"^avoid the [a-z0-9 ]+$"),
         re.compile(r"^avoid [a-z0-9 ]+$"),
+    ],
+}
+
+QualityReviewIndex = Dict[Tuple[str, str], Dict[str, Any]]
+INSTRUCTION_TARGET_PATTERNS = {
+    "goal_navigation": [
+        re.compile(r"^(?:go to|approach)(?: the)? (?P<label>[a-z0-9 ]+)$"),
+    ],
+    "visual_following": [
+        re.compile(r"^follow(?: the)? (?P<label>[a-z0-9 ]+)$"),
+    ],
+    "obstacle_aware_navigation": [
+        re.compile(r"^(?:go around|avoid)(?: the)? (?P<label>[a-z0-9 ]+?)(?: and [a-z0-9 ]+)?$"),
     ],
 }
 
@@ -130,6 +155,13 @@ class Sample:
             if isinstance(value, list) and not value:
                 continue
             record[field] = value
+        for field in QUALITY_REVIEW_FIELDS:
+            value = self.raw_record.get(field)
+            if value is None:
+                continue
+            if isinstance(value, str) and not value:
+                continue
+            record[field] = value
         if self.image_path is not None:
             record["image_path"] = self.image_path
         if self.source_image_path is not None:
@@ -169,6 +201,125 @@ def dump_jsonl(path: Path, records: Iterable[Dict[str, Any]]) -> None:
             handle.write(json.dumps(record, ensure_ascii=True) + "\n")
 
 
+def quality_review_path(dataset_root: Path) -> Path:
+    return dataset_root / QUALITY_REVIEW_FILENAME
+
+
+def episode_review_key(session_id: str, episode_id: str) -> Tuple[str, str]:
+    return (_safe_str(session_id), _safe_str(episode_id))
+
+
+def load_quality_review_index(dataset_root: Path, review_path: Optional[Path] = None) -> QualityReviewIndex:
+    candidate_paths: List[Path] = []
+    if review_path is not None:
+        candidate_paths.append(review_path.resolve())
+    else:
+        candidate_paths.append(quality_review_path(dataset_root.resolve()))
+
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        payload = load_json(path)
+        episodes = payload.get("episodes") if isinstance(payload, dict) else None
+        if not isinstance(episodes, list):
+            return {}
+        review_index: QualityReviewIndex = {}
+        for item in episodes:
+            if not isinstance(item, dict):
+                continue
+            session_id, episode_id = episode_review_key(item.get("session_id"), item.get("episode_id"))
+            if not session_id or not episode_id:
+                continue
+            quality_label = max(0, min(3, _safe_int(item.get("quality_label"), 0)))
+            review_payload: Dict[str, Any] = {
+                "quality_label": quality_label,
+                "exclude_from_processing": bool(item.get("exclude_from_processing")) or quality_label == QUALITY_LABEL_EXCLUDED,
+            }
+            quality_notes = _safe_str(item.get("quality_notes") or item.get("notes"))
+            if quality_notes:
+                review_payload["quality_notes"] = quality_notes
+            review_index[(session_id, episode_id)] = review_payload
+        return review_index
+    return {}
+
+
+def quality_review_for_episode(
+    review_index: Optional[QualityReviewIndex],
+    session_id: str,
+    episode_id: str,
+) -> Dict[str, Any]:
+    if not review_index:
+        return {}
+    return dict(review_index.get(episode_review_key(session_id, episode_id)) or {})
+
+
+def should_exclude_episode_from_processing(
+    review_index: Optional[QualityReviewIndex],
+    session_id: str,
+    episode_id: str,
+) -> bool:
+    review = quality_review_for_episode(review_index, session_id, episode_id)
+    return bool(review.get("exclude_from_processing"))
+
+
+def infer_episode_quality_label(payload: Dict[str, Any], episode_meta: Dict[str, Any]) -> int:
+    task_block = payload.get("task")
+    if not isinstance(task_block, dict):
+        task_block = {}
+    segment_status = _safe_str(
+        payload.get("segment_status") or
+        episode_meta.get("segment_status") or
+        task_block.get("segment_status")
+    ).lower()
+    success = _safe_str(
+        payload.get("success") or
+        episode_meta.get("success") or
+        task_block.get("success")
+    ).lower()
+    termination_reason = _safe_str(
+        payload.get("termination_reason") or
+        episode_meta.get("termination_reason") or
+        task_block.get("termination_reason")
+    ).lower()
+
+    if segment_status == "discard" or termination_reason == "discard":
+        return 4
+    if segment_status == "clean" and success == "success":
+        return 1
+    if segment_status == "usable" and success == "partial":
+        return 2
+    if success == "fail":
+        return 3
+    if segment_status == "usable" and termination_reason in {"operator_stop", "timeout", "failed"}:
+        return 3
+    return 0
+
+
+def resolved_episode_quality(
+    payload: Dict[str, Any],
+    episode_meta: Dict[str, Any],
+    review_index: Optional[QualityReviewIndex],
+    session_id: str,
+    episode_id: str,
+) -> Dict[str, Any]:
+    original_quality_label = infer_episode_quality_label(payload, episode_meta)
+    review = quality_review_for_episode(review_index, session_id, episode_id)
+    override_quality_label = max(0, min(3, _safe_int(review.get("quality_label"), 0)))
+    quality_label = override_quality_label if override_quality_label > 0 else original_quality_label
+    quality_notes = _safe_str(review.get("quality_notes"))
+    quality_overridden = override_quality_label > 0 and override_quality_label != original_quality_label
+    exclude_from_processing = (
+        bool(review.get("exclude_from_processing")) or quality_label == QUALITY_LABEL_EXCLUDED
+    )
+    return {
+        "original_quality_label": original_quality_label,
+        "quality_label": quality_label,
+        "quality_overridden": quality_overridden,
+        "quality_notes": quality_notes,
+        "exclude_from_processing": exclude_from_processing,
+    }
+
+
 def derived_labels_path(session_root: Path, episode_id: str) -> Path:
     return session_root / DERIVED_LABELS_DIRNAME / f"{episode_id}.json"
 
@@ -176,13 +327,16 @@ def derived_labels_path(session_root: Path, episode_id: str) -> Path:
 def load_episode_derived_labels(session_root: Path, episode_id: str) -> Dict[str, Any]:
     if not episode_id:
         return {}
-    path = derived_labels_path(session_root, episode_id)
-    if not path.exists():
-        return {}
-    payload = load_json(path)
-    if not isinstance(payload, dict):
-        return {}
-    return payload
+    candidate_paths = [derived_labels_path(session_root, episode_id)]
+    for dirname in FALLBACK_DERIVED_LABELS_DIRNAMES:
+        candidate_paths.append(session_root / dirname / f"{episode_id}.json")
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        payload = load_json(path)
+        if isinstance(payload, dict):
+            return payload
+    return {}
 
 
 def discover_session_roots(raw_root: Path) -> List[Path]:
@@ -243,6 +397,10 @@ def normalize_tags(value: Any) -> List[str]:
     return []
 
 
+def _normalize_target_label(value: str) -> str:
+    return " ".join(TEXT_TOKEN_RE.findall(_safe_str(value).lower())).strip()
+
+
 def is_controlled_instruction(instruction: str) -> bool:
     return instruction in CONTROLLED_INSTRUCTIONS
 
@@ -258,6 +416,29 @@ def infer_task_family(instruction: str, explicit_task_family: str = "") -> str:
         if any(pattern.fullmatch(normalized) for pattern in patterns):
             return family
     return ""
+
+
+def infer_target_label(
+    instruction: str,
+    explicit_task_family: str = "",
+    explicit_target_type: str = "",
+    explicit_target_description: str = "",
+) -> str:
+    normalized_instruction = _safe_str(instruction).lower()
+    task_family = infer_task_family(normalized_instruction, explicit_task_family)
+    patterns = INSTRUCTION_TARGET_PATTERNS.get(task_family, [])
+    for pattern in patterns:
+        match = pattern.fullmatch(normalized_instruction)
+        if not match:
+            continue
+        label = _normalize_target_label(match.group("label"))
+        if label:
+            return label
+
+    target_type_label = _normalize_target_label(explicit_target_type.replace("_", " "))
+    if target_type_label:
+        return target_type_label
+    return _normalize_target_label(explicit_target_description)
 
 
 def instruction_matches_known_template(instruction: str, task_family: str = "") -> bool:
@@ -281,6 +462,16 @@ def episode_task_metadata(payload: Dict[str, Any], episode_meta: Dict[str, Any])
         _safe_str(task_block.get("task_family"))
     )
     task_family = infer_task_family(instruction, explicit_task_family)
+    target_type = (
+        _safe_str(payload.get("target_type")) or
+        _safe_str(episode_meta.get("target_type")) or
+        _safe_str(task_block.get("target_type"))
+    )
+    target_description = (
+        _safe_str(payload.get("target_description")) or
+        _safe_str(episode_meta.get("target_description")) or
+        _safe_str(task_block.get("target_description"))
+    )
     return {
         "capture_mode": (
             _safe_str(payload.get("capture_mode")) or
@@ -288,16 +479,14 @@ def episode_task_metadata(payload: Dict[str, Any], episode_meta: Dict[str, Any])
             _safe_str(task_block.get("capture_mode"))
         ),
         "task_family": task_family,
-        "target_type": (
-            _safe_str(payload.get("target_type")) or
-            _safe_str(episode_meta.get("target_type")) or
-            _safe_str(task_block.get("target_type"))
+        "target_type": target_type,
+        "target_label": infer_target_label(
+            instruction,
+            explicit_task_family=task_family,
+            explicit_target_type=target_type,
+            explicit_target_description=target_description,
         ),
-        "target_description": (
-            _safe_str(payload.get("target_description")) or
-            _safe_str(episode_meta.get("target_description")) or
-            _safe_str(task_block.get("target_description"))
-        ),
+        "target_description": target_description,
         "collector_notes": (
             _safe_str(payload.get("collector_notes")) or
             _safe_str(episode_meta.get("collector_notes")) or
@@ -452,7 +641,12 @@ def episode_entries(session_root: Path) -> Tuple[str, List[Dict[str, Any]]]:
     return session_id, episodes
 
 
-def load_session_samples(session_root: Path, action_horizon: int = 1, min_trajectory_length: int = 1) -> List[Sample]:
+def load_session_samples(
+    session_root: Path,
+    action_horizon: int = 1,
+    min_trajectory_length: int = 1,
+    quality_review_index: Optional[QualityReviewIndex] = None,
+) -> List[Sample]:
     session_id, entries = episode_entries(session_root)
     samples: List[Sample] = []
 
@@ -460,9 +654,11 @@ def load_session_samples(session_root: Path, action_horizon: int = 1, min_trajec
         episode_id = str(episode_meta.get("episode_id") or "")
         if not episode_id:
             continue
-
         episode_path = session_root / "episodes" / f"{episode_id}.json"
         payload = load_json(episode_path)
+        quality_review = resolved_episode_quality(payload, episode_meta, quality_review_index, session_id, episode_id)
+        if quality_review.get("exclude_from_processing"):
+            continue
         instruction = str(payload.get("instruction") or "")
         scene_id = str(payload.get("scene_id") or episode_meta.get("scene_id") or "")
         operator_id = str(payload.get("operator_id") or episode_meta.get("operator_id") or "")
@@ -493,6 +689,13 @@ def load_session_samples(session_root: Path, action_horizon: int = 1, min_trajec
                 "operator_id": operator_id,
             }
             raw_record.update(task_metadata)
+            for field in QUALITY_REVIEW_FIELDS:
+                value = quality_review.get(field)
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value:
+                    continue
+                raw_record[field] = value
             if derived_labels:
                 raw_record["derived_labels"] = derived_labels
 

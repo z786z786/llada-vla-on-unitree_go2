@@ -7,9 +7,12 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COLLECTOR_BIN="${PROJECT_ROOT}/native/build/go2_collector"
 
 NETWORK_INTERFACE="${NETWORK_INTERFACE:-}"
-INPUT_BACKEND="${INPUT_BACKEND:-wireless_controller}"
-INPUT_DEVICE="${INPUT_DEVICE:-/dev/input/by-id/usb-Parallels_Virtual_Keyboard_KBD1.1-if01-event-kbd}"
+INPUT_BACKEND="${INPUT_BACKEND:-evdev}"
+WIRELESS_MOTION_MODE="${WIRELESS_MOTION_MODE:-collector}"
+INPUT_DEVICE="${INPUT_DEVICE:-}"
 CAPTURE_MODE="${CAPTURE_MODE:-trajectory}"
+WEB_UI_ENABLED="${WEB_UI_ENABLED:-1}"
+WEB_PORT="${WEB_PORT:-8080}"
 LOCAL_IPV4_CIDR="${LOCAL_IPV4_CIDR:-192.168.123.222/24}"
 AUTO_CONFIGURE_NETWORK=1
 AUTO_REEXEC_INPUT_GROUP=1
@@ -38,9 +41,12 @@ usage() {
 
 可选参数：
   --network-interface IFACE   默认：自动检测首选 Go2 有线网卡
-  --input-backend MODE        默认：wireless_controller
-  --input-device PATH         默认：/dev/input/by-id/usb-Parallels_Virtual_Keyboard_KBD1.1-if01-event-kbd
+  --input-backend MODE        默认：evdev
+  --wireless-motion-mode MODE 默认：collector（仅 wireless_controller 生效）
+  --input-device PATH         默认：留空并自动检测键盘
   --capture-mode MODE         默认：trajectory
+  --web-ui / --no-web-ui      默认：开启 Web UI
+  --web-port INT              默认：8080
   --local-ipv4-cidr CIDR      默认：192.168.123.222/24
   --task-family TEXT
   --target-type TEXT
@@ -82,12 +88,28 @@ while [[ $# -gt 0 ]]; do
       INPUT_BACKEND="$2"
       shift 2
       ;;
+    --wireless-motion-mode)
+      WIRELESS_MOTION_MODE="$2"
+      shift 2
+      ;;
     --input-device)
       INPUT_DEVICE="$2"
       shift 2
       ;;
     --capture-mode)
       CAPTURE_MODE="$2"
+      shift 2
+      ;;
+    --web-ui)
+      WEB_UI_ENABLED=1
+      shift
+      ;;
+    --no-web-ui)
+      WEB_UI_ENABLED=0
+      shift
+      ;;
+    --web-port)
+      WEB_PORT="$2"
       shift 2
       ;;
     --local-ipv4-cidr)
@@ -255,7 +277,13 @@ build_collector_cmd() {
     --instruction "${INSTRUCTION}"
   )
 
-  if [[ "${INPUT_BACKEND}" == "evdev" ]]; then
+  if [[ "${WEB_UI_ENABLED}" == "1" ]]; then
+    cmd_ref+=(--web-ui --web-port "${WEB_PORT}")
+  fi
+  if [[ "${INPUT_BACKEND}" == "wireless_controller" ]]; then
+    cmd_ref+=(--wireless-motion-mode "${WIRELESS_MOTION_MODE}")
+  fi
+  if [[ "${INPUT_BACKEND}" == "evdev" && -n "${INPUT_DEVICE}" ]]; then
     cmd_ref+=(--input-device "${INPUT_DEVICE}")
   fi
   if [[ -n "${TASK_FAMILY}" ]]; then
@@ -288,7 +316,7 @@ if [[ -z "${SCENE_ID}" || -z "${OPERATOR_ID}" || -z "${INSTRUCTION}" ]]; then
 fi
 
 require_file "${COLLECTOR_BIN}" "Collector binary"
-if [[ "${INPUT_BACKEND}" == "evdev" ]]; then
+if [[ "${INPUT_BACKEND}" == "evdev" && -n "${INPUT_DEVICE}" ]]; then
   require_file "${INPUT_DEVICE}" "Input device"
 fi
 

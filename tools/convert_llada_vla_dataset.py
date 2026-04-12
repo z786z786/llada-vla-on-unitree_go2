@@ -18,6 +18,7 @@ from llada_vla_common import (
     discover_session_roots,
     dump_jsonl,
     ensure_session_materialized,
+    load_quality_review_index,
     load_session_samples,
     summarize_trajectory_actions,
     summarize_trajectory_metric_series,
@@ -39,7 +40,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--derive-labels",
         choices=["none", "distribution"],
-        default="none",
+        default="distribution",
         help="转换前是否自动生成 derived_labels",
     )
     parser.add_argument(
@@ -64,6 +65,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         help="自动生成分布标签时输出汇总 JSON 的路径",
     )
+    parser.add_argument(
+        "--quality-review-path",
+        type=Path,
+        help="可选：筛检结果 JSON，quality_label=3 的 episode 会被排除",
+    )
     parser.add_argument("--overwrite", action="store_true", help="写入前删除已有输出目录")
     return parser
 
@@ -86,6 +92,8 @@ def _stats_payload(output_root: Path, raw_root: Path, session_roots: Sequence[Pa
     capture_mode_counter = Counter(str(record.get("capture_mode") or "") for record in all_records if str(record.get("capture_mode") or ""))
     task_family_counter = Counter(str(record.get("task_family") or "") for record in all_records if str(record.get("task_family") or ""))
     target_type_counter = Counter(str(record.get("target_type") or "") for record in all_records if str(record.get("target_type") or ""))
+    target_label_counter = Counter(str(record.get("target_label") or "") for record in all_records if str(record.get("target_label") or ""))
+    quality_label_counter = Counter(str(record.get("quality_label")) for record in all_records if record.get("quality_label") is not None)
     derived_target_side_counter = Counter(
         str((record.get("derived_labels") or {}).get("target_side_band") or "")
         for record in all_records
@@ -128,6 +136,8 @@ def _stats_payload(output_root: Path, raw_root: Path, session_roots: Sequence[Pa
         "capture_mode_counts": dict(sorted(capture_mode_counter.items(), key=lambda item: (-item[1], item[0]))),
         "task_family_counts": dict(sorted(task_family_counter.items(), key=lambda item: (-item[1], item[0]))),
         "target_type_counts": dict(sorted(target_type_counter.items(), key=lambda item: (-item[1], item[0]))),
+        "target_label_counts": dict(sorted(target_label_counter.items(), key=lambda item: (-item[1], item[0]))),
+        "quality_label_counts": dict(sorted(quality_label_counter.items(), key=lambda item: item[0])),
         "derived_target_side_counts": dict(sorted(derived_target_side_counter.items(), key=lambda item: (-item[1], item[0]))),
         "derived_target_distance_counts": dict(sorted(derived_target_distance_counter.items(), key=lambda item: (-item[1], item[0]))),
         "trajectory_metrics": {
@@ -161,6 +171,7 @@ def main() -> None:
     discovered_session_roots = discover_session_roots(raw_root)
     if not discovered_session_roots:
         raise FileNotFoundError(f"在以下路径下没有找到 session 根目录：{raw_root}")
+    quality_review_index = load_quality_review_index(raw_root, args.quality_review_path)
 
     derived_label_summary: Dict[str, Any] = {}
     if args.derive_labels == "distribution":
@@ -172,6 +183,7 @@ def main() -> None:
             distance_metric=args.derive_distance_metric,
             invert_side_sign=args.derive_invert_side_sign,
             summary_path=args.derive_summary_path,
+            quality_review_index=quality_review_index,
         )
 
     samples: List[Sample] = []
@@ -181,6 +193,7 @@ def main() -> None:
             session_root,
             action_horizon=args.action_horizon,
             min_trajectory_length=args.min_episode_length,
+            quality_review_index=quality_review_index,
         )
         if not session_samples:
             continue
@@ -233,6 +246,10 @@ def main() -> None:
         print(f"采集模式统计：{stats['capture_mode_counts']}")
     if stats["task_family_counts"]:
         print(f"任务族统计：{stats['task_family_counts']}")
+    if stats["target_label_counts"]:
+        print(f"语义目标统计：{stats['target_label_counts']}")
+    if stats["quality_label_counts"]:
+        print(f"筛检标签统计：{stats['quality_label_counts']}")
     if stats["derived_target_side_counts"]:
         print(f"派生左右标签统计：{stats['derived_target_side_counts']}")
     if stats["derived_target_distance_counts"]:

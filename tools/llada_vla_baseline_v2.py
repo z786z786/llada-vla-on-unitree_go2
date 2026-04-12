@@ -23,6 +23,7 @@ from llada_vla_common import (
     fit_standardizer,
     has_converted_manifests,
     load_jsonl,
+    load_quality_review_index,
     load_session_samples,
     resolve_image_path,
     standardize_vector,
@@ -86,6 +87,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-ratio", type=float, default=0.1, help="原始 session 划分测试集比例")
     parser.add_argument("--split-seed", type=int, help="可选：划分前随机打散 session/episode 分组的随机种子")
     parser.add_argument("--min-episode-length", type=int, default=1, help="丢弃短于该长度的原始 episode")
+    parser.add_argument("--quality-review-path", type=Path, help="可选：筛检结果 JSON，quality_label=3 的 episode 会被排除")
     parser.add_argument("--checkpoint-path", type=Path, help="用于恢复训练或仅评估的 checkpoint")
     parser.add_argument("--eval-only", action="store_true", help="跳过训练，直接评估 checkpoint")
     parser.add_argument("--save-predictions", action="store_true", help="保存 val/test 逐样本预测结果")
@@ -150,9 +152,16 @@ def _load_split_records(dataset_root: Path, manifest_root: Path, args: argparse.
     if not session_roots:
         raise FileNotFoundError(f"no converted manifests or raw session roots found under {dataset_root}")
 
+    quality_review_index = load_quality_review_index(dataset_root, args.quality_review_path)
     samples: List[Sample] = []
     for session_root in session_roots:
-        samples.extend(load_session_samples(session_root, min_trajectory_length=args.min_episode_length))
+        samples.extend(
+            load_session_samples(
+                session_root,
+                min_trajectory_length=args.min_episode_length,
+                quality_review_index=quality_review_index,
+            )
+        )
 
     strategy = args.split_strategy
     mapped = "auto"

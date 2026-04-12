@@ -218,6 +218,7 @@ def _derive_labels_for_episode(
         "instruction": instruction,
         "task_family": task_family,
         "target_type": str(task_metadata.get("target_type") or ""),
+        "target_label": str(task_metadata.get("target_label") or ""),
         "target_description": str(task_metadata.get("target_description") or ""),
         "target_side_band": side["band"],
         "target_distance_band": distance["band"],

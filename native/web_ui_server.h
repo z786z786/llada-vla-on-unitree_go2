@@ -44,6 +44,7 @@ struct UiStatusSnapshot
 {
     bool running = false;
     bool webUiEnabled = false;
+    bool previewMode = false;
     int webPort = 0;
     bool startupGateActive = false;
     std::string startupPrompt;

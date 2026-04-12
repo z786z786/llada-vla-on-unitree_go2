@@ -180,6 +180,7 @@ std::string MakeJsonStatus(const UiStatusSnapshot& status)
         << "\"output_dir\":" << JsonString(status.outputDir) << ","
         << "\"loop_hz\":" << status.loopHz << ","
         << "\"video_poll_hz\":" << status.videoPollHz << ","
+        << "\"preview_mode\":" << BoolJson(status.previewMode) << ","
         << "\"input_backend\":" << JsonString(status.inputBackend) << ","
         << "\"input_device\":" << JsonString(status.inputDevice) << ","
         << "\"defaults_path\":" << JsonString(status.defaultsPath)

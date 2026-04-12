@@ -6,7 +6,7 @@ import math
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -19,6 +19,8 @@ from llada_vla_common import (
     dump_json,
     episode_task_metadata,
     load_json,
+    load_quality_review_index,
+    resolved_episode_quality,
     state_from_frame,
 )
 
@@ -74,6 +76,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--summary-path",
         type=Path,
         help="可选的汇总 JSON 输出路径，用于记录阈值与标签分布",
+    )
+    parser.add_argument(
+        "--quality-review-path",
+        type=Path,
+        help="可选：筛检结果 JSON，quality_label=3 的 episode 会被跳过",
     )
     return parser
 
@@ -244,13 +251,18 @@ def generate_distribution_labels(
     distance_metric: str = "integrated_planar_distance",
     invert_side_sign: bool = False,
     summary_path: Optional[Path] = None,
+    quality_review_index: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+    quality_review_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     dataset_root = dataset_root.resolve()
     session_roots = discover_session_roots(dataset_root)
     if not session_roots:
         raise FileNotFoundError(f"no session roots found under {dataset_root}")
+    if quality_review_index is None:
+        quality_review_index = load_quality_review_index(dataset_root, quality_review_path)
 
     episode_records: List[Dict[str, Any]] = []
+    skipped_quality_filtered = 0
     skipped_non_visual = 0
     skipped_existing = 0
     skipped_missing_frames = 0
@@ -275,6 +287,10 @@ def generate_distribution_labels(
                 continue
 
             payload, frames = _load_episode_frames(session_root, episode_id)
+            quality_review = resolved_episode_quality(payload, episode_meta, quality_review_index, session_id, episode_id)
+            if quality_review.get("exclude_from_processing"):
+                skipped_quality_filtered += 1
+                continue
             task_metadata = episode_task_metadata(payload, episode_meta)
             task_family = str(task_metadata.get("task_family") or "")
             if task_family not in VISUAL_TASK_FAMILIES:
@@ -339,6 +355,7 @@ def generate_distribution_labels(
             "instruction": str(payload.get("instruction") or ""),
             "task_family": str(task_metadata.get("task_family") or ""),
             "target_type": str(task_metadata.get("target_type") or ""),
+            "target_label": str(task_metadata.get("target_label") or ""),
             "target_description": str(task_metadata.get("target_description") or ""),
             "target_side_band": target_side_band,
             "target_distance_band": target_distance_band,
@@ -384,6 +401,7 @@ def generate_distribution_labels(
 
     summary["side_band_counts"] = dict(sorted(side_counter.items()))
     summary["distance_band_counts"] = dict(sorted(distance_counter.items()))
+    summary["skipped_quality_filtered"] = skipped_quality_filtered
     summary["skipped_existing"] = skipped_existing
     summary["skipped_non_visual"] = skipped_non_visual
     summary["skipped_missing_frames"] = skipped_missing_frames
@@ -405,6 +423,7 @@ def main() -> None:
         distance_metric=args.distance_metric,
         invert_side_sign=args.invert_side_sign,
         summary_path=args.summary_path,
+        quality_review_path=args.quality_review_path,
     )
     print(
         f"已写入 {summary['episode_count']} 个 episode 的分布标签，"

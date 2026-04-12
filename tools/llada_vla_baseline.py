@@ -20,6 +20,7 @@ from llada_vla_common import (
     fit_standardizer,
     has_converted_manifests,
     load_jsonl,
+    load_quality_review_index,
     load_session_samples,
     standardize_vector,
 )
@@ -37,6 +38,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-ratio", type=float, default=0.1, help="原始 session 划分时的测试集比例")
     parser.add_argument("--min-episode-length", type=int, default=1, help="丢弃短于该长度的原始 episode")
     parser.add_argument("--split-mode", choices=["auto", "by_session", "by_trajectory"], default="auto", help="读取原始 session 时的数据划分模式")
+    parser.add_argument("--quality-review-path", type=Path, help="可选：筛检结果 JSON，quality_label=3 的 episode 会被排除")
     parser.add_argument("--save-model", type=Path, help="可选：将拟合后的基线权重保存为 JSON")
     return parser
 
@@ -201,9 +203,16 @@ def _load_split_records(dataset_root: Path, args: argparse.Namespace) -> Dict[st
     if not session_roots:
         raise FileNotFoundError(f"在以下路径下没有找到转换后清单或原始 session：{dataset_root}")
 
+    quality_review_index = load_quality_review_index(dataset_root, args.quality_review_path)
     samples: List[Sample] = []
     for session_root in session_roots:
-        samples.extend(load_session_samples(session_root, min_trajectory_length=args.min_episode_length))
+        samples.extend(
+            load_session_samples(
+                session_root,
+                min_trajectory_length=args.min_episode_length,
+                quality_review_index=quality_review_index,
+            )
+        )
     split_samples = assign_splits(
         samples,
         split_mode=args.split_mode,

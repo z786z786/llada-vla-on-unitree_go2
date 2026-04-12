@@ -12,6 +12,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <linux/input.h>
 #include <memory>
 #include <map>
@@ -43,6 +44,13 @@ constexpr char kDefaultDataDirName[] = "data";
 constexpr char kSportStateTopic[] = "rt/sportmodestate";
 constexpr char kWirelessControllerTopic[] = "rt/wirelesscontroller";
 constexpr char kSchemaVersion[] = "go2_local_dataset_v1";
+constexpr char kTrajectoryCaptureMode[] = "trajectory";
+constexpr char kPreviewSceneId[] = "preview_scene";
+constexpr char kPreviewOperatorId[] = "preview_operator";
+constexpr char kPreviewInstruction[] = "go to the door";
+constexpr char kPreviewTaskFamily[] = "goal_navigation";
+constexpr char kPreviewTargetType[] = "door";
+constexpr char kPreviewTargetDescription[] = "preview camera sample";
 constexpr double kStateTimeoutSeconds = 1.0;
 constexpr double kWirelessControllerTimeoutSeconds = 1.0;
 constexpr double kMaxSafeAbsRollRad = 0.75;
@@ -52,18 +60,20 @@ constexpr double kDefaultCmdVyMax = 0.3;
 constexpr double kDefaultCmdWzMax = 0.8;
 constexpr float kStandingBodyHeightThreshold = 0.18f;
 constexpr auto kKeyboardHoldTimeout = std::chrono::milliseconds(900);
+constexpr float kKeyboardLinearAccelPerSecond = 1.6f;
+constexpr float kKeyboardLinearDecelPerSecond = 2.4f;
+constexpr float kKeyboardYawAccelPerSecond = 2.0f;
+constexpr float kKeyboardYawDecelPerSecond = 3.0f;
 constexpr float kLinearAccelPerSecond = 3.0f;
 constexpr float kLinearDecelPerSecond = 4.5f;
 constexpr float kYawAccelPerSecond = 4.5f;
 constexpr float kYawDecelPerSecond = 6.0f;
 constexpr float kWirelessControllerDiscreteThreshold = 0.35f;
-constexpr auto kStartupGateReminderInterval = std::chrono::seconds(2);
 constexpr auto kTrajectoryFinalizeGracePeriod = std::chrono::milliseconds(400);
 constexpr auto kTrajectoryStopReleaseTimeout = std::chrono::milliseconds(1200);
 constexpr char kEscapeKey = 27;
 constexpr char kBackspace = 127;
 constexpr char kCtrlH = 8;
-constexpr char kStartupAcknowledgeKey = 'o';
 
 struct TrajectoryMotionGateConfig
 {
@@ -99,9 +109,10 @@ struct Config
         Tty,
     };
 
-    enum class CaptureMode
+    enum class WirelessMotionMode
     {
-        Trajectory,
+        NativePassthrough,
+        CollectorScaledMove,
     };
 
     std::string networkInterface;
@@ -110,7 +121,7 @@ struct Config
     double loopHz = 50.0;
     double videoPollHz = 20.0;
     InputBackend inputBackend = InputBackend::WirelessController;
-    CaptureMode captureMode = CaptureMode::Trajectory;
+    WirelessMotionMode wirelessMotionMode = WirelessMotionMode::NativePassthrough;
     fs::path inputDevice;
     std::string sceneId;
     std::string operatorId;
@@ -123,12 +134,12 @@ struct Config
     double cmdVyMax = kDefaultCmdVyMax;
     double cmdWzMax = kDefaultCmdWzMax;
     bool webUiEnabled = false;
+    bool previewUi = false;
     int webPort = 8080;
 };
 
 struct EditableCollectorConfig
 {
-    Config::CaptureMode captureMode = Config::CaptureMode::Trajectory;
     std::string sceneId;
     std::string operatorId;
     std::string instruction;
@@ -141,12 +152,10 @@ struct EditableCollectorConfig
     double cmdWzMax = kDefaultCmdWzMax;
 };
 
-std::optional<Config::CaptureMode> ParseCaptureMode(const std::string& value);
-
 struct TaskMetadata
 {
     std::string instruction;
-    std::string captureMode;
+    std::string captureMode = kTrajectoryCaptureMode;
     std::string taskFamily;
     std::string targetType;
     std::string targetDescription;
@@ -160,6 +169,8 @@ struct TaskMetadata
 struct LatestState
 {
     double timestamp = 0.0;
+    uint32_t errorCode = 0;
+    uint8_t mode = 0;
     float roll = 0.0f;
     float pitch = 0.0f;
     float yaw = 0.0f;
@@ -200,6 +211,37 @@ struct WirelessControllerSnapshot
     bool valid = false;
 };
 
+struct PendingWirelessControllerActions
+{
+    bool A = false;
+    bool B = false;
+    bool X = false;
+    bool Y = false;
+    bool R2 = false;
+    bool up = false;
+    bool right = false;
+    bool down = false;
+    bool left = false;
+
+    bool Any() const
+    {
+        return A || B || X || Y || R2 || up || right || down || left;
+    }
+
+    void MergeFrom(const collector::input::Gamepad& gamepad)
+    {
+        A = A || gamepad.A.onPress;
+        B = B || gamepad.B.onPress;
+        X = X || gamepad.X.onPress;
+        Y = Y || gamepad.Y.onPress;
+        R2 = R2 || gamepad.R2.onPress;
+        up = up || gamepad.up.onPress;
+        right = right || gamepad.right.onPress;
+        down = down || gamepad.down.onPress;
+        left = left || gamepad.left.onPress;
+    }
+};
+
 struct EffectiveControlAction
 {
     VelocityCommand command;
@@ -231,7 +273,7 @@ struct EpisodeSummary
 {
     std::string episodeId;
     std::string instruction;
-    std::string captureMode;
+    std::string captureMode = kTrajectoryCaptureMode;
     std::string taskFamily;
     std::string targetType;
     std::string targetDescription;
@@ -498,25 +540,35 @@ fs::path LegacyCollectorDefaultsPath(const fs::path& collectorRoot)
     return collectorRoot / "collector_webui_defaults.json";
 }
 
-std::string StartupUnlockHint(Config::InputBackend backend)
+bool UsesWirelessCollectorControl(const Config& config)
 {
-    switch (backend)
-    {
-    case Config::InputBackend::WirelessController:
-        return "请先按一次原生手柄 Start，让 Go2 进入正常可行走状态后再开始采集";
-    case Config::InputBackend::Evdev:
-    case Config::InputBackend::Tty:
-        return "当前输入后端无需额外解锁，可直接开始采集";
-    }
+    return config.inputBackend == Config::InputBackend::WirelessController &&
+           config.wirelessMotionMode == Config::WirelessMotionMode::CollectorScaledMove;
+}
+
+bool UsesWirelessNativePassthrough(const Config& config)
+{
+    return config.inputBackend == Config::InputBackend::WirelessController &&
+           config.wirelessMotionMode == Config::WirelessMotionMode::NativePassthrough;
+}
+
+std::string StartupUnlockHint(const Config& config)
+{
+    (void)config;
     return "当前输入后端无需额外解锁，可直接开始采集";
 }
 
-std::string StartupPromptText(Config::InputBackend backend)
+std::string StartupPromptText(const Config& config)
 {
-    if (backend == Config::InputBackend::WirelessController)
+    if (config.inputBackend == Config::InputBackend::WirelessController)
     {
-        return "collector 已完成初始化；配置在启动时固定，当前已启用原生手柄直通，可立即自由操作；"
-               "检测到一次原生 Start 后才允许开始采集";
+        if (UsesWirelessCollectorControl(config))
+        {
+            return "collector 已完成初始化；当前手柄输入由 collector 接管，原生手柄直通已关闭，"
+                   "左摇杆/右摇杆会按阈值离散成满量程控制，等价于把 WASDQE 映射到原生手柄拨杆拨满；"
+                   "可立即移动和录制";
+        }
+        return "collector 已完成初始化；配置在启动时固定，当前已启用原生手柄直通，可立即自由操作和录制";
     }
     return "collector 已完成初始化；配置在启动时固定，可直接移动和录制";
 }
@@ -580,14 +632,21 @@ std::string InputBackendName(Config::InputBackend backend)
     return "unknown";
 }
 
-std::string CaptureModeName(Config::CaptureMode mode)
+std::string WirelessMotionModeName(Config::WirelessMotionMode mode)
 {
     switch (mode)
     {
-    case Config::CaptureMode::Trajectory:
-        return "trajectory";
+    case Config::WirelessMotionMode::NativePassthrough:
+        return "native";
+    case Config::WirelessMotionMode::CollectorScaledMove:
+        return "collector";
     }
     return "unknown";
+}
+
+bool IsSupportedCaptureModeValue(const std::string& value)
+{
+    return Trim(value) == kTrajectoryCaptureMode;
 }
 
 std::string SegmentStatusName(SegmentStatus status)
@@ -788,14 +847,6 @@ void ApplyDefaultsFile(const fs::path& defaultsPath, Config& config)
     {
         config.instruction = value.value();
     }
-    if (const auto value = ExtractJsonStringFieldLocal(body, "capture_mode"); value.has_value())
-    {
-        const auto captureMode = ParseCaptureMode(value.value());
-        if (captureMode.has_value())
-        {
-            config.captureMode = captureMode.value();
-        }
-    }
     if (const auto value = ExtractJsonStringFieldLocal(body, "task_family"); value.has_value())
     {
         config.taskFamily = value.value();
@@ -823,6 +874,18 @@ void ApplyDefaultsFile(const fs::path& defaultsPath, Config& config)
     if (const auto value = ExtractJsonNumberFieldLocal(body, "cmd_wz_max"); value.has_value())
     {
         config.cmdWzMax = value.value();
+    }
+    if (const auto value = ExtractJsonStringFieldLocal(body, "wireless_motion_mode"); value.has_value())
+    {
+        const std::string trimmed = Trim(value.value());
+        if (trimmed == "collector")
+        {
+            config.wirelessMotionMode = Config::WirelessMotionMode::CollectorScaledMove;
+        }
+        else if (trimmed == "native")
+        {
+            config.wirelessMotionMode = Config::WirelessMotionMode::NativePassthrough;
+        }
     }
 }
 
@@ -858,11 +921,15 @@ std::optional<Config::InputBackend> ParseInputBackend(const std::string& value)
     return std::nullopt;
 }
 
-std::optional<Config::CaptureMode> ParseCaptureMode(const std::string& value)
+std::optional<Config::WirelessMotionMode> ParseWirelessMotionMode(const std::string& value)
 {
-    if (value == "trajectory")
+    if (value == "native" || value == "native_passthrough")
     {
-        return Config::CaptureMode::Trajectory;
+        return Config::WirelessMotionMode::NativePassthrough;
+    }
+    if (value == "collector" || value == "scaled" || value == "collector_scaled_move")
+    {
+        return Config::WirelessMotionMode::CollectorScaledMove;
     }
     return std::nullopt;
 }
@@ -947,6 +1014,19 @@ float SlewTowards(float current, float target, float accelPerSecond, float decel
     return current + (delta > 0.0f ? maxStep : -maxStep);
 }
 
+float QuantizeWirelessAxisToFullScale(float value)
+{
+    if (value > kWirelessControllerDiscreteThreshold)
+    {
+        return 1.0f;
+    }
+    if (value < -kWirelessControllerDiscreteThreshold)
+    {
+        return -1.0f;
+    }
+    return 0.0f;
+}
+
 EffectiveControlAction ResolveControlAction(const VelocityCommand& rawAction, double sampleTimestamp)
 {
     EffectiveControlAction resolved;
@@ -970,13 +1050,13 @@ TrajectoryMotionGateConfig BuildTrajectoryMotionGateConfig(double sampleHz)
 void PrintUsage(const char* program)
 {
     std::cout
-        << "用法: " << program << " --network-interface IFACE --scene-id SCENE --operator-id OPERATOR [options]\n\n"
+        << "用法: " << program << " [--network-interface IFACE] --scene-id SCENE --operator-id OPERATOR [options]\n\n"
         << "Options:\n"
         << "  --output-dir PATH        数据集根目录（默认：<collector>/" << kDefaultDataDirName << ")\n"
         << "  --loop-hz FLOAT          Control 和 logging loop frequency (default: 50.0)\n"
         << "  --video-poll-hz FLOAT    Camera polling frequency (default: 20.0)\n"
         << "  --input-backend MODE     Input backend: wireless_controller, evdev, or tty (default: wireless_controller)\n"
-        << "  --capture-mode MODE      Capture mode: trajectory (default: trajectory)\n"
+        << "  --wireless-motion-mode MODE  For wireless_controller: native or collector (default: native)\n"
         << "  --input-device PATH      evdev device path (default: auto-detect keyboard)\n"
         << "  --scene-id TEXT          Required scene identifier\n"
         << "  --operator-id TEXT       Required operator identifier\n"
@@ -989,25 +1069,29 @@ void PrintUsage(const char* program)
         << "  --cmd-vy-max FLOAT       Max strafe speed in m/s\n"
         << "  --cmd-wz-max FLOAT       Max yaw speed in rad/s\n"
         << "  --web-ui                 Enable optional local Web UI\n"
+        << "  --preview-ui             Launch Web UI without Go2 using local preview state/image\n"
         << "  --web-port INT           Local Web UI port (default: 8080)\n"
         << "  --help                   Show this help\n\n"
         << "Wireless controller:\n"
-        << "  Native joystick passthrough is enabled immediately at startup\n"
-        << "  Start keeps Go2 native behavior; collector only observes one Start press before allowing recording\n"
-        << "  Left stick (ly/lx) forward-backward / strafe\n"
-        << "  Right stick X turn left-right\n"
+        << "  native 模式保持 Unitree 原生手柄手感与低延迟\n"
+        << "  collector 模式关闭原生手柄直通，改由 collector 根据 cmd_vx/vy/wz 上限输出 Move 指令\n"
+        << "  collector 模式中：左摇杆/右摇杆会按阈值离散成满量程控制，等价于把 WASDQE 映射成原生手柄拨杆拨满\n"
+        << "  collector 模式会对摇杆输入做平滑斜坡，起停会更柔和，限速也会真正生效\n"
+        << "  无论 native 还是 collector 模式，都可直接移动和录制\n"
+        << "  native 模式: left stick (ly/lx)=forward-backward / strafe, right stick X=turn\n"
+        << "  collector 模式: left stick / right stick X over threshold -> full-scale discrete commands\n"
         << "  A start capture  B stop capture  X discard current segment\n"
         << "  R2 emergency stop  Y clear fault or toggle stand up/down\n"
         << "  D-pad Up/Right/Down/Left submit label 1/2/3/4 when label_ready\n"
         << "Keyboard fallback:\n"
         << "  W/S forward-backward  A/D strafe  Q/E turn\n"
-        << "  R start  T stop  ESC discard  Space estop  C clear fault  P status  H help  X quit\n"
+        << "  R start  T stop  ESC discard  Space estop  C clear fault  V toggle stand  P status  H help  X quit\n"
         << "Input:\n"
         << "  wireless_controller subscribes Go2 native controller topic rt/wirelesscontroller\n"
         << "  evdev supports true multi-key press/release 和 smoother diagonal motion\n"
         << "  tty is a fallback mode 和 may feel less stable for combined keys\n"
-        << "Capture mode:\n"
-        << "  trajectory starts on R, auto-detects effective motion before logging, and on T waits for motion settle before labeling\n";
+        << "Recording flow:\n"
+        << "  trajectory flow is fixed: R starts buffering, effective motion gates logging, and T waits for motion settle before labeling\n";
 }
 
 std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
@@ -1017,6 +1101,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
     config.collectorRoot = collectorRoot;
     config.outputDir = collectorRoot / kDefaultDataDirName;
     ApplyCollectorDefaults(collectorRoot, config);
+    bool inputBackendExplicit = false;
 
     for (int index = 1; index < argc; ++index)
     {
@@ -1076,6 +1161,22 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
                 return std::nullopt;
             }
             config.inputBackend = backend.value();
+            inputBackendExplicit = true;
+        }
+        else if (arg == "--wireless-motion-mode")
+        {
+            if (index + 1 >= argc)
+            {
+                error = "参数缺少取值：--wireless-motion-mode";
+                return std::nullopt;
+            }
+            const auto mode = ParseWirelessMotionMode(argv[++index]);
+            if (!mode.has_value())
+            {
+                error = "无线手柄运动模式必须是 native 或 collector";
+                return std::nullopt;
+            }
+            config.wirelessMotionMode = mode.value();
         }
         else if (arg == "--capture-mode")
         {
@@ -1084,13 +1185,11 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
                 error = "参数缺少取值：--capture-mode";
                 return std::nullopt;
             }
-            const auto captureMode = ParseCaptureMode(argv[++index]);
-            if (!captureMode.has_value())
+            if (!IsSupportedCaptureModeValue(argv[++index]))
             {
                 error = "采集模式当前仅支持 trajectory";
                 return std::nullopt;
             }
-            config.captureMode = captureMode.value();
         }
         else if (arg == "--input-device")
         {
@@ -1204,6 +1303,11 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
         {
             config.webUiEnabled = true;
         }
+        else if (arg == "--preview-ui")
+        {
+            config.previewUi = true;
+            config.webUiEnabled = true;
+        }
         else if (arg == "--web-port")
         {
             if (index + 1 >= argc)
@@ -1233,7 +1337,39 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
     config.targetDescription = Trim(config.targetDescription);
     config.collectorNotes = Trim(config.collectorNotes);
 
-    if (config.networkInterface.empty())
+    if (config.previewUi)
+    {
+        if (!inputBackendExplicit)
+        {
+            config.inputBackend = Config::InputBackend::Tty;
+        }
+        if (config.sceneId.empty())
+        {
+            config.sceneId = kPreviewSceneId;
+        }
+        if (config.operatorId.empty())
+        {
+            config.operatorId = kPreviewOperatorId;
+        }
+        if (config.instruction.empty())
+        {
+            config.instruction = kPreviewInstruction;
+        }
+        if (config.taskFamily.empty())
+        {
+            config.taskFamily = kPreviewTaskFamily;
+        }
+        if (config.targetType.empty())
+        {
+            config.targetType = kPreviewTargetType;
+        }
+        if (config.targetDescription.empty())
+        {
+            config.targetDescription = kPreviewTargetDescription;
+        }
+    }
+
+    if (!config.previewUi && config.networkInterface.empty())
     {
         error = "--network-interface 为必填参数";
         return std::nullopt;
@@ -1917,7 +2053,6 @@ public:
           logger_(config.outputDir),
           trajectoryGateConfig_(BuildTrajectoryMotionGateConfig(config.videoPollHz))
     {
-        editableConfig_.captureMode = config.captureMode;
         editableConfig_.sceneId = config.sceneId;
         editableConfig_.operatorId = config.operatorId;
         editableConfig_.instruction = config.instruction;
@@ -1928,7 +2063,7 @@ public:
         editableConfig_.cmdVxMax = config.cmdVxMax;
         editableConfig_.cmdVyMax = config.cmdVyMax;
         editableConfig_.cmdWzMax = config.cmdWzMax;
-        startupGateActive_ = config_.inputBackend == Config::InputBackend::WirelessController;
+        startupGateActive_ = false;
     }
 
     ~CollectorApp()
@@ -1952,72 +2087,45 @@ public:
         return editableConfig_;
     }
 
-    void MaybePrintStartupGateReminder()
-    {
-        bool shouldPrint = false;
-        {
-            std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            if (!startupGateActive_)
-            {
-                return;
-            }
-            const auto now = std::chrono::steady_clock::now();
-            if (lastStartupGateReminder_.time_since_epoch().count() == 0 ||
-                now - lastStartupGateReminder_ >= kStartupGateReminderInterval)
-            {
-                lastStartupGateReminder_ = now;
-                shouldPrint = true;
-            }
-        }
-        if (shouldPrint)
-        {
-            PrintLine("当前还不能开始采集；" + StartupUnlockHint(config_.inputBackend));
-        }
-    }
-
-    void ObserveWirelessNativeStart(bool emitLog)
-    {
-        bool cleared = false;
-        {
-            std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            if (startupGateActive_)
-            {
-                startupGateActive_ = false;
-                lastStartupGateReminder_ = std::chrono::steady_clock::time_point{};
-                cleared = true;
-            }
-        }
-
-        if (cleared && emitLog)
-        {
-            PrintLine("已检测到原生手柄 Start；Go2 保持原生操控，可开始采集");
-        }
-    }
+    void MaybePrintStartupGateReminder() {}
 
     void PrintStartupInstructions() const
     {
-        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
         std::lock_guard<std::mutex> lock(outputMutex_);
         std::cout << "\r\33[2KCollector Startup" << std::endl;
         std::cout << "  采集前检查：确认周围安全、机器人姿态稳定、状态已正常更新" << std::endl;
         if (config_.inputBackend == Config::InputBackend::WirelessController)
         {
-            std::cout << "  主控手柄：左摇杆前后/横移，右摇杆 X 转向，A 开始录制，B 结束录制，X 丢弃当前段" << std::endl;
-            std::cout << "  其他按键：Start 保持 Go2 原生行为，并在首次按下后允许 collector 开始录制" << std::endl;
+            if (UsesWirelessCollectorControl(config_))
+            {
+                std::cout << "  主控手柄：左/右摇杆越过阈值后按满量程输出，等价于 WASDQE 对应拨杆拨满" << std::endl;
+                std::cout << "  其他按键：由 collector 持续接管运动控制" << std::endl;
+            }
+            else
+            {
+                std::cout << "  主控手柄：左摇杆前后/横移，右摇杆 X 转向，A 开始录制，B 结束录制，X 丢弃当前段" << std::endl;
+                std::cout << "  其他按键：保持 Go2 原生行为，可立即开始录制" << std::endl;
+            }
             std::cout << "  安全/标注：R2 急停  Y 清 fault/切换站立  方向键上右下左 = 评分 1/2/3/4" << std::endl;
         }
         else
         {
             std::cout << "  主控键位：W/S 前后  A/D 横移  Q/E 转向  R 开始录制  T 结束录制  ESC 丢弃当前段" << std::endl;
-            std::cout << "  其他键位：C 清 fault/切换站立  P 状态  H 帮助  X 退出" << std::endl;
+            std::cout << "  其他键位：C 清 fault  V 切换站立  P 状态  H 帮助  X 退出" << std::endl;
             std::cout << "  标注快捷键：待标注时按 1/2/3/4 直接完成评分" << std::endl;
             std::cout << "  安全键位：Space 急停（始终有效）" << std::endl;
         }
-        std::cout << "  运行参数：启动时固定；如需修改 scene/instruction/speed，请重启 collector" << std::endl;
-        std::cout << "  录制门控：" << StartupUnlockHint(config_.inputBackend) << std::endl;
-        std::cout << "  当前模式：capture_mode=" << CaptureModeName(editable.captureMode)
-                  << " input_backend=" << InputBackendName(config_.inputBackend) << std::endl;
-        std::cout << "  " << StartupPromptText(config_.inputBackend) << std::endl;
+        std::cout << "  运行参数：启动时固定；如需修改 scene/instruction/control，请重启 collector" << std::endl;
+        std::cout << "  录制门控：" << StartupUnlockHint(config_) << std::endl;
+        std::cout << "  采集流程：trajectory input_backend=" << InputBackendName(config_.inputBackend) << std::endl;
+        if (config_.previewUi)
+        {
+            std::cout << "  当前运行在离线预览模式：未连接 Go2，页面使用本地示例状态与图像" << std::endl;
+        }
+        else
+        {
+            std::cout << "  " << StartupPromptText(config_) << std::endl;
+        }
     }
 
     void ResetTrajectoryStopFlowLocked()
@@ -2109,23 +2217,34 @@ public:
             terminalRawEnabled_ = terminalGuard_.TryEnable();
         }
 
-        unitree::robot::ChannelFactory::Instance()->Init(0, config_.networkInterface);
+        if (!config_.previewUi)
+        {
+            unitree::robot::ChannelFactory::Instance()->Init(0, config_.networkInterface);
 
-        sportClient_ = std::make_unique<unitree::robot::go2::SportClient>();
-        sportClient_->SetTimeout(10.0f);
-        sportClient_->Init();
-        SetWirelessControllerPassthroughEnabled(true, "collector startup uses native joystick");
+            sportClient_ = std::make_unique<unitree::robot::go2::SportClient>();
+            sportClient_->SetTimeout(10.0f);
+            sportClient_->Init();
+            SetWirelessControllerPassthroughEnabled(
+                UsesWirelessNativePassthrough(config_),
+                UsesWirelessNativePassthrough(config_) ? "collector startup uses native joystick"
+                                                       : "collector startup takes over wireless motion");
 
-        sportStateSubscriber_ = std::make_shared<unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::SportModeState_>>(kSportStateTopic);
-        sportStateSubscriber_->InitChannel(std::bind(&CollectorApp::OnSportState, this, std::placeholders::_1), 1);
+            sportStateSubscriber_ =
+                std::make_shared<unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::SportModeState_>>(kSportStateTopic);
+            sportStateSubscriber_->InitChannel(std::bind(&CollectorApp::OnSportState, this, std::placeholders::_1), 1);
 
-        wirelessControllerSubscriber_ =
-            std::make_shared<unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::WirelessController_>>(kWirelessControllerTopic);
-        wirelessControllerSubscriber_->InitChannel(std::bind(&CollectorApp::OnWirelessController, this, std::placeholders::_1), 1);
+            wirelessControllerSubscriber_ =
+                std::make_shared<unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::WirelessController_>>(kWirelessControllerTopic);
+            wirelessControllerSubscriber_->InitChannel(std::bind(&CollectorApp::OnWirelessController, this, std::placeholders::_1), 1);
 
-        videoClient_ = std::make_unique<unitree::robot::go2::VideoClient>();
-        videoClient_->SetTimeout(1.0f);
-        videoClient_->Init();
+            videoClient_ = std::make_unique<unitree::robot::go2::VideoClient>();
+            videoClient_->SetTimeout(1.0f);
+            videoClient_->Init();
+        }
+        else
+        {
+            InitializePreviewMode();
+        }
 
         running_.store(true);
         controlThread_ = std::thread(&CollectorApp::ControlLoop, this);
@@ -2171,16 +2290,29 @@ public:
         {
             PrintLine("Web UI：http://127.0.0.1:" + std::to_string(config_.webPort));
         }
-        if (config_.inputBackend == Config::InputBackend::WirelessController)
+        if (config_.previewUi)
         {
-            PrintLine("collector 已就绪；原生手柄直通已启用，可立即自由操作");
-            PrintLine("录制门控：检测到一次原生 Start 后才允许开始采集");
+            PrintLine("preview ui 模式已启动；未连接 Go2，控制与状态均为本地预览数据");
+        }
+        else if (config_.inputBackend == Config::InputBackend::WirelessController)
+        {
+            if (UsesWirelessNativePassthrough(config_))
+            {
+                PrintLine("collector 已就绪；原生手柄直通已启用，可立即自由操作");
+                PrintLine("当前可直接移动和录制");
+            }
+            else
+            {
+                PrintLine("collector 已就绪；当前由 collector 接管手柄运动，cmd_vx/vy/wz 限速已生效");
+                PrintLine("左/右摇杆越过阈值后按满量程输出，等价于把 WASDQE 映射成原生手柄拨杆拨满");
+                PrintLine("当前可直接移动和录制");
+            }
         }
         else
         {
             PrintLine("collector 已就绪；当前输入后端可直接移动和录制");
         }
-        PrintLine("运行参数在启动时固定；如需修改 scene/instruction/speed，请重启 collector");
+        PrintLine("运行参数在启动时固定；如需修改 scene/instruction/control，请重启 collector");
         PrintStartupInstructions();
     }
 
@@ -2226,8 +2358,11 @@ public:
         }
 
         StopMotion();
-        SetWirelessControllerPassthroughEnabled(true, "collector shutdown restore native joystick");
-        unitree::robot::ChannelFactory::Instance()->Release();
+        if (!config_.previewUi)
+        {
+            SetWirelessControllerPassthroughEnabled(true, "collector shutdown restore native joystick");
+            unitree::robot::ChannelFactory::Instance()->Release();
+        }
         CloseEvdevInput();
         terminalGuard_.Disable();
         logger_.CleanupIfEmpty();
@@ -2255,9 +2390,11 @@ public:
         snapshot.running = running_.load();
         snapshot.webUiEnabled = config_.webUiEnabled;
         snapshot.webPort = config_.webPort;
-        snapshot.startupPrompt = StartupPromptText(config_.inputBackend);
+        snapshot.previewMode = config_.previewUi;
+        snapshot.startupPrompt =
+            config_.previewUi ? "preview ui mode; no Go2 connection required" : StartupPromptText(config_);
         snapshot.sessionDir = logger_.OutputDir().string();
-        snapshot.captureMode = CaptureModeName(editable.captureMode);
+        snapshot.captureMode = kTrajectoryCaptureMode;
         snapshot.bufferedFrames = loggerStatus.bufferedFrames;
         snapshot.segmentDurationSeconds = loggerStatus.bufferedFrames >= 2
                                               ? std::max(0.0, loggerStatus.endTimestamp - loggerStatus.startTimestamp)
@@ -2266,7 +2403,9 @@ public:
         snapshot.imageValid = latest.image.valid;
         snapshot.stateAgeSeconds = AgeSeconds(latest.state.timestamp, nowSeconds);
         snapshot.imageAgeSeconds = AgeSeconds(latest.image.timestamp, nowSeconds);
-        snapshot.robotConnected = snapshot.stateValid && snapshot.stateAgeSeconds >= 0.0 && snapshot.stateAgeSeconds <= kStateTimeoutSeconds;
+        snapshot.robotConnected = config_.previewUi ||
+                                  (snapshot.stateValid && snapshot.stateAgeSeconds >= 0.0 &&
+                                   snapshot.stateAgeSeconds <= kStateTimeoutSeconds);
         snapshot.bodyHeight = latest.state.bodyHeight;
         snapshot.roll = latest.state.roll;
         snapshot.pitch = latest.state.pitch;
@@ -2284,7 +2423,7 @@ public:
         snapshot.cmdVxMax = editable.cmdVxMax;
         snapshot.cmdVyMax = editable.cmdVyMax;
         snapshot.cmdWzMax = editable.cmdWzMax;
-        snapshot.networkInterface = config_.networkInterface;
+        snapshot.networkInterface = config_.previewUi ? "preview" : config_.networkInterface;
         snapshot.outputDir = config_.outputDir.string();
         snapshot.loopHz = config_.loopHz;
         snapshot.videoPollHz = config_.videoPollHz;
@@ -2467,14 +2606,139 @@ private:
         return snapshot;
     }
 
+    static bool HasJpegExtension(const fs::path& path)
+    {
+        std::string extension = path.extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch)
+        {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return extension == ".jpg" || extension == ".jpeg";
+    }
+
+    std::optional<fs::path> FindPreviewImagePath() const
+    {
+        const std::vector<fs::path> searchRoots = {
+            config_.collectorRoot / "data",
+            config_.collectorRoot / "data_min10",
+        };
+        for (const fs::path& root : searchRoots)
+        {
+            std::error_code existsError;
+            if (!fs::exists(root, existsError) || existsError)
+            {
+                continue;
+            }
+
+            std::error_code walkError;
+            fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, walkError);
+            fs::recursive_directory_iterator end;
+            while (it != end && !walkError)
+            {
+                const fs::path candidate = it->path();
+                std::error_code statusError;
+                if (it->is_directory(statusError))
+                {
+                    const std::string name = candidate.filename().string();
+                    if (name == "llada_vla_converted" || name == "build")
+                    {
+                        it.disable_recursion_pending();
+                    }
+                }
+                else if (it->is_regular_file(statusError) && HasJpegExtension(candidate))
+                {
+                    return candidate;
+                }
+                it.increment(walkError);
+            }
+        }
+        return std::nullopt;
+    }
+
+    void InitializePreviewMode()
+    {
+        previewImageJpeg_.clear();
+        if (const auto previewImagePath = FindPreviewImagePath(); previewImagePath.has_value())
+        {
+            std::ifstream input(previewImagePath.value(), std::ios::binary);
+            if (input.is_open())
+            {
+                previewImageJpeg_ =
+                    std::vector<uint8_t>(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+            }
+            if (!previewImageJpeg_.empty())
+            {
+                PrintLine("preview ui 复用本地样例图像：" + previewImagePath.value().string());
+            }
+        }
+        if (previewImageJpeg_.empty())
+        {
+            PrintLine("preview ui 未找到本地 jpg 样例，Camera 区域将保持等待状态");
+        }
+
+        VelocityCommand command;
+        command.timestamp = NowSeconds();
+        command.valid = true;
+        {
+            std::lock_guard<std::mutex> lock(commandMutex_);
+            latestCommand_ = command;
+        }
+        UpdatePreviewState(command, 0.0);
+        PublishPreviewImageFrame();
+    }
+
+    void UpdatePreviewState(const VelocityCommand& command, double deltaSeconds)
+    {
+        const double nowSeconds = NowSeconds();
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        LatestState state = latestState_;
+        state.timestamp = nowSeconds;
+        state.valid = true;
+        state.roll = 0.03f * std::sin(static_cast<float>(nowSeconds * 0.7));
+        state.pitch = 0.02f * std::cos(static_cast<float>(nowSeconds * 0.5));
+        state.yaw += command.wz * static_cast<float>(deltaSeconds);
+        const float worldVx = command.vx * std::cos(state.yaw) - command.vy * std::sin(state.yaw);
+        const float worldVy = command.vx * std::sin(state.yaw) + command.vy * std::cos(state.yaw);
+        state.positionX += worldVx * static_cast<float>(deltaSeconds);
+        state.positionY += worldVy * static_cast<float>(deltaSeconds);
+        state.velocityX = command.vx;
+        state.velocityY = command.vy;
+        state.velocityZ = 0.0f;
+        state.yawSpeed = command.wz;
+        state.bodyHeight = 0.30f;
+        state.gaitType = (std::fabs(command.vx) > 1e-3f || std::fabs(command.vy) > 1e-3f || std::fabs(command.wz) > 1e-3f)
+                             ? 1
+                             : 0;
+        latestState_ = state;
+    }
+
+    void PublishPreviewImageFrame()
+    {
+        if (previewImageJpeg_.empty())
+        {
+            return;
+        }
+
+        LatestImage image;
+        image.timestamp = NowSeconds();
+        image.sequence = nextImageSequence_++;
+        image.jpegBytes = previewImageJpeg_;
+        image.valid = true;
+        {
+            std::lock_guard<std::mutex> lock(imageMutex_);
+            latestImage_ = std::move(image);
+        }
+        imageUpdatedCv_.notify_all();
+    }
+
     static UiActionAvailability BuildUiActionAvailability(const TrajectoryLogger::Status& loggerStatus,
                                                           CaptureState captureState,
                                                           SafetyState safetyState,
                                                           bool startupGateActive)
     {
+        (void)startupGateActive;
         UiActionAvailability actions;
-        actions.canStartRecording = !startupGateActive &&
-                                    safetyState == SafetyState::SafeReady &&
+        actions.canStartRecording = safetyState == SafetyState::SafeReady &&
                                     captureState == CaptureState::Idle &&
                                     !loggerStatus.pendingLabel;
         actions.canStopRecording = captureState == CaptureState::Capturing;
@@ -2522,10 +2786,20 @@ private:
 
             motionState.forward = controllerState.gamepad.rawLy > kWirelessControllerDiscreteThreshold;
             motionState.backward = controllerState.gamepad.rawLy < -kWirelessControllerDiscreteThreshold;
-            motionState.left = controllerState.gamepad.rawLx < -kWirelessControllerDiscreteThreshold;
-            motionState.right = controllerState.gamepad.rawLx > kWirelessControllerDiscreteThreshold;
-            motionState.yawLeft = controllerState.gamepad.rawRx < -kWirelessControllerDiscreteThreshold;
-            motionState.yawRight = controllerState.gamepad.rawRx > kWirelessControllerDiscreteThreshold;
+            if (UsesWirelessCollectorControl(config_))
+            {
+                motionState.left = controllerState.gamepad.rawLx < -kWirelessControllerDiscreteThreshold;
+                motionState.right = controllerState.gamepad.rawLx > kWirelessControllerDiscreteThreshold;
+                motionState.yawLeft = controllerState.gamepad.rawRx < -kWirelessControllerDiscreteThreshold;
+                motionState.yawRight = controllerState.gamepad.rawRx > kWirelessControllerDiscreteThreshold;
+            }
+            else
+            {
+                motionState.left = controllerState.gamepad.rawLx < -kWirelessControllerDiscreteThreshold;
+                motionState.right = controllerState.gamepad.rawLx > kWirelessControllerDiscreteThreshold;
+                motionState.yawLeft = controllerState.gamepad.rawRx < -kWirelessControllerDiscreteThreshold;
+                motionState.yawRight = controllerState.gamepad.rawRx > kWirelessControllerDiscreteThreshold;
+            }
             return motionState;
         }
 
@@ -2752,12 +3026,10 @@ private:
 
     void PrintHelp() const
     {
-        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
         std::lock_guard<std::mutex> lock(outputMutex_);
         std::cout << "\r\33[2KControls:" << std::endl;
         if (config_.inputBackend == Config::InputBackend::WirelessController)
         {
-            std::cout << "  Start 保持 Go2 原生行为；collector 仅在观察到一次 Start 后允许开始录制" << std::endl;
             std::cout << "  A start capture  B stop capture  X discard current segment" << std::endl;
             std::cout << "  left stick = forward/backward + strafe  right stick X = yaw" << std::endl;
             std::cout << "  R2 emergency stop  Y clear fault or toggle stand up/down" << std::endl;
@@ -2767,13 +3039,17 @@ private:
         {
             std::cout << "  W/S forward/backward  A/D strafe  Q/E yaw" << std::endl;
             std::cout << "  R start capture flow  T stop capture  ESC discard current segment" << std::endl;
-            std::cout << "  Space emergency stop  C clear fault or toggle stand up/down  P status  H help  X quit" << std::endl;
+            std::cout << "  Space emergency stop  C clear fault  V toggle stand up/down  P status  H help  X quit" << std::endl;
             std::cout << "  pending label: 1 good demo  2 usable imperfect  3 failed but valuable  4 discard" << std::endl;
         }
         std::cout << "  trajectory 模式：按 R 启动采集流程，连续有效动作后开始写入，按 T 请求结束并等待动作回落后标注" << std::endl;
         std::cout << "  该模式下必须提供 --instruction，并作为轨迹级语义标签保存" << std::endl;
+        if (config_.previewUi)
+        {
+            std::cout << "  当前为 preview ui 模式：无需 Go2，状态/图像来自本地预览数据" << std::endl;
+        }
         std::cout << "  input_backend=" << InputBackendName(config_.inputBackend)
-                  << " capture_mode=" << CaptureModeName(editable.captureMode) << std::endl;
+                  << " capture_flow=" << kTrajectoryCaptureMode << std::endl;
     }
 
     void PrintStatus() const
@@ -2790,24 +3066,21 @@ private:
         SafetyState safetyState;
         std::string faultReason;
         CaptureState captureState;
-        bool startupGateActive = false;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
             safetyState = safetyState_;
             faultReason = latchedFaultReason_;
             captureState = captureState_;
-            startupGateActive = startupGateActive_;
         }
 
         std::ostringstream oss;
         oss << std::boolalpha
             << "capture_state=" << CaptureStateName(captureState)
-            << " startup_gate=" << (startupGateActive ? "waiting_native_start" : "ready")
             << " safety_state=" << SafetyStateName(safetyState)
             << " fault_reason=" << (faultReason.empty() ? "-" : faultReason)
             << " scene_id=" << editable.sceneId
             << " operator_id=" << editable.operatorId
-            << " capture_mode=" << CaptureModeName(editable.captureMode)
+            << " preview_ui=" << config_.previewUi
             << " configured_instruction=" << (editable.instruction.empty() ? "-" : editable.instruction)
             << " task_family=" << (editable.taskFamily.empty() ? "-" : editable.taskFamily)
             << " target_type=" << (editable.targetType.empty() ? "-" : editable.targetType)
@@ -2825,7 +3098,8 @@ private:
                 << ",lx=" << controllerState.gamepad.rawLx
                 << ",rx=" << controllerState.gamepad.rawRx
                 << ")"
-                << " wireless_mode=" << (nativeJoystickEnabled_.load() ? "native_passthrough" : "passthrough_disabled");
+                << " wireless_mode=" << WirelessMotionModeName(config_.wirelessMotionMode)
+                << " native_passthrough=" << (nativeJoystickEnabled_.load() ? "enabled" : "disabled");
         }
         else
         {
@@ -2924,33 +3198,42 @@ private:
         PrintLine("急停已锁定：" + reason);
     }
 
-    void ClearFaultOrToggleStandState()
+    bool TryClearFault()
     {
         bool hasFault = false;
-        bool segmentActive = false;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
             hasFault = safetyState_ != SafetyState::SafeReady;
-            segmentActive = captureState_ == CaptureState::Capturing;
         }
 
-        if (hasFault)
+        if (!hasFault)
         {
-            std::string reason;
-            if (CanClearFault(reason))
+            return false;
+        }
+
+        std::string reason;
+        if (CanClearFault(reason))
+        {
+            ClearLatchedFault();
+            if (UsesWirelessNativePassthrough(config_))
             {
-                ClearLatchedFault();
-                if (config_.inputBackend == Config::InputBackend::WirelessController)
-                {
-                    SetWirelessControllerPassthroughEnabled(true, "fault cleared");
-                }
-                PrintLine("safety fault 已清除");
+                SetWirelessControllerPassthroughEnabled(true, "fault cleared");
             }
-            else
-            {
-                PrintLine("无法清除 safety fault：" + reason);
-            }
-            return;
+            PrintLine("safety fault 已清除");
+        }
+        else
+        {
+            PrintLine("无法清除 safety fault：" + reason);
+        }
+        return true;
+    }
+
+    void ToggleStandState()
+    {
+        bool segmentActive = false;
+        {
+            std::lock_guard<std::mutex> lock(stateMachineMutex_);
+            segmentActive = captureState_ == CaptureState::Capturing;
         }
 
         if (segmentActive)
@@ -2992,12 +3275,20 @@ private:
         }
     }
 
+    void ClearFaultOrToggleStandState()
+    {
+        if (TryClearFault())
+        {
+            return;
+        }
+        ToggleStandState();
+    }
+
     TaskMetadata ConfiguredTaskMetadata() const
     {
         const EditableCollectorConfig editable = GetEditableConfigSnapshot();
         TaskMetadata metadata;
         metadata.instruction = editable.instruction;
-        metadata.captureMode = CaptureModeName(editable.captureMode);
         metadata.taskFamily = editable.taskFamily;
         metadata.targetType = editable.targetType;
         metadata.targetDescription = editable.targetDescription;
@@ -3008,14 +3299,6 @@ private:
 
     std::optional<UiActionResult> ValidateBeginSegmentLocked(bool hasPendingLabel, bool emitLog) const
     {
-        if (startupGateActive_)
-        {
-            if (emitLog)
-            {
-                PrintLine("当前还不能开始采集；" + StartupUnlockHint(config_.inputBackend));
-            }
-            return ActionError("startup_gate_active", StartupUnlockHint(config_.inputBackend));
-        }
         if (safetyState_ != SafetyState::SafeReady)
         {
             if (emitLog)
@@ -3490,8 +3773,20 @@ private:
                     ageSeconds <= kWirelessControllerTimeoutSeconds)
                 {
                     targetVx = controllerState.gamepad.rawLy;
-                    targetVy = -controllerState.gamepad.rawLx;
-                    targetWz = -controllerState.gamepad.rawRx;
+                    if (UsesWirelessCollectorControl(config_))
+                    {
+                        // Collector mode reuses the keyboard motion path: once a
+                        // stick crosses the threshold, treat it like the
+                        // corresponding key is fully pressed.
+                        targetVx = QuantizeWirelessAxisToFullScale(controllerState.gamepad.rawLy);
+                        targetVy = -QuantizeWirelessAxisToFullScale(controllerState.gamepad.rawLx);
+                        targetWz = -QuantizeWirelessAxisToFullScale(controllerState.gamepad.rawRx);
+                    }
+                    else
+                    {
+                        targetVy = -controllerState.gamepad.rawLx;
+                        targetWz = -controllerState.gamepad.rawRx;
+                    }
                 }
             }
             else
@@ -3514,7 +3809,8 @@ private:
                 targetVy /= planarNorm;
             }
 
-            if (config_.inputBackend == Config::InputBackend::WirelessController)
+            if (config_.inputBackend == Config::InputBackend::WirelessController &&
+                UsesWirelessNativePassthrough(config_))
             {
                 smoothedVx_ = targetVx;
                 smoothedVy_ = targetVy;
@@ -3522,12 +3818,21 @@ private:
             }
             else
             {
+                const bool keyboardBackend = config_.inputBackend != Config::InputBackend::WirelessController;
+                const float linearAccelPerSecond =
+                    keyboardBackend ? kKeyboardLinearAccelPerSecond : kLinearAccelPerSecond;
+                const float linearDecelPerSecond =
+                    keyboardBackend ? kKeyboardLinearDecelPerSecond : kLinearDecelPerSecond;
+                const float yawAccelPerSecond =
+                    keyboardBackend ? kKeyboardYawAccelPerSecond : kYawAccelPerSecond;
+                const float yawDecelPerSecond =
+                    keyboardBackend ? kKeyboardYawDecelPerSecond : kYawDecelPerSecond;
                 smoothedVx_ =
-                    SlewTowards(smoothedVx_, targetVx, kLinearAccelPerSecond, kLinearDecelPerSecond, deltaSeconds);
+                    SlewTowards(smoothedVx_, targetVx, linearAccelPerSecond, linearDecelPerSecond, deltaSeconds);
                 smoothedVy_ =
-                    SlewTowards(smoothedVy_, targetVy, kLinearAccelPerSecond, kLinearDecelPerSecond, deltaSeconds);
+                    SlewTowards(smoothedVy_, targetVy, linearAccelPerSecond, linearDecelPerSecond, deltaSeconds);
                 smoothedWz_ =
-                    SlewTowards(smoothedWz_, targetWz, kYawAccelPerSecond, kYawDecelPerSecond, deltaSeconds);
+                    SlewTowards(smoothedWz_, targetWz, yawAccelPerSecond, yawDecelPerSecond, deltaSeconds);
             }
 
             commandVx = smoothedVx_;
@@ -3537,7 +3842,8 @@ private:
 
         VelocityCommand command;
         command.timestamp = NowSeconds();
-        if (config_.inputBackend == Config::InputBackend::WirelessController)
+        if (config_.inputBackend == Config::InputBackend::WirelessController &&
+            UsesWirelessNativePassthrough(config_))
         {
             // Native passthrough uses the robot's own joystick motion path; the
             // collector records normalized operator intent instead of issuing
@@ -3586,23 +3892,19 @@ private:
             EndSegment();
             break;
         case 'c':
-            ClearFaultOrToggleStandState();
+            if (!TryClearFault())
+            {
+                PrintLine("当前无 safety fault；如需切换站立请按 V");
+            }
+            break;
+        case 'v':
+            ToggleStandState();
             break;
         case 'p':
             PrintStatus();
             break;
         case 'h':
             PrintHelp();
-            break;
-        case kStartupAcknowledgeKey:
-            if (config_.inputBackend == Config::InputBackend::WirelessController)
-            {
-                PrintLine("collector 不需要 Apply；请直接按原生手柄 Start，检测到后即可开始采集");
-            }
-            else
-            {
-                PrintLine("collector 运行参数在启动时固定；请修改启动命令后重启 collector");
-            }
             break;
         case 'x':
             RequestQuit();
@@ -3640,45 +3942,49 @@ private:
         }
     }
 
-    void HandleWirelessControllerActions(const collector::input::Gamepad& gamepad)
+    PendingWirelessControllerActions TakePendingWirelessControllerActions()
     {
-        if (gamepad.start.onPress)
-        {
-            ObserveWirelessNativeStart(true);
-        }
-        if (gamepad.A.onPress)
+        std::lock_guard<std::mutex> lock(controllerMutex_);
+        PendingWirelessControllerActions pending = pendingWirelessControllerActions_;
+        pendingWirelessControllerActions_ = PendingWirelessControllerActions{};
+        return pending;
+    }
+
+    void HandleWirelessControllerActions(const PendingWirelessControllerActions& actions)
+    {
+        if (actions.A)
         {
             ProcessTeleopChar('r', false);
         }
-        if (gamepad.B.onPress)
+        if (actions.B)
         {
             ProcessTeleopChar('t', false);
         }
-        if (gamepad.X.onPress)
+        if (actions.X)
         {
             ProcessTeleopChar(kEscapeKey, false);
         }
-        if (gamepad.R2.onPress)
+        if (actions.R2)
         {
             ProcessTeleopChar(' ', false);
         }
-        if (gamepad.Y.onPress)
+        if (actions.Y)
         {
             ProcessTeleopChar('c', false);
         }
-        if (gamepad.up.onPress)
+        if (actions.up)
         {
             SubmitPresetLabelShortcut('1');
         }
-        if (gamepad.right.onPress)
+        if (actions.right)
         {
             SubmitPresetLabelShortcut('2');
         }
-        if (gamepad.down.onPress)
+        if (actions.down)
         {
             SubmitPresetLabelShortcut('3');
         }
-        if (gamepad.left.onPress)
+        if (actions.left)
         {
             SubmitPresetLabelShortcut('4');
         }
@@ -3718,15 +4024,13 @@ private:
 
     void WirelessControllerLoop()
     {
-        uint64_t lastHandledSequence = 0;
         while (running_.load())
         {
             MaybeRunPendingTerminalLabelPrompt();
-            const WirelessControllerSnapshot controllerState = GetWirelessControllerSnapshot();
-            if (controllerState.valid && controllerState.sequence != lastHandledSequence)
+            const PendingWirelessControllerActions pendingActions = TakePendingWirelessControllerActions();
+            if (pendingActions.Any())
             {
-                lastHandledSequence = controllerState.sequence;
-                HandleWirelessControllerActions(controllerState.gamepad);
+                HandleWirelessControllerActions(pendingActions);
             }
 
             if (terminalRawEnabled_ && !promptActive_.load())
@@ -3861,12 +4165,6 @@ private:
                 ProcessTeleopChar('h');
             }
             return true;
-        case KEY_O:
-            if (pressed)
-            {
-                ProcessTeleopChar(kStartupAcknowledgeKey);
-            }
-            return true;
         case KEY_X:
             if (pressed)
             {
@@ -3883,6 +4181,8 @@ private:
         const auto* state = static_cast<const unitree_go::msg::dds_::SportModeState_*>(message);
         LatestState latest;
         latest.timestamp = NowSeconds();
+        latest.errorCode = state->error_code();
+        latest.mode = state->mode();
         latest.roll = state->imu_state().rpy()[0];
         latest.pitch = state->imu_state().rpy()[1];
         latest.yaw = state->imu_state().rpy()[2];
@@ -3897,8 +4197,10 @@ private:
         latest.gaitType = state->gait_type();
         latest.valid = true;
 
-        std::lock_guard<std::mutex> lock(stateMutex_);
-        latestState_ = latest;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            latestState_ = latest;
+        }
     }
 
     void OnWirelessController(const void* message)
@@ -3906,6 +4208,7 @@ private:
         const auto* controller = static_cast<const unitree_go::msg::dds_::WirelessController_*>(message);
         std::lock_guard<std::mutex> lock(controllerMutex_);
         wirelessControllerSnapshot_.gamepad.Update(*controller);
+        pendingWirelessControllerActions_.MergeFrom(wirelessControllerSnapshot_.gamepad);
         wirelessControllerSnapshot_.timestamp = NowSeconds();
         wirelessControllerSnapshot_.sequence += 1;
         wirelessControllerSnapshot_.valid = true;
@@ -3943,11 +4246,17 @@ private:
                 latestCommand_ = command;
             }
 
+            if (config_.previewUi)
+            {
+                UpdatePreviewState(command, std::chrono::duration<double>(period).count());
+            }
+
             const bool moveActive = std::fabs(command.vx) > 1e-6f ||
                                     std::fabs(command.vy) > 1e-6f ||
                                     std::fabs(command.wz) > 1e-6f;
 
-            if (config_.inputBackend != Config::InputBackend::WirelessController)
+            if (config_.inputBackend != Config::InputBackend::WirelessController ||
+                UsesWirelessCollectorControl(config_))
             {
                 try
                 {
@@ -3982,6 +4291,13 @@ private:
         {
             const auto cycleStart = std::chrono::steady_clock::now();
 
+            if (config_.previewUi)
+            {
+                PublishPreviewImageFrame();
+                std::this_thread::sleep_until(cycleStart + period);
+                continue;
+            }
+
             std::vector<uint8_t> jpegBytes;
             int32_t ret = -1;
             try
@@ -4008,7 +4324,7 @@ private:
                     std::lock_guard<std::mutex> lock(imageMutex_);
                     latestImage_ = std::move(image);
                 }
-                imageUpdatedCv_.notify_one();
+                imageUpdatedCv_.notify_all();
             }
 
             std::this_thread::sleep_until(cycleStart + period);
@@ -4166,12 +4482,12 @@ private:
     std::string latchedFaultReason_;
     CaptureState captureState_ = CaptureState::Idle;
     bool startupGateActive_ = false;
-    std::chrono::steady_clock::time_point lastStartupGateReminder_{};
     bool trajectoryStopRequested_ = false;
     bool trajectoryStopWaitingForRelease_ = false;
     std::chrono::steady_clock::time_point trajectoryStopFinalizeDeadline_{};
     std::chrono::steady_clock::time_point trajectoryStopForceFinalizeDeadline_{};
     EditableCollectorConfig editableConfig_;
+    std::vector<uint8_t> previewImageJpeg_;
 
     KeyActivity keyW_;
     KeyActivity keyS_;
@@ -4184,6 +4500,7 @@ private:
     float smoothedVy_ = 0.0f;
     float smoothedWz_ = 0.0f;
     WirelessControllerSnapshot wirelessControllerSnapshot_{};
+    PendingWirelessControllerActions pendingWirelessControllerActions_{};
     std::atomic<bool> nativeJoystickEnabled_{false};
     std::atomic<bool> nativeJoystickStateKnown_{false};
     int evdevFd_ = -1;

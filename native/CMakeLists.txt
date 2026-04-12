@@ -21,5 +21,8 @@ target_link_libraries(go2_bridge PRIVATE unitree_sdk2)
 add_executable(go2_mode_probe go2_mode_probe.cpp)
 target_link_libraries(go2_mode_probe PRIVATE unitree_sdk2)
 
+add_executable(go2_speed_level_probe go2_speed_level_probe.cpp)
+target_link_libraries(go2_speed_level_probe PRIVATE unitree_sdk2)
+
 add_executable(go2_video_probe go2_video_probe.cpp)
 target_link_libraries(go2_video_probe PRIVATE unitree_sdk2)
