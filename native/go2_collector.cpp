@@ -20,9 +20,9 @@
 #include <optional>
 #include <poll.h>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
-#include <termios.h>
 #include <unistd.h>
 #include <vector>
 
@@ -32,7 +32,9 @@
 #include <unitree/robot/channel/channel_subscriber.hpp>
 #include <unitree/robot/go2/sport/sport_client.hpp>
 #include <unitree/robot/go2/video/video_client.hpp>
-#include "wireless_gamepad.h"
+#include "collector_input_backend.h"
+#include "collector_input_utils.h"
+#include "raw_terminal_guard.h"
 #include "web_ui_server.h"
 
 namespace
@@ -55,20 +57,24 @@ constexpr double kStateTimeoutSeconds = 1.0;
 constexpr double kWirelessControllerTimeoutSeconds = 1.0;
 constexpr double kMaxSafeAbsRollRad = 0.75;
 constexpr double kMaxSafeAbsPitchRad = 0.75;
-constexpr double kDefaultCmdVxMax = 0.5;
+constexpr double kDefaultCmdVxMax = 1.0;
 constexpr double kDefaultCmdVyMax = 0.3;
 constexpr double kDefaultCmdWzMax = 0.8;
 constexpr float kStandingBodyHeightThreshold = 0.18f;
-constexpr auto kKeyboardHoldTimeout = std::chrono::milliseconds(900);
-constexpr float kKeyboardLinearAccelPerSecond = 1.6f;
-constexpr float kKeyboardLinearDecelPerSecond = 2.4f;
-constexpr float kKeyboardYawAccelPerSecond = 2.0f;
-constexpr float kKeyboardYawDecelPerSecond = 3.0f;
-constexpr float kLinearAccelPerSecond = 3.0f;
-constexpr float kLinearDecelPerSecond = 4.5f;
-constexpr float kYawAccelPerSecond = 4.5f;
-constexpr float kYawDecelPerSecond = 6.0f;
-constexpr float kWirelessControllerDiscreteThreshold = 0.35f;
+constexpr float kKeyboardLinearAccelPerSecond = 0.9f;
+constexpr float kKeyboardLinearDecelPerSecond = 1.1f;
+constexpr float kKeyboardYawAccelPerSecond = 0.8f;
+constexpr float kKeyboardYawDecelPerSecond = 1.0f;
+constexpr float kLinearAccelPerSecond = 1.2f;
+constexpr float kLinearDecelPerSecond = 1.8f;
+constexpr float kYawAccelPerSecond = 1.5f;
+constexpr float kYawDecelPerSecond = 2.5f;
+constexpr float kWirelessControllerDiscreteThreshold = 0.85f;
+constexpr float kWirelessControllerStickDeadZone = 0.08f;
+constexpr float kWirelessControllerStickSmoothing = 0.18f;
+constexpr float kWirelessCollectorDeadZone = 0.22f;
+constexpr float kWirelessCollectorReleaseZone = 0.16f;
+constexpr float kWirelessCollectorAxisExponent = 1.8f;
 constexpr auto kTrajectoryFinalizeGracePeriod = std::chrono::milliseconds(400);
 constexpr auto kTrajectoryStopReleaseTimeout = std::chrono::milliseconds(1200);
 constexpr char kEscapeKey = 27;
@@ -106,7 +112,6 @@ struct Config
     {
         WirelessController,
         Evdev,
-        Tty,
     };
 
     enum class WirelessMotionMode
@@ -201,45 +206,6 @@ struct VelocityCommand
     float vy = 0.0f;
     float wz = 0.0f;
     bool valid = false;
-};
-
-struct WirelessControllerSnapshot
-{
-    collector::input::Gamepad gamepad;
-    double timestamp = 0.0;
-    uint64_t sequence = 0;
-    bool valid = false;
-};
-
-struct PendingWirelessControllerActions
-{
-    bool A = false;
-    bool B = false;
-    bool X = false;
-    bool Y = false;
-    bool R2 = false;
-    bool up = false;
-    bool right = false;
-    bool down = false;
-    bool left = false;
-
-    bool Any() const
-    {
-        return A || B || X || Y || R2 || up || right || down || left;
-    }
-
-    void MergeFrom(const collector::input::Gamepad& gamepad)
-    {
-        A = A || gamepad.A.onPress;
-        B = B || gamepad.B.onPress;
-        X = X || gamepad.X.onPress;
-        Y = Y || gamepad.Y.onPress;
-        R2 = R2 || gamepad.R2.onPress;
-        up = up || gamepad.up.onPress;
-        right = right || gamepad.right.onPress;
-        down = down || gamepad.down.onPress;
-        left = left || gamepad.left.onPress;
-    }
 };
 
 struct EffectiveControlAction
@@ -540,16 +506,10 @@ fs::path LegacyCollectorDefaultsPath(const fs::path& collectorRoot)
     return collectorRoot / "collector_webui_defaults.json";
 }
 
-bool UsesWirelessCollectorControl(const Config& config)
-{
-    return config.inputBackend == Config::InputBackend::WirelessController &&
-           config.wirelessMotionMode == Config::WirelessMotionMode::CollectorScaledMove;
-}
-
 bool UsesWirelessNativePassthrough(const Config& config)
 {
-    return config.inputBackend == Config::InputBackend::WirelessController &&
-           config.wirelessMotionMode == Config::WirelessMotionMode::NativePassthrough;
+    (void)config;
+    return false;
 }
 
 std::string StartupUnlockHint(const Config& config)
@@ -562,13 +522,7 @@ std::string StartupPromptText(const Config& config)
 {
     if (config.inputBackend == Config::InputBackend::WirelessController)
     {
-        if (UsesWirelessCollectorControl(config))
-        {
-            return "collector 已完成初始化；当前手柄输入由 collector 接管，原生手柄直通已关闭，"
-                   "左摇杆/右摇杆会按阈值离散成满量程控制，等价于把 WASDQE 映射到原生手柄拨杆拨满；"
-                   "可立即移动和录制";
-        }
-        return "collector 已完成初始化；配置在启动时固定，当前已启用原生手柄直通，可立即自由操作和录制";
+        return "collector 已完成初始化；原生手柄直通已关闭，手柄按键映射由 collector 接管，可立即移动和录制";
     }
     return "collector 已完成初始化；配置在启动时固定，可直接移动和录制";
 }
@@ -626,20 +580,6 @@ std::string InputBackendName(Config::InputBackend backend)
         return "wireless_controller";
     case Config::InputBackend::Evdev:
         return "evdev";
-    case Config::InputBackend::Tty:
-        return "tty";
-    }
-    return "unknown";
-}
-
-std::string WirelessMotionModeName(Config::WirelessMotionMode mode)
-{
-    switch (mode)
-    {
-    case Config::WirelessMotionMode::NativePassthrough:
-        return "native";
-    case Config::WirelessMotionMode::CollectorScaledMove:
-        return "collector";
     }
     return "unknown";
 }
@@ -875,18 +815,6 @@ void ApplyDefaultsFile(const fs::path& defaultsPath, Config& config)
     {
         config.cmdWzMax = value.value();
     }
-    if (const auto value = ExtractJsonStringFieldLocal(body, "wireless_motion_mode"); value.has_value())
-    {
-        const std::string trimmed = Trim(value.value());
-        if (trimmed == "collector")
-        {
-            config.wirelessMotionMode = Config::WirelessMotionMode::CollectorScaledMove;
-        }
-        else if (trimmed == "native")
-        {
-            config.wirelessMotionMode = Config::WirelessMotionMode::NativePassthrough;
-        }
-    }
 }
 
 void ApplyCollectorDefaults(const fs::path& collectorRoot, Config& config)
@@ -914,117 +842,7 @@ std::optional<Config::InputBackend> ParseInputBackend(const std::string& value)
     {
         return Config::InputBackend::Evdev;
     }
-    if (value == "tty")
-    {
-        return Config::InputBackend::Tty;
-    }
     return std::nullopt;
-}
-
-std::optional<Config::WirelessMotionMode> ParseWirelessMotionMode(const std::string& value)
-{
-    if (value == "native" || value == "native_passthrough")
-    {
-        return Config::WirelessMotionMode::NativePassthrough;
-    }
-    if (value == "collector" || value == "scaled" || value == "collector_scaled_move")
-    {
-        return Config::WirelessMotionMode::CollectorScaledMove;
-    }
-    return std::nullopt;
-}
-
-std::optional<fs::path> FindDefaultKeyboardDevice()
-{
-    const fs::path byIdDir("/dev/input/by-id");
-    if (fs::exists(byIdDir))
-    {
-        std::vector<std::pair<std::string, fs::path>> keyboardDevices;
-        for (const auto& entry : fs::directory_iterator(byIdDir))
-        {
-            if (!entry.is_symlink())
-            {
-                continue;
-            }
-            const std::string name = entry.path().filename().string();
-            if (name.find("-event-kbd") == std::string::npos)
-            {
-                continue;
-            }
-            std::error_code ec;
-            const fs::path resolved = fs::canonical(entry.path(), ec);
-            if (!ec)
-            {
-                keyboardDevices.emplace_back(name, resolved);
-            }
-        }
-
-        if (!keyboardDevices.empty())
-        {
-            std::sort(
-                keyboardDevices.begin(),
-                keyboardDevices.end(),
-                [](const auto& lhs, const auto& rhs)
-                {
-                    const bool lhsPrefersInterface = lhs.first.find("-if") != std::string::npos;
-                    const bool rhsPrefersInterface = rhs.first.find("-if") != std::string::npos;
-                    if (lhsPrefersInterface != rhsPrefersInterface)
-                    {
-                        return lhsPrefersInterface > rhsPrefersInterface;
-                    }
-                    return lhs.first < rhs.first;
-                });
-            return keyboardDevices.front().second;
-        }
-    }
-
-    const fs::path inputDir("/dev/input");
-    if (!fs::exists(inputDir))
-    {
-        return std::nullopt;
-    }
-
-    for (const auto& entry : fs::directory_iterator(inputDir))
-    {
-        const std::string name = entry.path().filename().string();
-        if (name.rfind("event", 0) == 0)
-        {
-            return entry.path();
-        }
-    }
-    return std::nullopt;
-}
-
-float SlewTowards(float current, float target, float accelPerSecond, float decelPerSecond, float deltaSeconds)
-{
-    const float delta = target - current;
-    if (std::fabs(delta) <= 1e-6f)
-    {
-        return target;
-    }
-
-    const bool accelerating = std::fabs(target) > std::fabs(current) ||
-                              (std::fabs(target) > 1e-6f && current * target < 0.0f);
-    const float maxStep = (accelerating ? accelPerSecond : decelPerSecond) *
-                          std::max(deltaSeconds, 0.0f);
-    if (std::fabs(delta) <= maxStep)
-    {
-        return target;
-    }
-    return current + (delta > 0.0f ? maxStep : -maxStep);
-}
-
-float QuantizeWirelessAxisToFullScale(float value)
-{
-    if (value > kWirelessControllerDiscreteThreshold)
-    {
-        return 1.0f;
-    }
-    if (value < -kWirelessControllerDiscreteThreshold)
-    {
-        return -1.0f;
-    }
-    return 0.0f;
 }
 
 EffectiveControlAction ResolveControlAction(const VelocityCommand& rawAction, double sampleTimestamp)
@@ -1055,8 +873,7 @@ void PrintUsage(const char* program)
         << "  --output-dir PATH        数据集根目录（默认：<collector>/" << kDefaultDataDirName << ")\n"
         << "  --loop-hz FLOAT          Control 和 logging loop frequency (default: 50.0)\n"
         << "  --video-poll-hz FLOAT    Camera polling frequency (default: 20.0)\n"
-        << "  --input-backend MODE     Input backend: wireless_controller, evdev, or tty (default: wireless_controller)\n"
-        << "  --wireless-motion-mode MODE  For wireless_controller: native or collector (default: native)\n"
+        << "  --input-backend MODE     Input backend: wireless_controller or evdev (default: wireless_controller)\n"
         << "  --input-device PATH      evdev device path (default: auto-detect keyboard)\n"
         << "  --scene-id TEXT          Required scene identifier\n"
         << "  --operator-id TEXT       Required operator identifier\n"
@@ -1073,23 +890,17 @@ void PrintUsage(const char* program)
         << "  --web-port INT           Local Web UI port (default: 8080)\n"
         << "  --help                   Show this help\n\n"
         << "Wireless controller:\n"
-        << "  native 模式保持 Unitree 原生手柄手感与低延迟\n"
-        << "  collector 模式关闭原生手柄直通，改由 collector 根据 cmd_vx/vy/wz 上限输出 Move 指令\n"
-        << "  collector 模式中：左摇杆/右摇杆会按阈值离散成满量程控制，等价于把 WASDQE 映射成原生手柄拨杆拨满\n"
-        << "  collector 模式会对摇杆输入做平滑斜坡，起停会更柔和，限速也会真正生效\n"
-        << "  无论 native 还是 collector 模式，都可直接移动和录制\n"
-        << "  native 模式: left stick (ly/lx)=forward-backward / strafe, right stick X=turn\n"
-        << "  collector 模式: left stick / right stick X over threshold -> full-scale discrete commands\n"
-        << "  A start capture  B stop capture  X discard current segment\n"
-        << "  R2 emergency stop  Y clear fault or toggle stand up/down\n"
-        << "  D-pad Up/Right/Down/Left submit label 1/2/3/4 when label_ready\n"
-        << "Keyboard fallback:\n"
+        << "  原生手柄直通已关闭：无线手柄按键由 collector 统一接管\n"
+        << "  离散控制：D-pad Up/Down/Left/Right = W/S/A/D，X/B = Q/E\n"
+        << "  when label_ready, D-pad Up/Right/Down/Left switches to label 1/2/3/4\n"
+        << "  Start start capture  A stop capture  Y discard current segment\n"
+        << "  R2 emergency stop  F1 clear fault  F2 toggle stand up/down\n"
+        << "Evdev keyboard:\n"
         << "  W/S forward-backward  A/D strafe  Q/E turn\n"
         << "  R start  T stop  ESC discard  Space estop  C clear fault  V toggle stand  P status  H help  X quit\n"
         << "Input:\n"
         << "  wireless_controller subscribes Go2 native controller topic rt/wirelesscontroller\n"
         << "  evdev supports true multi-key press/release 和 smoother diagonal motion\n"
-        << "  tty is a fallback mode 和 may feel less stable for combined keys\n"
         << "Recording flow:\n"
         << "  trajectory flow is fixed: R starts buffering, effective motion gates logging, and T waits for motion settle before labeling\n";
 }
@@ -1101,8 +912,6 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
     config.collectorRoot = collectorRoot;
     config.outputDir = collectorRoot / kDefaultDataDirName;
     ApplyCollectorDefaults(collectorRoot, config);
-    bool inputBackendExplicit = false;
-
     for (int index = 1; index < argc; ++index)
     {
         const std::string arg = argv[index];
@@ -1157,26 +966,15 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
             const auto backend = ParseInputBackend(argv[++index]);
             if (!backend.has_value())
             {
-                error = "输入后端必须是 wireless_controller、evdev 或 tty";
+                error = "输入后端必须是 wireless_controller 或 evdev";
                 return std::nullopt;
             }
             config.inputBackend = backend.value();
-            inputBackendExplicit = true;
         }
         else if (arg == "--wireless-motion-mode")
         {
-            if (index + 1 >= argc)
-            {
-                error = "参数缺少取值：--wireless-motion-mode";
-                return std::nullopt;
-            }
-            const auto mode = ParseWirelessMotionMode(argv[++index]);
-            if (!mode.has_value())
-            {
-                error = "无线手柄运动模式必须是 native 或 collector";
-                return std::nullopt;
-            }
-            config.wirelessMotionMode = mode.value();
+            error = "--wireless-motion-mode 已移除；无线手柄现在始终使用原生直通，如需更平缓控制请改用 --input-backend evdev";
+            return std::nullopt;
         }
         else if (arg == "--capture-mode")
         {
@@ -1339,10 +1137,6 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
 
     if (config.previewUi)
     {
-        if (!inputBackendExplicit)
-        {
-            config.inputBackend = Config::InputBackend::Tty;
-        }
         if (config.sceneId.empty())
         {
             config.sceneId = kPreviewSceneId;
@@ -1406,7 +1200,7 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
     }
     if (config.inputBackend == Config::InputBackend::Evdev && config.inputDevice.empty())
     {
-        const auto detected = FindDefaultKeyboardDevice();
+        const auto detected = collector::input::FindDefaultKeyboardDevice();
         if (!detected.has_value())
         {
             error = "无法在 /dev/input 下自动检测键盘输入设备";
@@ -1417,67 +1211,6 @@ std::optional<Config> ParseArgs(int argc, char** argv, std::string& error)
 
     return config;
 }
-
-class RawTerminalGuard
-{
-public:
-    RawTerminalGuard() = default;
-
-    bool TryEnable()
-    {
-        if (!isatty(STDIN_FILENO))
-        {
-            return false;
-        }
-        Enable();
-        return true;
-    }
-
-    void Enable()
-    {
-        if (!isatty(STDIN_FILENO))
-        {
-            throw std::runtime_error("键盘遥操作模式下，stdin 必须是 tty");
-        }
-        if (enabled_)
-        {
-            return;
-        }
-        if (tcgetattr(STDIN_FILENO, &original_) != 0)
-        {
-            throw std::runtime_error("获取终端属性失败");
-        }
-        termios raw = original_;
-        raw.c_lflag &= static_cast<unsigned int>(~(ICANON | ECHO));
-        raw.c_iflag &= static_cast<unsigned int>(~(IXON | ICRNL));
-        raw.c_cc[VMIN] = 0;
-        raw.c_cc[VTIME] = 1;
-        if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0)
-        {
-            throw std::runtime_error("设置终端 raw 模式失败");
-        }
-        enabled_ = true;
-    }
-
-    void Disable()
-    {
-        if (!enabled_)
-        {
-            return;
-        }
-        tcsetattr(STDIN_FILENO, TCSANOW, &original_);
-        enabled_ = false;
-    }
-
-    ~RawTerminalGuard()
-    {
-        Disable();
-    }
-
-private:
-    bool enabled_ = false;
-    termios original_{};
-};
 
 class TrajectoryLogger
 {
@@ -1509,7 +1242,32 @@ public:
     void CleanupIfEmpty()
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!episodeHistory_.empty() || capturing_ || !pendingFrames_.empty())
+        if (capturing_ || !pendingFrames_.empty())
+        {
+            return;
+        }
+        bool hasEpisodeFiles = false;
+        std::error_code scanEc;
+        if (fs::exists(episodesDir_, scanEc) && !scanEc)
+        {
+            for (const auto& entry : fs::directory_iterator(episodesDir_, scanEc))
+            {
+                if (scanEc)
+                {
+                    break;
+                }
+                if (!entry.is_regular_file())
+                {
+                    continue;
+                }
+                if (entry.path().extension() == ".json")
+                {
+                    hasEpisodeFiles = true;
+                    break;
+                }
+            }
+        }
+        if (!episodeHistory_.empty() || hasEpisodeFiles)
         {
             return;
         }
@@ -2096,17 +1854,10 @@ public:
         std::cout << "  采集前检查：确认周围安全、机器人姿态稳定、状态已正常更新" << std::endl;
         if (config_.inputBackend == Config::InputBackend::WirelessController)
         {
-            if (UsesWirelessCollectorControl(config_))
-            {
-                std::cout << "  主控手柄：左/右摇杆越过阈值后按满量程输出，等价于 WASDQE 对应拨杆拨满" << std::endl;
-                std::cout << "  其他按键：由 collector 持续接管运动控制" << std::endl;
-            }
-            else
-            {
-                std::cout << "  主控手柄：左摇杆前后/横移，右摇杆 X 转向，A 开始录制，B 结束录制，X 丢弃当前段" << std::endl;
-                std::cout << "  其他按键：保持 Go2 原生行为，可立即开始录制" << std::endl;
-            }
-            std::cout << "  安全/标注：R2 急停  Y 清 fault/切换站立  方向键上右下左 = 评分 1/2/3/4" << std::endl;
+            std::cout << "  主控手柄：原生手柄直通已关闭；当前仅保留 collector 映射的离散控制" << std::endl;
+            std::cout << "  离散控制：D-pad 对应 W/S/A/D，X/B 对应 Q/E；进入 label_ready 后 D-pad 临时切换为评分 1/2/3/4" << std::endl;
+            std::cout << "  录制按键：Start 开始录制  A 结束录制  Y 丢弃当前段，可立即开始录制" << std::endl;
+            std::cout << "  安全/恢复：R2 急停  F1 清 fault  F2 切换站立" << std::endl;
         }
         else
         {
@@ -2203,19 +1954,9 @@ public:
             return;
         }
 
-        if (config_.inputBackend == Config::InputBackend::Tty)
-        {
-            terminalGuard_.Enable();
-        }
-        else if (config_.inputBackend == Config::InputBackend::Evdev)
-        {
-            terminalRawEnabled_ = terminalGuard_.TryEnable();
-            OpenEvdevInput();
-        }
-        else
-        {
-            terminalRawEnabled_ = terminalGuard_.TryEnable();
-        }
+        terminalRawEnabled_ = terminalGuard_.TryEnable();
+        inputBackend_ = collector::input::CreateInputBackend(BuildInputBackendConfig());
+        inputBackend_->Start();
 
         if (!config_.previewUi)
         {
@@ -2224,18 +1965,23 @@ public:
             sportClient_ = std::make_unique<unitree::robot::go2::SportClient>();
             sportClient_->SetTimeout(10.0f);
             sportClient_->Init();
-            SetWirelessControllerPassthroughEnabled(
-                UsesWirelessNativePassthrough(config_),
-                UsesWirelessNativePassthrough(config_) ? "collector startup uses native joystick"
-                                                       : "collector startup takes over wireless motion");
+            const bool passthroughConfigured =
+                SetWirelessControllerPassthroughEnabled(false, "collector startup disables native joystick");
+            if (config_.inputBackend == Config::InputBackend::WirelessController && !passthroughConfigured)
+            {
+                throw std::runtime_error("无线手柄模式启动失败：未能关闭原生手柄直通，已拒绝继续运行以避免控制冲突");
+            }
 
             sportStateSubscriber_ =
                 std::make_shared<unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::SportModeState_>>(kSportStateTopic);
             sportStateSubscriber_->InitChannel(std::bind(&CollectorApp::OnSportState, this, std::placeholders::_1), 1);
 
-            wirelessControllerSubscriber_ =
-                std::make_shared<unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::WirelessController_>>(kWirelessControllerTopic);
-            wirelessControllerSubscriber_->InitChannel(std::bind(&CollectorApp::OnWirelessController, this, std::placeholders::_1), 1);
+            if (config_.inputBackend == Config::InputBackend::WirelessController)
+            {
+                wirelessControllerSubscriber_ =
+                    std::make_shared<unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::WirelessController_>>(kWirelessControllerTopic);
+                wirelessControllerSubscriber_->InitChannel(std::bind(&CollectorApp::OnWirelessController, this, std::placeholders::_1), 1);
+            }
 
             videoClient_ = std::make_unique<unitree::robot::go2::VideoClient>();
             videoClient_->SetTimeout(1.0f);
@@ -2284,7 +2030,7 @@ public:
         }
 
         PrintLine("session 目录：" + logger_.OutputDir().string());
-        PrintLine("输入后端：" + InputBackendName(config_.inputBackend) +
+        PrintLine("输入后端：" + (inputBackend_ ? inputBackend_->BackendName() : InputBackendName(config_.inputBackend)) +
                   (config_.inputDevice.empty() ? "" : " device=" + config_.inputDevice.string()));
         if (config_.webUiEnabled)
         {
@@ -2296,17 +2042,9 @@ public:
         }
         else if (config_.inputBackend == Config::InputBackend::WirelessController)
         {
-            if (UsesWirelessNativePassthrough(config_))
-            {
-                PrintLine("collector 已就绪；原生手柄直通已启用，可立即自由操作");
-                PrintLine("当前可直接移动和录制");
-            }
-            else
-            {
-                PrintLine("collector 已就绪；当前由 collector 接管手柄运动，cmd_vx/vy/wz 限速已生效");
-                PrintLine("左/右摇杆越过阈值后按满量程输出，等价于把 WASDQE 映射成原生手柄拨杆拨满");
-                PrintLine("当前可直接移动和录制");
-            }
+            PrintLine("collector 已就绪；原生手柄直通已禁用，当前由 collector 接管手柄映射");
+            PrintLine("D-pad=WSAD，X/B=QE；待标注时 D-pad 切回 1/2/3/4 评分");
+            PrintLine("当前可直接移动和录制");
         }
         else
         {
@@ -2358,12 +2096,16 @@ public:
         }
 
         StopMotion();
+        if (inputBackend_)
+        {
+            inputBackend_->Stop();
+            inputBackend_.reset();
+        }
         if (!config_.previewUi)
         {
             SetWirelessControllerPassthroughEnabled(true, "collector shutdown restore native joystick");
             unitree::robot::ChannelFactory::Instance()->Release();
         }
-        CloseEvdevInput();
         terminalGuard_.Disable();
         logger_.CleanupIfEmpty();
         webUiServer_.reset();
@@ -2750,68 +2492,15 @@ private:
         return actions;
     }
 
-    struct KeyActivity
-    {
-        bool pressed = false;
-        std::chrono::steady_clock::time_point deadline{};
-    };
-
-    struct MotionStateSnapshot
-    {
-        bool forward = false;
-        bool backward = false;
-        bool left = false;
-        bool right = false;
-        bool yawLeft = false;
-        bool yawRight = false;
-    };
-
-    WirelessControllerSnapshot GetWirelessControllerSnapshot() const
-    {
-        std::lock_guard<std::mutex> lock(controllerMutex_);
-        return wirelessControllerSnapshot_;
-    }
+    using MotionStateSnapshot = collector::input::MotionState;
 
     MotionStateSnapshot GetMotionStateSnapshot() const
     {
-        MotionStateSnapshot motionState;
-        if (config_.inputBackend == Config::InputBackend::WirelessController)
+        if (!inputBackend_)
         {
-            const WirelessControllerSnapshot controllerState = GetWirelessControllerSnapshot();
-            const double ageSeconds = AgeSeconds(controllerState.timestamp, NowSeconds());
-            if (!controllerState.valid || ageSeconds < 0.0 || ageSeconds > kWirelessControllerTimeoutSeconds)
-            {
-                return motionState;
-            }
-
-            motionState.forward = controllerState.gamepad.rawLy > kWirelessControllerDiscreteThreshold;
-            motionState.backward = controllerState.gamepad.rawLy < -kWirelessControllerDiscreteThreshold;
-            if (UsesWirelessCollectorControl(config_))
-            {
-                motionState.left = controllerState.gamepad.rawLx < -kWirelessControllerDiscreteThreshold;
-                motionState.right = controllerState.gamepad.rawLx > kWirelessControllerDiscreteThreshold;
-                motionState.yawLeft = controllerState.gamepad.rawRx < -kWirelessControllerDiscreteThreshold;
-                motionState.yawRight = controllerState.gamepad.rawRx > kWirelessControllerDiscreteThreshold;
-            }
-            else
-            {
-                motionState.left = controllerState.gamepad.rawLx < -kWirelessControllerDiscreteThreshold;
-                motionState.right = controllerState.gamepad.rawLx > kWirelessControllerDiscreteThreshold;
-                motionState.yawLeft = controllerState.gamepad.rawRx < -kWirelessControllerDiscreteThreshold;
-                motionState.yawRight = controllerState.gamepad.rawRx > kWirelessControllerDiscreteThreshold;
-            }
-            return motionState;
+            return MotionStateSnapshot{};
         }
-
-        std::lock_guard<std::mutex> lock(keyMutex_);
-        const auto now = std::chrono::steady_clock::now();
-        motionState.forward = keyW_.pressed || keyW_.deadline > now;
-        motionState.backward = keyS_.pressed || keyS_.deadline > now;
-        motionState.left = keyA_.pressed || keyA_.deadline > now;
-        motionState.right = keyD_.pressed || keyD_.deadline > now;
-        motionState.yawLeft = keyQ_.pressed || keyQ_.deadline > now;
-        motionState.yawRight = keyE_.pressed || keyE_.deadline > now;
-        return motionState;
+        return inputBackend_->GetMotionState(NowSeconds(), std::chrono::steady_clock::now());
     }
 
     static bool IsMotionInputActive(const MotionStateSnapshot& motionState)
@@ -2850,10 +2539,18 @@ private:
 
     void UpdateTrajectoryStopFlow(const MotionStateSnapshot& motionState)
     {
+        const bool loggerStopReady = logger_.ConsumeTrajectoryStopReady();
         TrajectoryStopFlowAction action = TrajectoryStopFlowAction::None;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
-            action = EvaluateTrajectoryStopFlowLocked(motionState);
+            if (captureState_ == CaptureState::Capturing && trajectoryStopRequested_ && loggerStopReady)
+            {
+                action = TrajectoryStopFlowAction::Finalize;
+            }
+            else
+            {
+                action = EvaluateTrajectoryStopFlowLocked(motionState);
+            }
         }
 
         if (action == TrajectoryStopFlowAction::StartGracePeriodAfterTimeout)
@@ -3028,19 +2725,9 @@ private:
     {
         std::lock_guard<std::mutex> lock(outputMutex_);
         std::cout << "\r\33[2KControls:" << std::endl;
-        if (config_.inputBackend == Config::InputBackend::WirelessController)
+        if (inputBackend_)
         {
-            std::cout << "  A start capture  B stop capture  X discard current segment" << std::endl;
-            std::cout << "  left stick = forward/backward + strafe  right stick X = yaw" << std::endl;
-            std::cout << "  R2 emergency stop  Y clear fault or toggle stand up/down" << std::endl;
-            std::cout << "  pending label: D-pad up/right/down/left = 1/2/3/4" << std::endl;
-        }
-        else
-        {
-            std::cout << "  W/S forward/backward  A/D strafe  Q/E yaw" << std::endl;
-            std::cout << "  R start capture flow  T stop capture  ESC discard current segment" << std::endl;
-            std::cout << "  Space emergency stop  C clear fault  V toggle stand up/down  P status  H help  X quit" << std::endl;
-            std::cout << "  pending label: 1 good demo  2 usable imperfect  3 failed but valuable  4 discard" << std::endl;
+            inputBackend_->AppendHelp(std::cout);
         }
         std::cout << "  trajectory 模式：按 R 启动采集流程，连续有效动作后开始写入，按 T 请求结束并等待动作回落后标注" << std::endl;
         std::cout << "  该模式下必须提供 --instruction，并作为轨迹级语义标签保存" << std::endl;
@@ -3056,11 +2743,6 @@ private:
     {
         const EditableCollectorConfig editable = GetEditableConfigSnapshot();
         const Snapshot latest = CollectLatestSnapshot();
-        const MotionStateSnapshot motionState = GetMotionStateSnapshot();
-        const WirelessControllerSnapshot controllerState =
-            config_.inputBackend == Config::InputBackend::WirelessController ? GetWirelessControllerSnapshot()
-                                                                             : WirelessControllerSnapshot{};
-
         const auto loggerStatus = logger_.GetStatus();
         const double nowSeconds = NowSeconds();
         SafetyState safetyState;
@@ -3091,50 +2773,16 @@ private:
             << " state_age_s=" << std::fixed << std::setprecision(3) << AgeSeconds(latest.state.timestamp, nowSeconds)
             << " image_age_s=" << AgeSeconds(latest.image.timestamp, nowSeconds)
             << " command=(" << latest.action.vx << "," << latest.action.vy << "," << latest.action.wz << ")";
+        if (inputBackend_)
+        {
+            inputBackend_->AppendStatus(oss, nowSeconds);
+        }
         if (config_.inputBackend == Config::InputBackend::WirelessController)
         {
-            oss << " controller_axes=("
-                << "ly=" << controllerState.gamepad.rawLy
-                << ",lx=" << controllerState.gamepad.rawLx
-                << ",rx=" << controllerState.gamepad.rawRx
-                << ")"
-                << " wireless_mode=" << WirelessMotionModeName(config_.wirelessMotionMode)
+            oss << " wireless_mode=collector_button_map"
                 << " native_passthrough=" << (nativeJoystickEnabled_.load() ? "enabled" : "disabled");
         }
-        else
-        {
-            oss << " motion_keys=("
-                << (motionState.forward ? "W" : "")
-                << (motionState.backward ? "S" : "")
-                << (motionState.left ? "A" : "")
-                << (motionState.right ? "D" : "")
-                << (motionState.yawLeft ? "Q" : "")
-                << (motionState.yawRight ? "E" : "")
-                << ")";
-        }
         PrintLine(oss.str());
-    }
-
-    void OpenEvdevInput()
-    {
-        if (config_.inputDevice.empty())
-        {
-            throw std::runtime_error("evdev input device path is empty");
-        }
-        evdevFd_ = ::open(config_.inputDevice.c_str(), O_RDONLY | O_NONBLOCK);
-        if (evdevFd_ < 0)
-        {
-            throw std::runtime_error("打开输入设备失败：" + config_.inputDevice.string());
-        }
-    }
-
-    void CloseEvdevInput()
-    {
-        if (evdevFd_ >= 0)
-        {
-            ::close(evdevFd_);
-            evdevFd_ = -1;
-        }
     }
 
     std::string EvaluateSafetyFault(const Snapshot& snapshot, double nowSeconds) const
@@ -3187,7 +2835,10 @@ private:
             ResetCaptureProgressLocked();
         }
         logger_.DiscardPendingSegment();
-        ResetActiveMotionKeys();
+        if (inputBackend_)
+        {
+            inputBackend_->ResetMotionState();
+        }
         SetWirelessControllerPassthroughEnabled(false, "safety fault latched");
         StopMotion();
     }
@@ -3437,6 +3088,7 @@ private:
             }
             BeginTrajectoryStopLocked(waitingForRelease);
         }
+        logger_.RequestTrajectoryStop();
 
         if (emitLog)
         {
@@ -3597,18 +3249,18 @@ private:
         }
     }
 
-    void SetWirelessControllerPassthroughEnabled(bool enabled, const std::string& reason)
+    bool SetWirelessControllerPassthroughEnabled(bool enabled, const std::string& reason)
     {
         if (config_.inputBackend != Config::InputBackend::WirelessController)
         {
-            return;
+            return true;
         }
 
         const bool alreadyEnabled = nativeJoystickEnabled_.load();
         const bool stateKnown = nativeJoystickStateKnown_.load();
         if (stateKnown && alreadyEnabled == enabled)
         {
-            return;
+            return true;
         }
 
         std::string error;
@@ -3616,7 +3268,7 @@ private:
             std::lock_guard<std::mutex> lock(sportClientMutex_);
             if (!sportClient_)
             {
-                return;
+                return false;
             }
 
             try
@@ -3649,277 +3301,117 @@ private:
         if (!error.empty())
         {
             PrintLine(error);
-            return;
+            return false;
         }
 
         PrintLine(std::string("原生手柄直通已") + (enabled ? "启用" : "禁用") + "：" + reason);
+        return true;
     }
 
-    void ResetActiveMotionKeys()
+    collector::input::BackendConfig BuildInputBackendConfig() const
     {
-        std::lock_guard<std::mutex> lock(keyMutex_);
-        keyW_ = KeyActivity{};
-        keyS_ = KeyActivity{};
-        keyA_ = KeyActivity{};
-        keyD_ = KeyActivity{};
-        keyQ_ = KeyActivity{};
-        keyE_ = KeyActivity{};
-        smoothedVx_ = 0.0f;
-        smoothedVy_ = 0.0f;
-        smoothedWz_ = 0.0f;
-        lastCommandUpdate_ = std::chrono::steady_clock::now();
-    }
-
-    void SetKeyState(char ch, bool pressed)
-    {
-        std::lock_guard<std::mutex> lock(keyMutex_);
-        KeyActivity* target = nullptr;
-        switch (std::tolower(static_cast<unsigned char>(ch)))
-        {
-        case 'w':
-            target = &keyW_;
-            break;
-        case 's':
-            target = &keyS_;
-            break;
-        case 'a':
-            target = &keyA_;
-            break;
-        case 'd':
-            target = &keyD_;
-            break;
-        case 'q':
-            target = &keyQ_;
-            break;
-        case 'e':
-            target = &keyE_;
-            break;
-        default:
-            break;
-        }
-        if (!target)
-        {
-            return;
-        }
-        target->pressed = pressed;
-        target->deadline = pressed ? std::chrono::steady_clock::time_point{} : std::chrono::steady_clock::time_point{};
-    }
-
-    void MarkTtyKeyActive(char ch)
-    {
-        const auto deadline = std::chrono::steady_clock::now() + kKeyboardHoldTimeout;
-        std::lock_guard<std::mutex> lock(keyMutex_);
-        KeyActivity* target = nullptr;
-        switch (std::tolower(static_cast<unsigned char>(ch)))
-        {
-        case 'w':
-            target = &keyW_;
-            break;
-        case 's':
-            target = &keyS_;
-            break;
-        case 'a':
-            target = &keyA_;
-            break;
-        case 'd':
-            target = &keyD_;
-            break;
-        case 'q':
-            target = &keyQ_;
-            break;
-        case 'e':
-            target = &keyE_;
-            break;
-        default:
-            break;
-        }
-        if (!target)
-        {
-            return;
-        }
-        target->deadline = deadline;
+        collector::input::BackendConfig backendConfig;
+        backendConfig.kind = config_.inputBackend == Config::InputBackend::WirelessController
+                                 ? collector::input::BackendKind::WirelessController
+                                 : collector::input::BackendKind::Evdev;
+        backendConfig.inputDevice = config_.inputDevice;
+        backendConfig.terminalRawEnabled = terminalRawEnabled_;
+        backendConfig.wirelessTimeoutSeconds = kWirelessControllerTimeoutSeconds;
+        backendConfig.keyboardLinearAccelPerSecond = kKeyboardLinearAccelPerSecond;
+        backendConfig.keyboardLinearDecelPerSecond = kKeyboardLinearDecelPerSecond;
+        backendConfig.keyboardYawAccelPerSecond = kKeyboardYawAccelPerSecond;
+        backendConfig.keyboardYawDecelPerSecond = kKeyboardYawDecelPerSecond;
+        backendConfig.linearAccelPerSecond = kLinearAccelPerSecond;
+        backendConfig.linearDecelPerSecond = kLinearDecelPerSecond;
+        backendConfig.yawAccelPerSecond = kYawAccelPerSecond;
+        backendConfig.yawDecelPerSecond = kYawDecelPerSecond;
+        backendConfig.wirelessDiscreteThreshold = kWirelessControllerDiscreteThreshold;
+        backendConfig.wirelessStickDeadZone = kWirelessControllerStickDeadZone;
+        backendConfig.wirelessStickSmoothing = kWirelessControllerStickSmoothing;
+        backendConfig.wirelessCollectorDeadZone = kWirelessCollectorDeadZone;
+        backendConfig.wirelessCollectorReleaseZone = kWirelessCollectorReleaseZone;
+        backendConfig.wirelessAxisExponent = kWirelessCollectorAxisExponent;
+        return backendConfig;
     }
 
     VelocityCommand ComputeInputCommand()
     {
+        if (!inputBackend_)
+        {
+            return VelocityCommand{};
+        }
+
         bool stopRequested = false;
         {
             std::lock_guard<std::mutex> lock(stateMachineMutex_);
             stopRequested = trajectoryStopRequested_;
         }
-        const auto now = std::chrono::steady_clock::now();
-        float targetVx = 0.0f;
-        float targetVy = 0.0f;
-        float targetWz = 0.0f;
-        WirelessControllerSnapshot controllerState;
-        if (config_.inputBackend == Config::InputBackend::WirelessController)
-        {
-            controllerState = GetWirelessControllerSnapshot();
-        }
-        float commandVx = 0.0f;
-        float commandVy = 0.0f;
-        float commandWz = 0.0f;
-        {
-            std::lock_guard<std::mutex> lock(keyMutex_);
-            const float deltaSeconds = lastCommandUpdate_.time_since_epoch().count() == 0
-                                           ? 0.0f
-                                           : std::chrono::duration<float>(now - lastCommandUpdate_).count();
-            lastCommandUpdate_ = now;
 
-            if (config_.inputBackend == Config::InputBackend::WirelessController)
-            {
-                const double ageSeconds = AgeSeconds(controllerState.timestamp, NowSeconds());
-                if (!stopRequested && controllerState.valid && ageSeconds >= 0.0 &&
-                    ageSeconds <= kWirelessControllerTimeoutSeconds)
-                {
-                    targetVx = controllerState.gamepad.rawLy;
-                    if (UsesWirelessCollectorControl(config_))
-                    {
-                        // Collector mode reuses the keyboard motion path: once a
-                        // stick crosses the threshold, treat it like the
-                        // corresponding key is fully pressed.
-                        targetVx = QuantizeWirelessAxisToFullScale(controllerState.gamepad.rawLy);
-                        targetVy = -QuantizeWirelessAxisToFullScale(controllerState.gamepad.rawLx);
-                        targetWz = -QuantizeWirelessAxisToFullScale(controllerState.gamepad.rawRx);
-                    }
-                    else
-                    {
-                        targetVy = -controllerState.gamepad.rawLx;
-                        targetWz = -controllerState.gamepad.rawRx;
-                    }
-                }
-            }
-            else
-            {
-                const float forward = stopRequested ? 0.0f : ((keyW_.pressed || keyW_.deadline > now) ? 1.0f : 0.0f);
-                const float backward = stopRequested ? 0.0f : ((keyS_.pressed || keyS_.deadline > now) ? 1.0f : 0.0f);
-                const float left = stopRequested ? 0.0f : ((keyA_.pressed || keyA_.deadline > now) ? 1.0f : 0.0f);
-                const float right = stopRequested ? 0.0f : ((keyD_.pressed || keyD_.deadline > now) ? 1.0f : 0.0f);
-                const float yawLeft = stopRequested ? 0.0f : ((keyQ_.pressed || keyQ_.deadline > now) ? 1.0f : 0.0f);
-                const float yawRight = stopRequested ? 0.0f : ((keyE_.pressed || keyE_.deadline > now) ? 1.0f : 0.0f);
-                targetVx = forward - backward;
-                targetVy = left - right;
-                targetWz = yawLeft - yawRight;
-            }
-
-            const float planarNorm = std::sqrt(targetVx * targetVx + targetVy * targetVy);
-            if (planarNorm > 1.0f)
-            {
-                targetVx /= planarNorm;
-                targetVy /= planarNorm;
-            }
-
-            if (config_.inputBackend == Config::InputBackend::WirelessController &&
-                UsesWirelessNativePassthrough(config_))
-            {
-                smoothedVx_ = targetVx;
-                smoothedVy_ = targetVy;
-                smoothedWz_ = targetWz;
-            }
-            else
-            {
-                const bool keyboardBackend = config_.inputBackend != Config::InputBackend::WirelessController;
-                const float linearAccelPerSecond =
-                    keyboardBackend ? kKeyboardLinearAccelPerSecond : kLinearAccelPerSecond;
-                const float linearDecelPerSecond =
-                    keyboardBackend ? kKeyboardLinearDecelPerSecond : kLinearDecelPerSecond;
-                const float yawAccelPerSecond =
-                    keyboardBackend ? kKeyboardYawAccelPerSecond : kYawAccelPerSecond;
-                const float yawDecelPerSecond =
-                    keyboardBackend ? kKeyboardYawDecelPerSecond : kYawDecelPerSecond;
-                smoothedVx_ =
-                    SlewTowards(smoothedVx_, targetVx, linearAccelPerSecond, linearDecelPerSecond, deltaSeconds);
-                smoothedVy_ =
-                    SlewTowards(smoothedVy_, targetVy, linearAccelPerSecond, linearDecelPerSecond, deltaSeconds);
-                smoothedWz_ =
-                    SlewTowards(smoothedWz_, targetWz, yawAccelPerSecond, yawDecelPerSecond, deltaSeconds);
-            }
-
-            commandVx = smoothedVx_;
-            commandVy = smoothedVy_;
-            commandWz = smoothedWz_;
-        }
+        const EditableCollectorConfig editable = GetEditableConfigSnapshot();
+        const auto nowSteady = std::chrono::steady_clock::now();
+        const double nowSeconds = NowSeconds();
+        collector::input::ComputeCommandOptions options;
+        options.stopRequested = stopRequested;
+        options.nowSeconds = nowSeconds;
+        options.nowSteady = nowSteady;
+        options.wirelessNativePassthrough = UsesWirelessNativePassthrough(config_);
+        options.cmdVxMax = static_cast<float>(editable.cmdVxMax);
+        options.cmdVyMax = static_cast<float>(editable.cmdVyMax);
+        options.cmdWzMax = static_cast<float>(editable.cmdWzMax);
+        const collector::input::CommandIntent intent = inputBackend_->ComputeCommand(options);
 
         VelocityCommand command;
-        command.timestamp = NowSeconds();
-        if (config_.inputBackend == Config::InputBackend::WirelessController &&
-            UsesWirelessNativePassthrough(config_))
-        {
-            // Native passthrough uses the robot's own joystick motion path; the
-            // collector records normalized operator intent instead of issuing
-            // another scaled Move() command.
-            command.vx = commandVx;
-            command.vy = commandVy;
-            command.wz = commandWz;
-        }
-        else
-        {
-            const EditableCollectorConfig editable = GetEditableConfigSnapshot();
-            command.vx = commandVx * static_cast<float>(editable.cmdVxMax);
-            command.vy = commandVy * static_cast<float>(editable.cmdVyMax);
-            command.wz = commandWz * static_cast<float>(editable.cmdWzMax);
-        }
-        command.valid = true;
+        command.timestamp = intent.timestamp;
+        command.vx = intent.vx;
+        command.vy = intent.vy;
+        command.wz = intent.wz;
+        command.valid = intent.valid;
+        pendingSendVx_ = intent.sendVx;
+        pendingSendVy_ = intent.sendVy;
+        pendingSendWz_ = intent.sendWz;
+        pendingSendMotion_ = intent.shouldSendMotion;
         return command;
     }
 
-    void ProcessTeleopChar(char ch, bool allowMotionKeys = true)
+    void HandleTeleopEvent(const collector::input::TeleopEvent& event)
     {
-        const char lowered = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-        if (ch == kEscapeKey)
+        switch (event.type)
         {
-            CancelCurrentSegment("cancelled by operator");
-            return;
-        }
-
-        switch (lowered)
-        {
-        case 'w':
-        case 'a':
-        case 's':
-        case 'd':
-        case 'q':
-        case 'e':
-            if (allowMotionKeys)
-            {
-                MarkTtyKeyActive(ch);
-            }
-            break;
-        case 'r':
+        case collector::input::TeleopEventType::StartCapture:
             BeginSegment();
             break;
-        case 't':
+        case collector::input::TeleopEventType::StopCapture:
             EndSegment();
             break;
-        case 'c':
+        case collector::input::TeleopEventType::CancelSegment:
+            CancelCurrentSegment("cancelled by operator");
+            break;
+        case collector::input::TeleopEventType::EmergencyStop:
+            RequestEmergencyStop("键盘急停");
+            break;
+        case collector::input::TeleopEventType::ClearFault:
             if (!TryClearFault())
             {
-                PrintLine("当前无 safety fault；如需切换站立请按 V");
+                PrintLine(
+                    config_.inputBackend == Config::InputBackend::WirelessController
+                        ? "当前无 safety fault；如需切换站立请按 Y"
+                        : "当前无 safety fault；如需切换站立请按 V");
             }
             break;
-        case 'v':
+        case collector::input::TeleopEventType::ToggleStand:
             ToggleStandState();
             break;
-        case 'p':
+        case collector::input::TeleopEventType::PrintStatus:
             PrintStatus();
             break;
-        case 'h':
+        case collector::input::TeleopEventType::PrintHelp:
             PrintHelp();
             break;
-        case 'x':
+        case collector::input::TeleopEventType::Quit:
             RequestQuit();
             break;
-        case '1':
-        case '2':
-        case '3':
-        case '4':
-            SubmitPresetLabelShortcut(lowered);
-            break;
-        default:
-            if (ch == ' ')
-            {
-                RequestEmergencyStop("键盘急停");
-            }
+        case collector::input::TeleopEventType::SubmitLabelShortcut:
+            SubmitPresetLabelShortcut(event.shortcut);
             break;
         }
     }
@@ -3942,237 +3434,27 @@ private:
         }
     }
 
-    PendingWirelessControllerActions TakePendingWirelessControllerActions()
-    {
-        std::lock_guard<std::mutex> lock(controllerMutex_);
-        PendingWirelessControllerActions pending = pendingWirelessControllerActions_;
-        pendingWirelessControllerActions_ = PendingWirelessControllerActions{};
-        return pending;
-    }
-
-    void HandleWirelessControllerActions(const PendingWirelessControllerActions& actions)
-    {
-        if (actions.A)
-        {
-            ProcessTeleopChar('r', false);
-        }
-        if (actions.B)
-        {
-            ProcessTeleopChar('t', false);
-        }
-        if (actions.X)
-        {
-            ProcessTeleopChar(kEscapeKey, false);
-        }
-        if (actions.R2)
-        {
-            ProcessTeleopChar(' ', false);
-        }
-        if (actions.Y)
-        {
-            ProcessTeleopChar('c', false);
-        }
-        if (actions.up)
-        {
-            SubmitPresetLabelShortcut('1');
-        }
-        if (actions.right)
-        {
-            SubmitPresetLabelShortcut('2');
-        }
-        if (actions.down)
-        {
-            SubmitPresetLabelShortcut('3');
-        }
-        if (actions.left)
-        {
-            SubmitPresetLabelShortcut('4');
-        }
-    }
-
     void KeyboardLoop()
     {
-        if (config_.inputBackend == Config::InputBackend::WirelessController)
-        {
-            WirelessControllerLoop();
-            return;
-        }
-
-        if (config_.inputBackend == Config::InputBackend::Evdev)
-        {
-            EvdevKeyboardLoop();
-            return;
-        }
-
         while (running_.load())
         {
             MaybeRunPendingTerminalLabelPrompt();
-            if (promptActive_.load())
+            if (!inputBackend_)
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
             }
-            char ch = 0;
-            const ssize_t bytesRead = ::read(STDIN_FILENO, &ch, 1);
-            if (bytesRead <= 0)
+            const bool labelInputActive = promptActive_.load() || logger_.GetStatus().pendingLabel;
+            const auto events = inputBackend_->PollEvents(labelInputActive, std::chrono::milliseconds(100));
+            for (const auto& event : events)
             {
-                continue;
-            }
-            ProcessTeleopChar(ch, true);
-        }
-    }
-
-    void WirelessControllerLoop()
-    {
-        while (running_.load())
-        {
-            MaybeRunPendingTerminalLabelPrompt();
-            const PendingWirelessControllerActions pendingActions = TakePendingWirelessControllerActions();
-            if (pendingActions.Any())
-            {
-                HandleWirelessControllerActions(pendingActions);
-            }
-
-            if (terminalRawEnabled_ && !promptActive_.load())
-            {
-                pollfd pfd{STDIN_FILENO, POLLIN, 0};
-                const int pollResult = ::poll(&pfd, 1, 0);
-                if (pollResult > 0 && (pfd.revents & POLLIN) != 0)
-                {
-                    char ch = 0;
-                    const ssize_t bytesRead = ::read(STDIN_FILENO, &ch, 1);
-                    if (bytesRead > 0)
-                    {
-                        ProcessTeleopChar(ch, false);
-                    }
-                }
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-    }
-
-    void EvdevKeyboardLoop()
-    {
-        std::vector<pollfd> pfds;
-        pfds.push_back(pollfd{evdevFd_, POLLIN, 0});
-        if (terminalRawEnabled_)
-        {
-            pfds.push_back(pollfd{STDIN_FILENO, POLLIN, 0});
-        }
-        while (running_.load())
-        {
-            MaybeRunPendingTerminalLabelPrompt();
-            const int pollResult = ::poll(pfds.data(), static_cast<nfds_t>(pfds.size()), 100);
-            if (pollResult <= 0)
-            {
-                continue;
-            }
-
-            if ((pfds[0].revents & POLLIN) != 0)
-            {
-                input_event event{};
-                const ssize_t bytesRead = ::read(evdevFd_, &event, sizeof(event));
-                if (bytesRead == static_cast<ssize_t>(sizeof(event)) && event.type == EV_KEY)
-                {
-                    const bool pressed = event.value != 0;
-                    HandleEvdevKey(event.code, pressed);
-                }
-            }
-
-            if (terminalRawEnabled_ && pfds.size() > 1 && (pfds[1].revents & POLLIN) != 0)
-            {
-                if (promptActive_.load())
-                {
-                    continue;
-                }
-                char ch = 0;
-                const ssize_t bytesRead = ::read(STDIN_FILENO, &ch, 1);
-                if (bytesRead > 0)
-                {
-                    ProcessTeleopChar(ch, false);
-                }
-            }
-        }
-    }
-
-    bool HandleEvdevKey(uint16_t code, bool pressed)
-    {
-        switch (code)
-        {
-        case KEY_W:
-            SetKeyState('w', pressed);
-            return true;
-        case KEY_S:
-            SetKeyState('s', pressed);
-            return true;
-        case KEY_A:
-            SetKeyState('a', pressed);
-            return true;
-        case KEY_D:
-            SetKeyState('d', pressed);
-            return true;
-        case KEY_Q:
-            SetKeyState('q', pressed);
-            return true;
-        case KEY_E:
-            SetKeyState('e', pressed);
-            return true;
-        case KEY_ESC:
-            if (pressed)
-            {
-                if (promptActive_.load())
+                if (promptActive_.load() && event.type == collector::input::TeleopEventType::CancelSegment)
                 {
                     promptCancelRequested_.store(true);
-                    return true;
+                    continue;
                 }
-                ProcessTeleopChar(kEscapeKey);
+                HandleTeleopEvent(event);
             }
-            return true;
-        case KEY_SPACE:
-            if (pressed)
-            {
-                ProcessTeleopChar(' ');
-            }
-            return true;
-        case KEY_R:
-            if (pressed)
-            {
-                ProcessTeleopChar('r');
-            }
-            return true;
-        case KEY_T:
-            if (pressed)
-            {
-                ProcessTeleopChar('t');
-            }
-            return true;
-        case KEY_C:
-            if (pressed)
-            {
-                ProcessTeleopChar('c');
-            }
-            return true;
-        case KEY_P:
-            if (pressed)
-            {
-                ProcessTeleopChar('p');
-            }
-            return true;
-        case KEY_H:
-            if (pressed)
-            {
-                ProcessTeleopChar('h');
-            }
-            return true;
-        case KEY_X:
-            if (pressed)
-            {
-                ProcessTeleopChar('x');
-            }
-            return true;
-        default:
-            return false;
         }
     }
 
@@ -4205,13 +3487,12 @@ private:
 
     void OnWirelessController(const void* message)
     {
+        if (!inputBackend_)
+        {
+            return;
+        }
         const auto* controller = static_cast<const unitree_go::msg::dds_::WirelessController_*>(message);
-        std::lock_guard<std::mutex> lock(controllerMutex_);
-        wirelessControllerSnapshot_.gamepad.Update(*controller);
-        pendingWirelessControllerActions_.MergeFrom(wirelessControllerSnapshot_.gamepad);
-        wirelessControllerSnapshot_.timestamp = NowSeconds();
-        wirelessControllerSnapshot_.sequence += 1;
-        wirelessControllerSnapshot_.valid = true;
+        inputBackend_->HandleWirelessControllerMessage(*controller);
     }
 
     void ControlLoop()
@@ -4239,6 +3520,10 @@ private:
                 command = VelocityCommand{};
                 command.timestamp = NowSeconds();
                 command.valid = true;
+                pendingSendMotion_.store(false);
+                pendingSendVx_.store(0.0f);
+                pendingSendVy_.store(0.0f);
+                pendingSendWz_.store(0.0f);
             }
 
             {
@@ -4251,12 +3536,22 @@ private:
                 UpdatePreviewState(command, std::chrono::duration<double>(period).count());
             }
 
-            const bool moveActive = std::fabs(command.vx) > 1e-6f ||
-                                    std::fabs(command.vy) > 1e-6f ||
-                                    std::fabs(command.wz) > 1e-6f;
+            float sendVx = command.vx;
+            float sendVy = command.vy;
+            float sendWz = command.wz;
+            bool shouldSendMotion = config_.inputBackend != Config::InputBackend::WirelessController;
+            if (config_.inputBackend == Config::InputBackend::WirelessController)
+            {
+                shouldSendMotion = pendingSendMotion_;
+                sendVx = pendingSendVx_;
+                sendVy = pendingSendVy_;
+                sendWz = pendingSendWz_;
+            }
+            const bool moveActive = std::fabs(sendVx) > 1e-6f ||
+                                    std::fabs(sendVy) > 1e-6f ||
+                                    std::fabs(sendWz) > 1e-6f;
 
-            if (config_.inputBackend != Config::InputBackend::WirelessController ||
-                UsesWirelessCollectorControl(config_))
+            if (shouldSendMotion || lastMoveActive)
             {
                 try
                 {
@@ -4265,7 +3560,7 @@ private:
                     {
                         if (moveActive)
                         {
-                            sportClient_->Move(command.vx, command.vy, command.wz);
+                            sportClient_->Move(sendVx, sendVy, sendWz);
                         }
                         else if (lastMoveActive)
                         {
@@ -4468,8 +3763,6 @@ private:
     mutable std::mutex commandMutex_;
     mutable std::mutex sportClientMutex_;
     mutable std::mutex stateMachineMutex_;
-    mutable std::mutex keyMutex_;
-    mutable std::mutex controllerMutex_;
     mutable std::mutex editableConfigMutex_;
     std::condition_variable imageUpdatedCv_;
 
@@ -4489,21 +3782,13 @@ private:
     EditableCollectorConfig editableConfig_;
     std::vector<uint8_t> previewImageJpeg_;
 
-    KeyActivity keyW_;
-    KeyActivity keyS_;
-    KeyActivity keyA_;
-    KeyActivity keyD_;
-    KeyActivity keyQ_;
-    KeyActivity keyE_;
-    std::chrono::steady_clock::time_point lastCommandUpdate_{};
-    float smoothedVx_ = 0.0f;
-    float smoothedVy_ = 0.0f;
-    float smoothedWz_ = 0.0f;
-    WirelessControllerSnapshot wirelessControllerSnapshot_{};
-    PendingWirelessControllerActions pendingWirelessControllerActions_{};
+    std::unique_ptr<collector::input::InputBackend> inputBackend_;
     std::atomic<bool> nativeJoystickEnabled_{false};
     std::atomic<bool> nativeJoystickStateKnown_{false};
-    int evdevFd_ = -1;
+    std::atomic<bool> pendingSendMotion_{false};
+    std::atomic<float> pendingSendVx_{0.0f};
+    std::atomic<float> pendingSendVy_{0.0f};
+    std::atomic<float> pendingSendWz_{0.0f};
     bool terminalRawEnabled_ = false;
 
     std::unique_ptr<unitree::robot::go2::SportClient> sportClient_;
